@@ -1,6 +1,13 @@
+"""
+`Ghostbuster`: the end-to-end single-particle reconstruction pipeline, from
+a CryoSPARC particle set to a trained `Reconstructor`.
+"""
+
 from __future__ import annotations
 
-import json
+from ..progress import console
+
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
@@ -8,65 +15,27 @@ import mrcfile
 import torch
 import torch.utils.data
 
-from ._helpers import _preprocess_particle_images
+from ..settings import Optics, Propagation
+from ._helpers import _images_to_counts
 from ._reconstructor import Reconstructor
-from ._run_helpers import build_trainer
+from ._pipeline_base import _GhostbusterBase
+from specter.options import ImageUnits, Scheduler, SymmetryMode
 
 
-def compare_runs(
-    base_dir: str | Path = "output/runs",
-    show_params: list[str] | None = None,
-) -> None:
-    """
-    Print a summary table of all saved Ghostbuster runs.
-
-    Parameters
-    ----------
-    base_dir : str or Path
-        Root directory containing run subdirectories.
-    show_params : list of str, optional
-        Parameter keys to display as columns. Defaults to
-        ``["scattering_model", "lr", "rotate_mode", "use_nps", "niter"]``.
-    """
-    if show_params is None:
-        show_params = ["scattering_model", "lr", "rotate_mode", "use_nps", "niter"]
-
-    seen: set[Path] = set()
-    runs = sorted(
-        p
-        for p in Path(base_dir).glob("*/params*.json")
-        if not (p.parent in seen or seen.add(p.parent))  # type: ignore[func-returns-value]
-    )
-    if not runs:
-        print(f"No runs found in {base_dir}.")
-        return
-
-    col_w = 20
-    header = f"{'run':<45}" + "".join(f"  {k:<{col_w}}" for k in show_params)
-    print(header)
-    print("-" * len(header))
-    for p in runs:
-        d = json.loads(p.read_text())
-        row = f"{p.parent.name:<45}" + "".join(
-            f"  {str(d.get(k, '—')):<{col_w}}" for k in show_params
-        )
-        print(row)
-
-
-class Ghostbuster:
+class Ghostbuster(_GhostbusterBase):
     """
     End-to-end reconstruction pipeline for cryo-EM/cryo-ET.
 
     .. note::
-        ``return_class`` and ``cryosparc_ref`` are excluded from the job
+        ``halfset`` and ``cryosparc_ref`` are excluded from the job
         parameter log (see :attr:`_job_log_exclude`) because they differ
-        between halfsets. ``return_class`` encodes halfset identity in the
-        output filenames (``vol_A.mrc`` / ``vol_B.mrc``), and ``cryosparc_ref``
+        between halfsets. ``halfset`` encodes halfset identity in the
+        output filenames (``volume_A.mrc`` / ``volume_B.mrc``), and ``cryosparc_ref``
         points to the corresponding halfset reference. Both halfset runs must
         use identical settings for every other parameter.
 
     Loads particle data from CryoSPARC output files, preprocesses images
-    (sign flip, dose/scale normalisation), and drives a :class:`Reconstructor`
+    (data sign, dose/scale normalisation), and drives a :class:`Reconstructor`
     via a Lightning ``Trainer``.
 
     All parameters — data paths, physics settings, and training hyperparameters
@@ -94,7 +63,10 @@ class Ghostbuster:
     mrc_file : str or Path
         Path to the particle stack ``.mrc``/``.mrcs`` file.
     dose_per_angstrom : float
-        Electron dose in e⁻/Å².
+        Total electron dose (fluence) per image in e⁻/Å².
+    alpha : float, optional
+        Amplitude contrast ratio in ``[0, 1]``, overriding the ``.cs`` file's
+        ``ctf/amp_contrast``. Default None uses the ``.cs`` file's value.
     lr : float, optional
         Learning rate for the volume. ``None`` disables volume optimisation.
     lr_R : float, optional
@@ -104,7 +76,7 @@ class Ghostbuster:
     lr_D : float, optional
         Learning rate for defocus offset.
     defocus_offset : float, optional
-        Initial defocus offset in Ångströms added to all particles' dfu and dfv.
+        Initial defocus offset in Å added to all particles' dfu and dfv.
     bfactor : float, optional
         Isotropic B-factor envelope in Å² applied in the microscope transfer
         function, damping high-resolution signal. None or 0.0 means no
@@ -117,43 +89,33 @@ class Ghostbuster:
         schedulers. Default 0.1.
     epochs : int
         Number of training epochs.
-    batch_size : int
+    batchsize : int
         Dataloader batch size.
-    scattering_model : str
-        Wave propagation model (``"multislice"``, ``"rytov"``, ``"firstborn"``,
-        ``"projection"``).
-    aberration_model : str
-        CTF aberration model passed to ``ImageGenerator``.
-    aberration_backend : {"legacy", "torch_ctf"}, optional
-        Which engine computes the CTF/aberration transfer function.
-        ``"legacy"`` (default) uses ``aberrations.Aberration``; ``"torch_ctf"``
-        uses ``ctf.LegacyAberrationAdapter`` (verified parity, see
-        ``ImageGenerator``'s docstring). Opt-in only; not yet the default.
-    lpp_params : dict[str, float], optional
-        Laser-phase-plate config, in ``ctf.CTFParameters``-native units.
-        Requires ``aberration_backend="torch_ctf"``; raises at construction
-        time otherwise.
+    init_volume : torch.Tensor, str, Path, or None, optional
+        Starting volume, in the reconstruction's units (volts), instead of
+        zeros: a ``(N, N, N)`` tensor or a path to a .mrc file. A volume an
+        integer multiple of the image box is block-averaged down to it, which
+        is what `test_run`'s binning needs. Default None (zeros).
+    init_lowpass : float, optional
+        Resolution in Å to which `init_volume` is low-passed before training
+        starts (a smooth Butterworth edge with its half-power point there).
+        Both halves of a gold-standard run start from the same volume, so it
+        should carry no detail finer than the halves are meant to establish
+        independently. Default None (unfiltered).
+    propagation : Propagation, optional
+        How the forward model computes the exit wave. Default
+        ``Propagation(scattering_model="rytov")``. Its ``alpha`` is replaced
+        by the amplitude contrast recorded in the ``.cs`` file, since that is
+        data rather than a modelling choice, or by `alpha` when given.
+    optics : Optics, optional
+        The aberration engine and phase plate. Default ``Optics()``.
     symmetry : str, optional
         Point-group symmetry to enforce (e.g. ``"C3"``, ``"I1"``).
     symmetry_batchsize : int, optional
         Batch size used when applying symmetry to the volume.
-    symmetry_mode : {"real", "fourier"}
-        Domain in which symmetry is applied.
-    sparsity : float, optional
-        L1 regularisation weight on V.
-    rotate_mode : {"real", "fourier"}
-        Domain in which rotations are applied.
-    ews_curvature_sign : str
-        Ewald sphere curvature sign matching CryoSPARC's convention.
-        ``'negative'`` (default) or ``'positive'``.
-    klim : float, optional
-        Hard frequency cutoff passed to ``ImageGenerator``.
-    nps_weight : torch.Tensor, optional
-        Per-frequency noise power spectrum weight for the loss.
-    learn_noise_model : bool
-        Whether to estimate sigma²(k) from residuals (RELION-style).
-    use_ncc : bool
-        Whether to use normalised cross-correlation loss instead of MSE.
+    symmetry_mode : {"exact", "real", "fourier"}
+        How the point group is averaged; see `specter.symmetries.apply_symmetry`.
+        Default ``"exact"``.
     fsc_ref : torch.Tensor, str, Path, or None
         Reference volume for map-to-model FSC logging. Can be a tensor or a
         path to a .mrc file to load.
@@ -164,89 +126,124 @@ class Ghostbuster:
         CryoSPARC reference volume for FSC comparison. Can be a tensor or a
         path to a .mrc file to load. Only plotted alongside fsc_ref when
         both are provided. Default is None.
-    use_2d_mask : bool
-        If True, rotate ``fsc_mask`` for each particle, max-project it to 2D,
-        and use that projected mask to weight the image-domain MSE loss.
     precision : str
         Lightning ``Trainer`` precision (e.g. ``"16-mixed"``, ``"32"``).
         Falls back to ``"32"`` automatically on CPU.
     num_workers : int
         Dataloader worker processes.
-    num_particles : int, optional
-        Use only the first ``num_particles`` particles. Defaults to all.
-    return_class : {"0", "1", "all"}
-        Particle class to extract from the ``.cs`` file.
+    n_particles : int, optional
+        Use only the first ``n_particles`` particles. Defaults to all.
+    halfset : {"A", "B", "all"}
+        Gold-standard half-set [1]_ [2]_ to extract from the ``.cs`` file.
     run_dir : str or Path, optional
         Directory for all job outputs. Injected automatically by
         :meth:`~specter.jobs.Job.create` when used inside a ``Job`` context.
+    image_units : {"normalized", "counts"}, optional
+        What the particle stack's values are. ``"normalized"`` (the default)
+        is a CryoSPARC/RELION stack with zero mean and unit variance; each
+        image is brought to its recorded polarity by its data sign
+        (``blob/sign``, taken as -1, inverted contrast, when the ``.cs`` file
+        records none) and mapped back to counts as ``sqrt(N) * x + N``, with
+        ``N = dose_per_angstrom * pixel_size**2``.
+        ``"counts"`` is electrons per pixel, used as is, such as a specter
+        stack written with ``normalize_particles=False``.
+
+    References
+    ----------
+    .. [1] Henderson, R., Sali, A., Baker, M. L., Carragher, B., Devkota, B.,
+       Downing, K. H., et al. (2012). Outcome of the first electron microscopy
+       validation task force meeting. *Structure*, 20(2), 205–214.
+       https://doi.org/10.1016/j.str.2011.12.014
+    .. [2] Scheres, S. H. W., & Chen, S. (2012). Prevention of overfitting in
+       cryo-EM structure determination. *Nature Methods*, 9(9), 853–854.
+       https://doi.org/10.1038/nmeth.2115
+    .. [3] Scheres, S. H. W. (2012). RELION: Implementation of a Bayesian
+       approach to cryo-EM structure determination. *Journal of Structural
+       Biology*, 180(3), 519–530. https://doi.org/10.1016/j.jsb.2012.09.006
     """
 
-    _job_log_exclude: tuple[str, ...] = ("return_class", "cryosparc_ref")
+    _job_log_exclude: tuple[str, ...] = ("halfset", "cryosparc_ref")
 
     def __init__(
         self,
         cs_file: str | Path,
         mrc_file: str | Path,
         dose_per_angstrom: float,
+        address_by_blob_idx: bool = False,
+        alpha: float | None = None,
         lr: float | None = None,
         lr_R: float | None = None,
         lr_T: float | None = None,
         lr_D: float | None = None,
         defocus_offset: float = 0.0,
         bfactor: float | None = None,
-        scheduler: Literal[
-            "LambdaLR",
-            "OneCycleLR",
-            "CosineAnnealingWarmRestarts",
-            "MultiplicativeLR",
-        ] = "LambdaLR",
+        scheduler: Scheduler = "LambdaLR",
         lr_decay: float = 0.1,
         epochs: int = 5,
-        batch_size: int = 3,
-        scattering_model: str = "rytov",
-        aberration_model: str = "holography",
-        aberration_backend: Literal["legacy", "torch_ctf"] = "legacy",
-        lpp_params: dict[str, float] | None = None,
+        batchsize: int = 3,
+        init_volume: torch.Tensor | str | Path | None = None,
+        init_lowpass: float | None = None,
+        propagation: Propagation = Propagation(scattering_model="rytov"),
+        optics: Optics = Optics(),
         symmetry: str | None = None,
         symmetry_batchsize: int | None = None,
-        symmetry_mode: Literal["real", "fourier"] = "fourier",
-        sparsity: float | None = None,
-        rotate_mode: Literal["real", "fourier"] = "real",
-        ews_curvature_sign: str = "negative",
-        klim: float | None = None,
-        nps_weight: torch.Tensor | None = None,
-        learn_noise_model: bool = False,
-        use_ncc: bool = False,
+        symmetry_mode: SymmetryMode = "exact",
         fsc_ref: torch.Tensor | str | Path | None = None,
         fsc_mask: torch.Tensor | float | str | Path | None = None,
         cryosparc_ref: torch.Tensor | str | Path | None = None,
-        use_2d_mask: bool = False,
         precision: str = "16-mixed",
         num_workers: int = 0,
-        num_particles: int | None = None,
-        return_class: Literal["0", "1", "all"] = "all",
+        n_particles: int | None = None,
+        halfset: Literal["A", "B", "all"] = "all",
         run_dir: str | Path | None = None,
+        image_units: ImageUnits = "normalized",
     ) -> None:
-        _halfset_map: dict[str, str | None] = {"0": "A", "1": "B", "all": None}
-        self.halfset_label: str | None = _halfset_map[return_class]
+        if alpha is not None and not 0.0 <= alpha <= 1.0:
+            # Checked before the particle stack is read, not after.
+            raise ValueError(f"alpha={alpha} must be in [0, 1]")
+        self.halfset_label: str | None = halfset if halfset != "all" else None
 
         (
             voltage,
             pixel_size,
-            alpha,
+            alpha_cs,
             rotations,
             translations,
             ctf_params,
             scale,
             anisomag,
             indices,
-        ) = self._load_particle_parameters(cs_file, return_class, num_particles)
-        images = self._load_particle_images(mrc_file, indices)
+        ) = self._load_particle_parameters(cs_file, halfset, n_particles)
+        images = self._load_particle_images(
+            cs_file, indices, mrc_file, address_by_blob_idx
+        )
 
         voxel_size = float(
             pixel_size.item() if hasattr(pixel_size, "item") else pixel_size
         )
-        images = _preprocess_particle_images(images, dose_per_angstrom, voxel_size)
+        dose_per_pixel = dose_per_angstrom * voxel_size**2
+        # Into the polarity the microscope recorded: each image times its
+        # data sign, blob/sign in the .cs file. A normalized stack that
+        # records none is taken to be inverted, as RELION and CryoSPARC write
+        # them; counts carry their physical polarity.
+        signs = self._image_signs(cs_file, indices, image_units)
+        if not images.is_floating_point():
+            images = images.float()
+        if image_units == "normalized":
+            # This stack is privately owned, so reuse it. Keep the existing
+            # conversion arithmetic on bounded blocks instead of retaining
+            # several full stacks during sign reversal, scaling and addition.
+            for block, sign in zip(images.split(64), signs.split(64)):
+                block.mul_(sign.to(block.dtype)[:, None, None])
+                block.copy_(
+                    _images_to_counts(
+                        block, image_units, dose_per_pixel, flip_contrast=False
+                    )
+                )
+        else:
+            images = _images_to_counts(
+                images, image_units, dose_per_pixel, flip_contrast=False
+            )
 
         # preprocessed particle data (not hyperparams — not logged by job.create)
         self._images = images
@@ -257,7 +254,12 @@ class Ghostbuster:
         self._anisomag = anisomag
         self._voltage = float(voltage.item() if hasattr(voltage, "item") else voltage)
         self._voxel_size = voxel_size
-        self._alpha = float(alpha.item() if hasattr(alpha, "item") else alpha)
+        self._alpha = float(alpha_cs.item() if hasattr(alpha_cs, "item") else alpha_cs)
+        if alpha is not None:
+            console.print(
+                f"  amplitude contrast {alpha} (overrides the .cs file's {self._alpha:g})"
+            )
+            self._alpha = float(alpha)
 
         # training hyperparameters (stored for run() and test_run())
         self.lr = lr
@@ -269,36 +271,32 @@ class Ghostbuster:
         self.scheduler = scheduler
         self.lr_decay = lr_decay
         self.epochs = epochs
-        self.batch_size = batch_size
-        self.scattering_model = scattering_model
-        self.aberration_model = aberration_model
-        self.aberration_backend = aberration_backend
-        self.lpp_params = lpp_params
+        self.batchsize = batchsize
+        if init_lowpass is not None and init_lowpass <= 0:
+            raise ValueError(f"init_lowpass={init_lowpass} must be positive (Angstrom)")
+        self.init_volume = init_volume
+        self.init_lowpass = init_lowpass
+        # The amplitude contrast is data, read from the .cs file above unless
+        # `alpha` overrides it.
+        self.propagation = replace(propagation, alpha=self._alpha)
+        self.optics = optics
         self.symmetry = symmetry
         self.symmetry_batchsize = symmetry_batchsize
         self.symmetry_mode = symmetry_mode
-        self.sparsity = sparsity
-        self.rotate_mode = rotate_mode
-        self.ews_curvature_sign = ews_curvature_sign
-        self.klim = klim
-        self.nps_weight = nps_weight
-        self.learn_noise_model = learn_noise_model
-        self.use_ncc = use_ncc
         self.fsc_ref = fsc_ref
         self.fsc_mask = fsc_mask
         self.cryosparc_ref = cryosparc_ref
-        self.use_2d_mask = use_2d_mask
         self.precision = precision
         self.num_workers = num_workers
-        self.num_particles = num_particles
+        self.n_particles = n_particles
         self.dose_per_angstrom = dose_per_angstrom
         self.run_dir = Path(run_dir) if run_dir is not None else None
 
     @staticmethod
     def _load_particle_parameters(
         cs_file: str | Path,
-        return_class: Literal["0", "1", "all"],
-        num_particles: int | None,
+        halfset: Literal["A", "B", "all"],
+        n_particles: int | None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -313,7 +311,7 @@ class Ghostbuster:
         """Extract poses, CTF parameters, and particle indices from a .cs file."""
         from ..io import extract_parameters_from_csfile
 
-        print(f"Loading particle parameters from {Path(cs_file).name} ...")
+        console.print(f"Loading particle parameters from {Path(cs_file).name} ...")
         (
             voltage,
             pixel_size,
@@ -326,14 +324,14 @@ class Ghostbuster:
             indices,
             _split,
         ) = extract_parameters_from_csfile(
-            str(cs_file), return_class=return_class, n_particles=num_particles
+            str(cs_file), halfset=halfset, n_particles=n_particles
         )
         n_loaded = len(rotations)
         voltage_val = float(voltage.item() if hasattr(voltage, "item") else voltage)
         pixel_size_val = float(
             pixel_size.item() if hasattr(pixel_size, "item") else pixel_size
         )
-        print(
+        console.print(
             f"  {n_loaded} particles  |  {voltage_val:.0f} kV  |  {pixel_size_val:.3f} Å/px"
         )
         return (
@@ -349,34 +347,161 @@ class Ghostbuster:
         )
 
     @staticmethod
-    def _load_particle_images(
-        mrc_file: str | Path, indices: torch.Tensor
+    def _image_signs(
+        cs_file: str | Path, indices: torch.Tensor, image_units: str
     ) -> torch.Tensor:
-        """Load the particle stack .mrc/.mrcs file, indexed to the extracted particles."""
-        print(f"Loading particle stack from {Path(mrc_file).name} ...")
-        with mrcfile.mmap(str(mrc_file)) as mrc:
-            images = torch.as_tensor((mrc.data[indices]).copy())
+        """
+        Each selected image's data sign, from the ``.cs`` file's ``blob/sign``.
+
+        Without one, a normalized stack is taken to be inverted (-1) and a
+        stack of counts to be in its recorded polarity (+1). Counts recorded
+        as inverted are refused: a count has a physical sign, so a stack of
+        counts stored negated is a mislabelled file, not a convention.
+        """
+        from ..io import image_signs
+
+        rows = [int(i) for i in indices.flatten().tolist()]
+        assumed = -1.0 if image_units == "normalized" else 1.0
+        signs = image_signs(cs_file, rows, assumed=assumed)
+        if image_units == "counts" and bool((signs < 0).any()):
+            raise ValueError(
+                f"{Path(cs_file).name} records a data sign of -1 (blob/sign) for a "
+                "stack given as image_units='counts': counts carry the polarity "
+                "they were recorded in, so they cannot be stored inverted. Check "
+                "image_units, or the sign the .cs file was written with."
+            )
+        return signs
+
+    @staticmethod
+    def _load_particle_images(
+        cs_file: str | Path,
+        indices: torch.Tensor,
+        mrc_file: str | Path,
+        address_by_blob_idx: bool,
+    ) -> torch.Tensor:
+        """
+        Load each extracted particle's image from the stack.
+
+        Row ``i`` of the ``.cs`` file pairs with slice ``i`` of the stack. That
+        is the contract, because it is the one that survives the pair being
+        copied off the machine that produced it, and it is checked rather than
+        assumed: CryoSPARC's ``blob/idx`` says which slice each row's image
+        really is, and a Restack Particles job does not write its stack in row
+        order. Reading one as if it did pairs every pose with a different
+        particle's image and says nothing about it, so a stack the ``.cs``
+        contradicts is refused. ``address_by_blob_idx`` reads such a stack
+        where the ``.cs`` says the images are, instead of refusing.
+        """
+        from ..io import particle_image_refs, read_particle_images, row_order_conflict
+
+        rows = [int(i) for i in indices.flatten().tolist()]
+
+        if address_by_blob_idx:
+            refs = particle_image_refs(cs_file, stack_path=mrc_file)
+            console.print(
+                f"Loading particle stack from {Path(mrc_file).name} "
+                "at the .cs file's blob/idx ..."
+            )
+            images = read_particle_images([refs[i] for i in rows])
+        else:
+            conflict = row_order_conflict(cs_file, rows)
+            if conflict is not None:
+                row, idx, stack = conflict
+                raise ValueError(
+                    f"{Path(cs_file).name} says its images are not in row order: "
+                    f"row {row} is slice {idx} of {stack}, not slice {row}. Reading "
+                    f"{Path(mrc_file).name} by row would pair every pose with "
+                    "another particle's image. Point mrc_file at a stack written in "
+                    "this file's row order (`specter.io.write_row_ordered_csfile` writes one), "
+                    "or pass address_by_blob_idx to read this one where the .cs "
+                    "says the images are."
+                )
+            console.print(f"Loading particle stack from {Path(mrc_file).name} ...")
+            with mrcfile.mmap(str(mrc_file)) as mrc:
+                # Integer-list indexing already makes a writable, owned copy,
+                # independent of the mmap. A second copy doubles load scratch.
+                images = torch.as_tensor(mrc.data[rows])
+
         h, w = images.shape[-2], images.shape[-1]
-        print(f"  {len(images)} images  |  box {h}×{w}  |  dtype {images.dtype}")
+        console.print(
+            f"  {len(images)} images  |  box {h}×{w}  |  dtype {images.dtype}"
+        )
         return images
+
+    def _initial_volume(self, n: int, voxel_size: float) -> torch.Tensor:
+        """
+        The volume training starts from: zeros, or `init_volume` on this grid.
+
+        Parameters
+        ----------
+        n : int
+            Box size of the images, and so of the reconstructed volume.
+        voxel_size : float
+            Voxel size of the reconstruction in Å, after any binning.
+
+        Returns
+        -------
+        torch.Tensor
+            Starting volume, shape ``(n, n, n)``, on the CPU.
+
+        Raises
+        ------
+        ValueError
+            If `init_volume` is not a cube, or its box is not an integer
+            multiple of `n`.
+        """
+        if self.init_volume is None:
+            return torch.zeros(n, n, n)
+        if isinstance(self.init_volume, torch.Tensor):
+            volume = self.init_volume.detach().to("cpu", torch.float32).clone()
+        else:
+            with mrcfile.open(str(self.init_volume), permissive=True) as mrc:
+                volume = torch.as_tensor(mrc.data.astype("float32"))
+        if volume.ndim != 3 or len(set(volume.shape)) != 1:
+            raise ValueError(
+                f"init_volume must be a cube, got shape {tuple(volume.shape)}"
+            )
+        box = volume.shape[-1]
+        if box % n:
+            raise ValueError(
+                f"init_volume is {box}^3 but the images are {n}x{n}: its box must "
+                "equal the images' or be an integer multiple of it"
+            )
+        if box != n:
+            # test_run bins the images; block-averaging keeps the potential's
+            # value per voxel, as the binned reconstruction expects.
+            factor = box // n
+            volume = torch.nn.functional.avg_pool3d(volume[None, None], factor)[0, 0]
+        if self.init_lowpass is not None:
+            k = torch.fft.fftfreq(n, d=voxel_size)
+            kz, ky, kx = torch.meshgrid(k, k, k, indexing="ij")
+            k_mag = torch.sqrt(kz**2 + ky**2 + kx**2)
+            # Butterworth, order 8: half power at 1 / init_lowpass, no ringing
+            # worth the name, and DC passed unchanged.
+            response = 1.0 / torch.sqrt(1.0 + (k_mag * self.init_lowpass) ** 16)
+            volume = torch.fft.ifftn(torch.fft.fftn(volume) * response).real
+        console.print(
+            f"  starting volume: {self.init_volume if isinstance(self.init_volume, (str, Path)) else 'tensor'}"
+            + (f", low-passed to {self.init_lowpass:g} Å" if self.init_lowpass else "")
+        )
+        return volume.contiguous()
 
     def _build_reconstructor_and_loader(
         self,
         images: torch.Tensor,
         voxel_size: float,
-        scattering_model: str,
-        batch_size: int,
+        batchsize: int,
     ) -> tuple["Reconstructor", torch.utils.data.DataLoader]:
         from ..arrays import ball3d
 
         n = images.shape[-1]
         kmask = ball3d(n, n)
-        volume_init = torch.zeros(n, n, n)
+        volume_init = self._initial_volume(n, voxel_size)
 
         idx = torch.arange(len(images))
         dataset = torch.utils.data.TensorDataset(images, idx)
         loader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, num_workers=self.num_workers
+            dataset, batch_size=batchsize, shuffle=True, num_workers=self.num_workers
         )
 
         model = Reconstructor(
@@ -388,14 +513,11 @@ class Ghostbuster:
             self._voltage,
             self.dose_per_angstrom,
             anisomag=self._anisomag,
-            alpha=self._alpha,
             scale=self._scale,
             defocus_offset=torch.tensor(self.defocus_offset),
             bfactor=self.bfactor,
-            scattering_model=scattering_model,
-            aberration_model=self.aberration_model,
-            aberration_backend=self.aberration_backend,
-            lpp_params=self.lpp_params,
+            propagation=self.propagation,
+            optics=self.optics,
             lr=self.lr,
             lr_R=self.lr_R,
             lr_T=self.lr_T,
@@ -403,20 +525,12 @@ class Ghostbuster:
             scheduler=self.scheduler,
             lr_decay=self.lr_decay,
             kmask=kmask,
-            klim=self.klim,
-            nps_weight=self.nps_weight,
-            learn_noise_model=self.learn_noise_model,
-            use_ncc=self.use_ncc,
-            sparsity=self.sparsity,
-            rotate_mode=self.rotate_mode,
-            ews_curvature_sign=self.ews_curvature_sign,
             symmetry=self.symmetry,
             symmetry_batchsize=self.symmetry_batchsize,
             symmetry_mode=self.symmetry_mode,
             fsc_ref=self.fsc_ref,
             fsc_mask=self.fsc_mask,
             cryosparc_ref=self.cryosparc_ref,
-            use_2d_mask=self.use_2d_mask,
             run_dir=self.run_dir,
             halfset_label=self.halfset_label,
         )
@@ -424,7 +538,7 @@ class Ghostbuster:
 
     def run(
         self,
-        device: int | Sequence[int] = 0,
+        device: int | Sequence[int] | str = 0,
         callbacks: list[Any] | None = None,
     ) -> "Reconstructor":
         """
@@ -432,13 +546,15 @@ class Ghostbuster:
 
         Parameters
         ----------
-        device : int or sequence of int
+        device : int or sequence of int or {"cpu"}
             GPU index, or a sequence of GPU indices (e.g. ``[0, 1]``) to train
             across multiple GPUs via Lightning DDP (``strategy="ddp"``).
             Gradients (for the volume, and for rotations/translations/defocus
             when pose refinement is enabled) are synchronised every step via
             DDP's all-reduce, so the returned model is identical whichever
-            rank produced it. Ignored when CUDA is unavailable.
+            rank produced it. Pass ``"cpu"`` to force CPU
+            training; any other value uses the GPU when CUDA is
+            available and falls back to the CPU when it is not.
         callbacks : list, optional
             Additional Lightning callbacks passed to the ``Trainer``.
 
@@ -447,29 +563,21 @@ class Ghostbuster:
         Reconstructor
             The trained model. Access the volume via ``model.V.detach()``.
         """
-        _box = self._images.shape[-1]
-        use_gpu = torch.cuda.is_available()
-        _device_str = f"GPU {device}" if use_gpu else "CPU"
-        print(
-            f"Starting reconstruction: {len(self._images)} particles  |  box {_box}³  |  "
-            f"{self.scattering_model}  |  {self.epochs} epochs  |  "
-            f"batch {self.batch_size}  |  {_device_str}"
+        console.print(
+            f"Starting reconstruction: {len(self._images)} particles  |  "
+            f"box {self._images.shape[-1]}³  |  "
+            f"{self.propagation.scattering_model}  |  {self.epochs} epochs  |  "
+            f"batch {self.batchsize}  |  {self._device_label(device)}"
         )
         model, loader = self._build_reconstructor_and_loader(
-            self._images,
-            self._voxel_size,
-            self.scattering_model,
-            self.batch_size,
+            self._images, self._voxel_size, self.batchsize
         )
-
-        trainer = build_trainer(use_gpu, device, self.epochs, self.precision, callbacks)
-        trainer.fit(model, loader)
-        return model
+        return self._fit(model, loader, device, self.epochs, self.precision, callbacks)
 
     def test_run(
         self,
         bin_factor: int = 8,
-        device: int | Sequence[int] = 0,
+        device: int | Sequence[int] | str = 0,
         callbacks: list[Any] | None = None,
     ) -> "Reconstructor":
         """
@@ -486,10 +594,10 @@ class Ghostbuster:
         bin_factor : int
             Spatial downsampling factor applied to images and voxel size.
             Default 8.
-        device : int or sequence of int
+        device : int or sequence of int or {"cpu"}
             GPU index, or a sequence of GPU indices (e.g. ``[0, 1]``) to run
-            across multiple GPUs via Lightning DDP. Ignored when CUDA is
-            unavailable.
+            across multiple GPUs via Lightning DDP, or ``"cpu"`` to force
+            CPU training.
         callbacks : list, optional
             Additional Lightning callbacks passed to the ``Trainer``.
 
@@ -499,27 +607,17 @@ class Ghostbuster:
             The trained model after one epoch.
         """
         n_particles = len(self._images)
-        print(f"Test run: {n_particles} particles  |  {bin_factor}× binned  |  1 epoch")
-
-        pool = torch.nn.AvgPool2d(bin_factor, stride=bin_factor)
-        images_binned = pool(self._images.unsqueeze(1)).squeeze(1) * bin_factor**2
-        voxel_size_binned = self._voxel_size * bin_factor
-
-        model, loader = self._build_reconstructor_and_loader(
-            images_binned,
-            voxel_size_binned,
-            self.scattering_model,
-            self.batch_size,
+        console.print(
+            f"Test run: {n_particles} particles  |  {bin_factor}× binned  |  1 epoch"
         )
-
-        use_gpu = torch.cuda.is_available()
-        trainer = build_trainer(use_gpu, device, 1, "32", callbacks)
-        trainer.fit(model, loader)
-
-        v = model.V.detach()
-        print(
-            f"Test run passed — {bin_factor}× binned, {n_particles} particles, "
-            f"box {images_binned.shape[-1]}³  |  "
-            f"V min={v.min():.4f}  max={v.max():.4f}  mean={v.mean():.4f}"
+        images_binned, voxel_size_binned = self._bin_images(bin_factor)
+        model, loader = self._build_reconstructor_and_loader(
+            images_binned, voxel_size_binned, self.batchsize
+        )
+        model = self._fit(model, loader, device, 1, "32", callbacks)
+        self._report_test_run(
+            model,
+            f"{bin_factor}× binned, {n_particles} particles, "
+            f"box {images_binned.shape[-1]}³",
         )
         return model

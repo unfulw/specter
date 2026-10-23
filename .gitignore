@@ -1,3 +1,17 @@
+# What specter writes into a working directory (leading slash anchors
+# each to the repo root, so e.g. /particles/ doesn't also match
+# src/specter/particles/). The project marker is tracked deliberately:
+# it is what makes this checkout a specter project.
+/particles/
+/micrographs/
+/tiltseries/
+/tomograms/
+/ice/
+/reconstructions/
+/match/
+# Pre-2026-08-24 layout. Nothing writes here any more, but existing
+# checkouts still have one and it should stay out of `git status`.
+/specter-data/
 pdb-data/
 cache/
 manuscript/
@@ -42,3 +56,11 @@ site/
 .codex
 .claude/
 .superpowers/
+
+# CLI QA sweep run artifacts (the harness itself is tracked, see tools/cli-qa/README.md)
+tools/cli-qa/results/
+
+# Parsed-structure cache. Written wherever a pdb_cache_dir points, which for
+# the tests is the tracked fixtures folder -- the entries are derived from the
+# .cif files beside them and regenerate on demand (see PDB's parsed cache).
+tests/test_data/parsed/

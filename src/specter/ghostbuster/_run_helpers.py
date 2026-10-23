@@ -1,12 +1,56 @@
+"""
+Device resolution and Lightning `Trainer` construction for the two
+Ghostbuster pipelines.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Sequence, cast
 
 import lightning as L
+from lightning.pytorch.callbacks import TQDMProgressBar
+import torch
 
 # ---------------------------------------------------------------------------
 # Shared Trainer construction for Ghostbuster/TomogramGhostbuster run()/test_run()
 # ---------------------------------------------------------------------------
+
+
+def resolve_device(device: int | Sequence[int] | str) -> tuple[bool, int | list[int]]:
+    """
+    Split a ``device`` argument into a GPU/CPU decision and the device ids.
+
+    ``"cpu"`` is the only spelling that forces the CPU; every other value
+    targets the GPU when CUDA is available and silently falls back to the CPU
+    when it is not. Without the explicit ``"cpu"`` case, ``run(device=...)``
+    had no way to express "run on the CPU" on a machine that has a GPU, since
+    the decision was taken from ``torch.cuda.is_available()`` alone.
+
+    Parameters
+    ----------
+    device : int or sequence of int or str
+        A GPU index, a sequence of GPU indices for multi-GPU DDP, or the
+        string ``"cpu"``.
+
+    Returns
+    -------
+    use_gpu : bool
+        Whether to target a GPU, as :func:`build_trainer` expects it.
+    device : int or list of int
+        The device ids, unchanged except that ``"cpu"`` becomes ``0`` (which
+        ``build_trainer`` ignores once ``use_gpu`` is False).
+    """
+    if isinstance(device, str):
+        if device != "cpu":
+            raise ValueError(
+                f"device={device!r} is invalid: the only string accepted is "
+                "'cpu'; pass a GPU index (0) or a list of them ([0, 1]) to "
+                "target GPUs."
+            )
+        return False, 0
+    return torch.cuda.is_available(), (
+        device if isinstance(device, int) else list(device)
+    )
 
 
 def build_trainer(
@@ -49,6 +93,11 @@ def build_trainer(
     """
     device_list = [device] if isinstance(device, int) else list(device)
     multi_gpu = use_gpu and len(device_list) > 1
+    # The progress bar reads the logged loss with `.item()` on every
+    # refresh, a device sync; at the default refresh of every step that
+    # serialised the CPU's kernel launches behind the GPU. Every tenth step
+    # is the same bar to a human.
+    callbacks = [TQDMProgressBar(refresh_rate=10), *(callbacks or [])]
     return L.Trainer(
         accelerator="gpu" if use_gpu else "cpu",
         devices=device_list if use_gpu else 1,
@@ -57,5 +106,5 @@ def build_trainer(
         precision=cast(Any, precision if use_gpu else "32"),
         logger=False,
         enable_checkpointing=False,
-        callbacks=callbacks or [],
+        callbacks=callbacks,
     )

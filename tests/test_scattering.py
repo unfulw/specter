@@ -4,54 +4,88 @@ import roma
 import torch
 
 from specter.rotations import build_affine_matrix, rotate_volume
+from specter.potential import apply_amplitude_contrast
 from specter.scattering import (
     IterativeScattering,
     Scattering,
-    complex_potential,
 )
+from specter.fft import fft2, ifft2
 
 
-def test_complex_potential():
-    v = torch.ones(4, 4)
-    alpha = 0.1
-    cv = complex_potential(v, alpha=alpha)
+@pytest.mark.parametrize("sign", ["negative", "positive"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("uniform_absorption", [0.0, 0.03])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda:0",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="needs CUDA"
+            ),
+        ),
+    ],
+)
+def test_multislice_separate_absorption_matches_complex_volume(
+    sign, dtype, uniform_absorption, device
+):
+    """Pairing fields per chunk preserves both waves and material gradients.
 
-    expected_real = np.sqrt(0.99)
-    assert torch.allclose(
-        cv.real, torch.tensor(expected_real, dtype=torch.float32), atol=1e-6
-    )
-    assert torch.allclose(cv.imag, torch.tensor(0.1, dtype=torch.float32), atol=1e-6)
-
-
-def test_iterative_scattering_batch_size(dummy_volume):
-    scat_iter = IterativeScattering(
-        nxy=64,
-        pixel_size=1.0,
-        voltage=300.0,
-        scattering_model="multislice",
+    Three images and 19 slices exercise noncontiguous batch/chunk views,
+    reversed traversal and the final incomplete eight-slice chunk. Explicit
+    absorption must also bypass a nonzero amplitude-contrast setting.
+    """
+    torch.manual_seed(43)
+    shape = (3, 19, 16, 16)
+    elastic = torch.rand(shape, device=device, dtype=dtype).requires_grad_()
+    absorption = (0.1 * torch.rand(shape, device=device, dtype=dtype)).requires_grad_()
+    model = Scattering(
+        16,
+        1.3,
+        300.0,
+        alpha=0.2,
+        klim=0.66,
+        ews_curvature_sign=sign,
+        uniform_absorption=uniform_absorption,
         progressbars=False,
+    ).to(device=device, dtype=dtype)
+    reference = model(torch.complex(elastic, absorption))
+    want_grads = torch.autograd.grad(
+        reference.abs().square().sum(), (elastic, absorption)
+    )
+    actual = model(elastic, absorption_potential=absorption)
+    got_grads = torch.autograd.grad(actual.abs().square().sum(), (elastic, absorption))
+    assert torch.equal(actual, reference)
+    for actual_grad, reference_grad in zip(got_grads, want_grads, strict=True):
+        torch.testing.assert_close(actual_grad, reference_grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("model", ["rytov", "projection", "firstborn", "kinematic"])
+def test_separate_absorption_preserves_other_scattering_models(model):
+    torch.manual_seed(9)
+    v = torch.rand(2, 9, 12, 12)
+    absorption = torch.rand_like(v) * 0.1
+    scattering = Scattering(12, 1.0, 300.0, scattering_model=model, nz=9, alpha=0.2)
+    assert torch.equal(
+        scattering(v, absorption_potential=absorption),
+        scattering(torch.complex(v, absorption)),
     )
 
-    R = roma.rotvec_to_rotmat(torch.tensor([[0.0, 0.1, 0.0]])).to(dummy_volume.device)
-    theta_matrix = build_affine_matrix(R)
 
-    psi1 = scat_iter.forward(dummy_volume, theta_matrix, slice_batch_size=1)
-    psi4 = scat_iter.forward(dummy_volume, theta_matrix, slice_batch_size=4)
-
-    assert torch.allclose(psi1, psi4, atol=1e-5)
-
-    scat_iter_rytov = IterativeScattering(
-        nxy=64,
-        pixel_size=1.0,
-        voltage=300.0,
-        scattering_model="rytov",
-        progressbars=False,
-    )
-
-    psi1_rytov = scat_iter_rytov.rytov(dummy_volume, theta_matrix, slice_batch_size=1)
-    psi4_rytov = scat_iter_rytov.rytov(dummy_volume, theta_matrix, slice_batch_size=4)
-
-    assert torch.allclose(psi1_rytov, psi4_rytov, atol=1e-5)
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "complex"])
+def test_multislice_rejects_incompatible_absorption_fields(invalid):
+    v = torch.ones(1, 9, 8, 8)
+    absorption = torch.zeros_like(v)
+    if invalid == "shape":
+        absorption = absorption[:, :1]
+    elif invalid == "dtype":
+        absorption = absorption.double()
+    else:
+        absorption = absorption.to(torch.complex64)
+    scattering = Scattering(8, 1.0, 300.0)
+    with pytest.raises(ValueError, match="real and share shape, dtype and device"):
+        scattering(v, absorption_potential=absorption)
 
 
 def test_multislice_checkpointing_matches_uncheckpointed(dummy_volume):
@@ -68,23 +102,6 @@ def test_multislice_checkpointing_matches_uncheckpointed(dummy_volume):
 
     assert torch.allclose(psi, psi_ckpt3, atol=1e-5)
     assert torch.allclose(psi, psi_ckpt8, atol=1e-5)
-
-
-def test_multislice_checkpointing_backprops(dummy_volume):
-    """Gradients must flow through the checkpointed multislice path."""
-    scat_iter = IterativeScattering(
-        nxy=64, pixel_size=1.0, voltage=300.0, progressbars=False
-    )
-    R = roma.rotvec_to_rotmat(torch.tensor([[0.0, 0.1, 0.0]])).to(dummy_volume.device)
-    theta_matrix = build_affine_matrix(R)
-
-    V = dummy_volume.clone().requires_grad_(True)
-    psi = scat_iter.multislice(V, theta_matrix, checkpoint_chunks=3)
-    psi.abs().sum().backward()
-
-    assert V.grad is not None
-    assert torch.isfinite(V.grad).all()
-    assert V.grad.abs().sum() > 0
 
 
 def test_parallel_rytov_matches_iterative_rytov(dummy_volume):
@@ -122,9 +139,23 @@ def test_parallel_rytov_checkpointing_backprops(dummy_volume):
     assert V.grad.abs().sum() > 0
 
 
-@pytest.mark.parametrize("scattering_model", ["firstborn", "kinematic", "ctf"])
-def test_iterative_models_consistent_across_batch_size(dummy_volume, scattering_model):
-    """firstborn/kinematic/ctf must be invariant to the slice_batch_size chunking."""
+@pytest.mark.parametrize(
+    "scattering_model, method_name",
+    [
+        ("multislice", "forward"),
+        ("rytov", "rytov"),
+        ("firstborn", "firstborn"),
+        ("kinematic", "kinematic"),
+        ("ctf", "ctf"),
+    ],
+    ids=["multislice", "rytov", "firstborn", "kinematic", "ctf"],
+)
+def test_iterative_models_consistent_across_batch_size(
+    dummy_volume, scattering_model, method_name
+):
+    """Every iterative model must be invariant to the slice_batchsize chunking
+    (multislice through the ``forward`` dispatch, the others through their own
+    method)."""
     scat_iter = IterativeScattering(
         nxy=64,
         pixel_size=1.0,
@@ -135,18 +166,18 @@ def test_iterative_models_consistent_across_batch_size(dummy_volume, scattering_
     R = roma.rotvec_to_rotmat(torch.tensor([[0.0, 0.1, 0.0]])).to(dummy_volume.device)
     theta_matrix = build_affine_matrix(R)
 
-    method = getattr(scat_iter, scattering_model)
-    psi1 = method(dummy_volume, theta_matrix, slice_batch_size=1)
-    psi4 = method(dummy_volume, theta_matrix, slice_batch_size=4)
+    method = getattr(scat_iter, method_name)
+    psi1 = method(dummy_volume, theta_matrix, slice_batchsize=1)
+    psi4 = method(dummy_volume, theta_matrix, slice_batchsize=4)
 
     assert torch.allclose(psi1, psi4, atol=1e-5)
 
 
 @pytest.fixture
 def dummy_volume() -> torch.Tensor:
-    vol = torch.zeros(1, 32, 64, 64)
-    vol[0, 12:20, 24:40, 24:40] = 1.0
-    return vol
+    volume = torch.zeros(1, 32, 64, 64)
+    volume[0, 12:20, 24:40, 24:40] = 1.0
+    return volume
 
 
 @pytest.fixture
@@ -157,11 +188,15 @@ def padded_volume():
     boundary contribute nothing, making Scattering and IterativeScattering
     numerically comparable at arbitrary tilt angles.
     """
-    vol = torch.zeros(64, 64, 64)
-    vol[24:40, 24:40, 24:40] = 1.0
-    return vol
+    volume = torch.zeros(64, 64, 64)
+    volume[24:40, 24:40, 24:40] = 1.0
+    return volume
 
 
+@pytest.mark.parametrize(
+    "scattering_model",
+    ["projection", "multislice", "rytov", "firstborn", "kinematic", "ctf"],
+)
 @pytest.mark.parametrize(
     "angle_deg, atol",
     [
@@ -171,8 +206,31 @@ def padded_volume():
         (45.0, 5e-3),
     ],
 )
-def test_scattering_vs_iterative_consistency(padded_volume, angle_deg, atol):
-    """Scattering with a pre-rotated volume matches IterativeScattering for the same pose."""
+def test_scattering_vs_iterative_consistency(
+    padded_volume, angle_deg, atol, scattering_model
+):
+    """
+    Scattering with a pre-rotated volume matches IterativeScattering for the
+    same pose, for every mode both implement.
+
+    The two are independent implementations of the same six models -- roughly
+    1,360 lines with no inheritance between them -- split by caller rather than
+    by physics: `Scattering` takes a whole volume, `IterativeScattering` streams
+    Z-slices for volumes too large to rotate at once, which is what every tilt
+    series and micrograph runs. Nothing but this test stops them drifting apart.
+
+    It used to cover ``"projection"`` alone, which is the case least able to
+    drift: a plain sum along Z with no propagation between slices, so streaming
+    and whole-volume paths coincide almost trivially. The modes that can drift
+    are the ones where the streamed version has to get slice ordering,
+    propagator distances and tilt geometry right, and ``"multislice"`` -- the
+    default, and what a tilt series actually uses -- was among the untested
+    ones. Measured agreement at 0°: projection 2.0e-08, ctf 4.0e-08, firstborn
+    and kinematic 6.0e-08, rytov 7.2e-07, multislice 3.1e-06.
+
+    ``nz`` goes to `Scattering` only: `IterativeScattering` derives it from the
+    volume it is handed, and rejects the argument.
+    """
     nxy = 64
 
     theta_rad = torch.deg2rad(torch.tensor(angle_deg))
@@ -186,20 +244,753 @@ def test_scattering_vs_iterative_consistency(padded_volume, angle_deg, atol):
         nxy=nxy,
         pixel_size=1.0,
         voltage=300.0,
-        scattering_model="projection",
+        scattering_model=scattering_model,
         alpha=0.1,
         progressbars=False,
     )
 
-    scat = Scattering(**kwargs)
+    scat = Scattering(**kwargs, nz=padded_volume.shape[0])
     scat_iter = IterativeScattering(**kwargs)
 
-    vol_rotated = rotate_volume(padded_volume, theta_matrix, padding_mode="zeros")
-    psi_scat = scat.forward(vol_rotated)
+    volume_rotated = rotate_volume(padded_volume, theta_matrix, padding_mode="zeros")
+    psi_scat = scat.forward(volume_rotated)
 
     psi_iter = scat_iter.forward(padded_volume.unsqueeze(0), theta_matrix)
 
     assert psi_scat.shape == psi_iter.shape
+    assert torch.allclose(psi_scat, psi_iter, atol=atol), (
+        f"{scattering_model} disagrees between implementations at "
+        f"{angle_deg}°: max diff {(psi_scat - psi_iter).abs().max().item():.2e}"
+    )
+
+
+def test_klim_bandlimit_keeps_low_frequencies(dummy_volume):
+    """``klim`` must zero content *above* the cutoff and leave content
+    *below* it untouched -- Kirkland's antialiasing bandlimit, not its
+    inverse. Regression test for a fftshift/native-FFT convention mismatch
+    between ``disk2d`` (centered at N//2) and the unshifted spectrum
+    ``Scattering.multislice`` actually multiplies it into."""
+    nxy = 64
+    pixel_size = 1.0
+    klim = 0.5
+    scat = Scattering(
+        nxy=nxy,
+        pixel_size=pixel_size,
+        voltage=300.0,
+        scattering_model="multislice",
+        klim=klim,
+        progressbars=False,
+    )
+    psi = scat(dummy_volume)
+
+    k = torch.fft.fftfreq(nxy, pixel_size)
+    kxx, kyy = torch.meshgrid(k, k, indexing="ij")
+    k_mag = torch.sqrt(kxx**2 + kyy**2)
+    k_nyquist = 1.0 / (2.0 * pixel_size)
+
+    spectrum = torch.fft.fft2(psi[0])
+    below_cutoff = spectrum[k_mag <= klim * k_nyquist]
+    above_cutoff = spectrum[k_mag > klim * k_nyquist]
+
+    # Masked every slice through 32 FFT/IFFT round trips, so the "zeroed"
+    # region carries float32 round-off rather than being exactly 0 -- still
+    # several orders of magnitude below the surviving low-frequency content.
+    assert torch.abs(above_cutoff).max() < 1e-3 * torch.abs(below_cutoff).max()
+    assert torch.abs(below_cutoff).max() > 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Multislice chunking: the chunked/unbind form of the slice loop must stay
+# bitwise identical to the plain per-slice form it replaced. Asserted with
+# torch.equal rather than allclose -- the restructuring only changes kernel
+# launch granularity, never per-element arithmetic, so any drift at all is a
+# regression rather than tolerable round-off.
+# ---------------------------------------------------------------------------
+
+
+def _multislice_per_slice_reference(scat, V):
+    """The pre-chunking implementation of Scattering.multislice, verbatim."""
+    F = scat.F_real + 1j * scat.F_imag
+    if scat.ews_curvature_sign == "positive":
+        V = torch.flip(V, dims=(1,))
+    exitwave = None
+    for i in range(V.size(1)):
+        t = torch.exp(1j * scat.sigma * scat.pixel_size * V[:, i].to(scat.device))
+        wv = t if exitwave is None else t * exitwave
+        exitwave = torch.fft.ifft2(
+            torch.fft.fft2(wv, dim=(-1, -2)) * F * scat.kmask, dim=(-1, -2)
+        )
+    return exitwave
+
+
+@pytest.mark.parametrize(
+    "alpha, klim, sign, nz",
+    [
+        (0.07, None, "negative", 16),
+        (0.0, None, "negative", 16),
+        (0.07, 0.66, "negative", 16),
+        (0.07, None, "positive", 16),
+        (0.07, None, "negative", 13),  # nz not divisible by the chunk size
+    ],
+)
+def test_multislice_matches_per_slice_reference(alpha, klim, sign, nz):
+    """Chunked multislice is bitwise identical to the per-slice form."""
+    n = 32
+    scat = Scattering(
+        nxy=n,
+        pixel_size=1.0,
+        voltage=300.0,
+        scattering_model="multislice",
+        alpha=alpha,
+        klim=klim,
+        ews_curvature_sign=sign,
+        nz=nz,
+        progressbars=False,
+    )
+    torch.manual_seed(0)
+    V = torch.rand(2, nz, n, n) * 4.0
+
+    got = scat.multislice(apply_amplitude_contrast(V, alpha=alpha))
+    want = _multislice_per_slice_reference(
+        scat, apply_amplitude_contrast(V, alpha=alpha)
+    )
+    assert torch.equal(got, want)
+
+
+def test_multislice_gradients_match_per_slice_reference():
+    """Gradients w.r.t. the potential are bitwise identical too."""
+    n, nz = 32, 16
+    scat = Scattering(
+        nxy=n,
+        pixel_size=1.0,
+        voltage=300.0,
+        scattering_model="multislice",
+        alpha=0.07,
+        nz=nz,
+        progressbars=False,
+    )
+    torch.manual_seed(0)
+    V = torch.rand(2, nz, n, n) * 4.0
+
+    def grad_of(fn):
+        v = V.clone().requires_grad_(True)
+        fn(scat, apply_amplitude_contrast(v, alpha=0.07)).real.sum().backward()
+        return v.grad
+
+    assert torch.equal(
+        grad_of(lambda s, x: s.multislice(x)),
+        grad_of(_multislice_per_slice_reference),
+    )
+
+
+def test_multislice_accepts_volume_off_compute_device():
+    """A volume on a different device than the module still streams through."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA to have two distinct devices")
+    n, nz = 32, 16
+    scat = Scattering(
+        nxy=n,
+        pixel_size=1.0,
+        voltage=300.0,
+        scattering_model="multislice",
+        alpha=0.07,
+        nz=nz,
+        progressbars=False,
+    ).to("cuda")
+    torch.manual_seed(0)
+    V_cpu = apply_amplitude_contrast(torch.rand(1, nz, n, n) * 4.0, alpha=0.07)
+
+    out = scat.multislice(V_cpu)
+    assert out.device.type == "cuda"
+    assert torch.equal(out, scat.multislice(V_cpu.cuda()))
+
+
+def _iterative_multislice_unhoisted_reference(scat, V, theta_matrix):
+    """
+    `IterativeScattering.multislice` with the bandlimit applied per slice.
+
+    The shipped loop folds the bandlimit into the propagator once
+    (``Fk = F * kmask``) instead of evaluating ``psi_k * F * kmask`` on every
+    slice. This is the pre-hoist arithmetic, kept verbatim as the reference.
+    """
+    from specter.fft import fft2, ifft2
+
+    if scat.pad_fft:
+        F = scat.F_step_padded_real + 1j * scat.F_step_padded_imag
+        kmask = scat.kmask_padded
+        canvas = scat.padded_nxy
+        roi_size = canvas
+    else:
+        F = scat.F_step_real + 1j * scat.F_step_imag
+        kmask = scat.kmask
+        canvas = scat.nxy
+        roi_size = None
+
+    exitwave = torch.ones(
+        V.shape[0], canvas, canvas, device=scat.device, dtype=torch.complex64
+    )
+    for _, _, slice_sample in scat._iter_slices(
+        V, theta_matrix, 1, "reference", roi_size=roi_size
+    ):
+        slice_complex = apply_amplitude_contrast(slice_sample, alpha=scat.alpha)
+        t = torch.exp(1j * scat.sigma * scat.pixel_size * slice_complex)
+        exitwave = ifft2(fft2(t * exitwave) * F * kmask)
+    return exitwave
+
+
+@pytest.mark.parametrize("klim", [None, 0.66])
+@pytest.mark.parametrize("alpha", [0.0, 0.1])
+def test_iterative_multislice_bandlimit_hoist_is_exact(alpha, klim, pad_fft=False):
+    """
+    Folding the bandlimit into the propagator changes nothing, bit for bit.
+
+    `psi_k * F * kmask` and `psi_k * (F * kmask)` are only interchangeable
+    because `kmask` is binary (0.0/1.0), or the Python int 1 when `klim` is
+    None -- in which case the shipped form also skips a full-size complex
+    multiply by one, per slice. A soft or apodised mask would make the
+    reassociation inexact, so this asserts equality rather than closeness.
+
+    `klim` is parametrized over both spellings for that reason. The padded
+    propagator takes the same code path with a different buffer; what the
+    reassociation needs of it is covered by
+    `test_iterative_scattering_bandlimit_masks_are_binary`.
+    """
+    torch.manual_seed(0)
+    n, nz = 32, 12
+    scat = IterativeScattering(
+        nxy=n,
+        pixel_size=2.0,
+        voltage=300.0,
+        scattering_model="multislice",
+        klim=klim,
+        alpha=alpha,
+        pad_fft=pad_fft,
+        progressbars=False,
+    )
+    V = torch.rand(2, nz, n, n) * 0.5
+
+    angle = torch.tensor(25.0 * np.pi / 180.0)
+    c, s = torch.cos(angle), torch.sin(angle)
+    theta = torch.zeros(2, 3, 4)
+    theta[:, :, :3] = torch.tensor([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+    got = scat.multislice(V, theta, slice_batchsize=1)
+    want = _iterative_multislice_unhoisted_reference(scat, V, theta)
+
+    assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("pad_fft", [False, True])
+@pytest.mark.parametrize("klim", [None, 0.66])
+def test_iterative_scattering_bandlimit_masks_are_binary(klim, pad_fft):
+    """
+    Every bandlimit mask is binary (or the int 1), which is what makes the hoist exact.
+
+    `multislice` folds the mask into the propagator once rather than applying it
+    per slice. Reassociating `(psi_k * F) * kmask` to `psi_k * (F * kmask)` is
+    bitwise-exact for a 0.0/1.0 mask and NOT exact for a soft or apodised one,
+    so this pins the property the optimisation rests on -- including for the
+    padded propagator, whose own buffer is a separate construction.
+    """
+    scat = IterativeScattering(
+        nxy=32,
+        pixel_size=2.0,
+        voltage=300.0,
+        scattering_model="multislice",
+        klim=klim,
+        pad_fft=pad_fft,
+        progressbars=False,
+    )
+    mask = scat.kmask_padded if pad_fft else scat.kmask
+    if not torch.is_tensor(mask):
+        assert mask == 1
+        return
+    assert torch.equal(mask, (mask > 0).to(mask.dtype)), (
+        "bandlimit mask must be binary for the propagator hoist to stay exact"
+    )
+
+
+# ---------------------------------------------------------------------------
+# memory formulations, pinned to the whole-volume spellings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.07])
+def test_multislice_forward_complexifies_per_chunk_bitwise(alpha):
+    """forward(real V) == multislice(apply_amplitude_contrast(V)) exactly:
+    the complexification is elementwise, so doing it per chunk changes
+    nothing but the peak memory."""
+    n, nz = 16, 13  # nz not a multiple of the chunk size
+    scat = Scattering(
+        nxy=n,
+        pixel_size=1.0,
+        voltage=300.0,
+        scattering_model="multislice",
+        alpha=alpha,
+        nz=nz,
+        progressbars=False,
+    )
+    torch.manual_seed(0)
+    V = torch.rand(2, nz, n, n) * 4.0
+    got = scat(V)
+    want = scat.multislice(apply_amplitude_contrast(V, alpha=alpha))
+    assert torch.equal(got, want)
+
+
+def test_multislice_gradient_through_real_volume_matches_complex_path():
+    n, nz = 16, 8
+    scat = Scattering(
+        nxy=n,
+        pixel_size=1.0,
+        voltage=300.0,
+        scattering_model="multislice",
+        alpha=0.07,
+        nz=nz,
+        progressbars=False,
+    )
+    torch.manual_seed(0)
+    V = torch.rand(1, nz, n, n) * 4.0
+
+    v1 = V.clone().requires_grad_(True)
+    scat(v1).real.sum().backward()
+    v2 = V.clone().requires_grad_(True)
+    scat.multislice(apply_amplitude_contrast(v2, alpha=0.07)).real.sum().backward()
+    assert torch.equal(v1.grad, v2.grad)
+
+
+def _reference(model: Scattering, name: str, V: torch.Tensor) -> torch.Tensor:
+    """The pre-rewrite implementations, applied to a real V as `forward` did."""
+    F = model.F_real + 1j * model.F_imag
+    V = apply_amplitude_contrast(V, alpha=model.alpha)
+    if model.ews_curvature_sign == "positive":
+        V = torch.flip(V, dims=(1,))
+    c = model.sigma * model.pixel_size
+    if name == "rytov":
+        scattered_k = (fft2(1j * c * V) * F[None]).sum(dim=1)
+        return torch.exp(ifft2(scattered_k))
+    if name == "firstborn":
+        return 1 + 1j * ifft2(torch.sum(c * fft2(V) * F[None], 1))
+    t = torch.exp(1j * c * V) - 1
+    return 1 + ifft2(torch.sum(fft2(t) * F[None], 1))
+
+
+@pytest.mark.parametrize("name", ["rytov", "firstborn", "kinematic"])
+@pytest.mark.parametrize("sign", ["negative", "positive"])
+@pytest.mark.parametrize("alpha", [0.0, 0.1])
+def test_single_scatter_models_match_their_old_spelling(name, sign, alpha):
+    from specter.scattering import _kernels as sc
+
+    torch.manual_seed(0)
+    n, nz, B = 16, 11, 2
+    model = Scattering(
+        n,
+        1.0,
+        300.0,
+        scattering_model=name,
+        nz=nz,
+        alpha=alpha,
+        ews_curvature_sign=sign,
+        progressbars=False,
+    ).double()
+    V = (torch.rand(B, nz, n, n, dtype=torch.float64) * 5).requires_grad_(True)
+
+    ref = _reference(model, name, V)
+    (g_ref,) = torch.autograd.grad(ref.abs().sum(), V)
+
+    # Force several chunks so the accumulation path is exercised.
+    old = sc._SLICE_SUM_CHUNK_ELEMENTS
+    sc._SLICE_SUM_CHUNK_ELEMENTS = B * n * n * 3
+    try:
+        new = model(V)
+        (g_new,) = torch.autograd.grad(new.abs().sum(), V)
+    finally:
+        sc._SLICE_SUM_CHUNK_ELEMENTS = old
+
+    assert torch.allclose(new, ref, rtol=1e-10, atol=1e-12)
+    assert torch.allclose(g_new, g_ref, rtol=1e-8, atol=1e-12)
+
+
+def test_single_scatter_models_accept_a_complex_volume():
+    """A caller that has already applied the absorption factor gets the same
+    answer as one that hands over the real volume."""
+    torch.manual_seed(1)
+    n, nz = 12, 7
+    model = Scattering(
+        n, 1.0, 300.0, scattering_model="rytov", nz=nz, alpha=0.1, progressbars=False
+    ).double()
+    V = torch.rand(1, nz, n, n, dtype=torch.float64)
+    from_real = model.rytov(V)
+    from_complex = model.rytov(apply_amplitude_contrast(V, alpha=0.1))
+    assert torch.allclose(from_real, from_complex, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "scattering_model, n, nz, px, sign",
+    [
+        ("rytov", 8, 5, 1.0, "negative"),
+        ("firstborn", 16, 9, 1.3, "negative"),
+        ("firstborn", 16, 9, 1.3, "positive"),
+    ],
+    ids=["rytov-negative", "firstborn-negative", "firstborn-positive"],
+)
+def test_propagator_is_the_cached_per_slice_stack(scattering_model, n, nz, px, sign):
+    """The broadcast build is bitwise the per-slice `fresnel_propagator` stack,
+    held once (cached, and flipped once for the positive Ewald sign), and is
+    neither checkpoint state nor lost by `.double()`."""
+    from specter.scattering._kernels import frequency_grid, fresnel_propagator
+
+    model = Scattering(
+        n,
+        px,
+        300.0,
+        scattering_model=scattering_model,
+        nz=nz,
+        ews_curvature_sign=sign,
+        progressbars=False,
+    )
+    k2 = frequency_grid(n, px) ** 2
+    per_slice = torch.stack(
+        [fresnel_propagator(k2, model.wavelength, px * (nz - i)) for i in range(nz)]
+    )
+    assert torch.equal(model.F_real, per_slice.real)
+    assert torch.equal(model.F_imag, per_slice.imag)
+    traversal = per_slice.flip(0) if sign == "positive" else per_slice
+    assert torch.equal(torch.view_as_complex(model._F_traversal), traversal)
+    assert [name for name, _ in model.named_buffers()].count("_F_traversal") == 1
+    assert "_F_traversal" not in model.state_dict()
+
+    V = torch.rand(1, nz, n, n)
+    F1 = model._propagator(V)
+    F2 = model._propagator(V)
+    # A zero-copy view of the one stored stack, already in traversal order.
+    assert F1.data_ptr() == F2.data_ptr() == model._F_traversal.data_ptr()
+    assert torch.equal(F1, traversal)
+    # Another dtype is converted once and cached.
+    Vd = V.double()
+    assert model._propagator(Vd) is model._propagator(Vd)
+    assert torch.equal(model._propagator(Vd), traversal.to(torch.complex128))
+
+    model.double()
+    assert torch.equal(
+        model._propagator(torch.zeros(1, nz, n, n, dtype=torch.float64)),
+        traversal.to(torch.complex128),
+    )
+
+
+# ---------------------------------------------------------------------------
+# projection: the real volume is summed over z before the complex
+# amplitude-contrast scalar is applied, so no complex copy of the volume is
+# materialised. The model is linear in V, so only rounding moves.
+# ---------------------------------------------------------------------------
+
+
+def _projection_complex_volume_reference(scat, V):
+    """Pre-change projection: rotate the whole volume into the complex plane,
+    then sum over z."""
+    Vc = apply_amplitude_contrast(V, alpha=scat.alpha)
+    return torch.exp(
+        1j * scat.sigma * scat.pixel_size * torch.sum(Vc, 1)
+        - scat.sigma * scat.pixel_size * scat.uniform_absorption * V.shape[1]
+    )
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.07])
+@pytest.mark.parametrize("uniform_absorption", [0.0, 0.02])
+def test_projection_matches_complex_volume_formula(alpha, uniform_absorption):
+    n, nz = 32, 24
+    scat = Scattering(
+        nxy=n,
+        pixel_size=1.0,
+        voltage=300.0,
+        scattering_model="projection",
+        alpha=alpha,
+        uniform_absorption=uniform_absorption,
+        nz=nz,
+        progressbars=False,
+    )
+    torch.manual_seed(0)
+    V = torch.rand(2, nz, n, n) * 4.0
+    got = scat(V)
+    want = _projection_complex_volume_reference(scat, V)
+    rel = float((got - want).abs().max() / want.abs().max())
+    assert rel < 1e-6
+    if alpha == 0.0:
+        # No complex scalar to reorder: the result is unchanged bit for bit.
+        assert torch.equal(got, want)
+    # An already-complex (absorptive) volume is used as given.
+    Vc = apply_amplitude_contrast(V, alpha=0.05)
     assert torch.allclose(
-        psi_scat, psi_iter, atol=atol
-    ), f"Max diff at {angle_deg}°: {(psi_scat - psi_iter).abs().max().item():.2e}"
+        scat(Vc), _projection_complex_volume_reference(scat, Vc), rtol=1e-6
+    )
+
+
+def test_projection_does_not_materialise_a_complex_volume():
+    """The pre-change form's complex copy was 8 bytes per voxel on top of the
+    real volume; the sum-first form needs only (B, Y, X) temporaries."""
+    if not torch.cuda.is_available():
+        pytest.skip("peak memory is measured with the CUDA allocator")
+    n = 128
+    scat = Scattering(
+        nxy=n,
+        pixel_size=1.0,
+        voltage=300.0,
+        scattering_model="projection",
+        alpha=0.07,
+        nz=n,
+        progressbars=False,
+    ).to("cuda")
+    V = torch.rand(1, n, n, n, device="cuda")
+
+    def peak(fn):
+        torch.cuda.synchronize(V.device)
+        torch.cuda.reset_peak_memory_stats(V.device)
+        base = torch.cuda.memory_allocated(V.device)
+        fn()
+        torch.cuda.synchronize(V.device)
+        return torch.cuda.max_memory_allocated(V.device) - base
+
+    complex_volume_bytes = V.numel() * 8
+    new = peak(lambda: scat(V))
+    old = peak(lambda: _projection_complex_volume_reference(scat, V))
+    assert old >= complex_volume_bytes
+    assert new < complex_volume_bytes / 8
+
+
+# ---------------------------------------------------------------------------
+# Supersampled multislice: the recursion on a finer xy grid, cropped back.
+# ---------------------------------------------------------------------------
+
+
+def _supersampled_reference(V, factor, *, alpha, pixel_size=1.0, sign="negative"):
+    """
+    The fine-grid recursion spelled out: interpolate each slice, exponentiate,
+    propagate with a fine-grid Fresnel kernel of the SAME slice thickness,
+    Fourier-crop the exit wave. No bandlimit anywhere.
+    """
+    from specter.scattering._kernels import (
+        fourier_crop_xy,
+        fourier_upsample_xy,
+        frequency_grid,
+        fresnel_propagator,
+    )
+
+    n = V.shape[-1]
+    scat = Scattering(n, pixel_size, 300.0, progressbars=False)
+    k = frequency_grid(n * factor, pixel_size / factor)
+    F = fresnel_propagator(k**2, scat.wavelength, pixel_size).to(torch.complex64)
+    if sign == "positive":
+        V = V.flip(1)
+    psi = None
+    for z in range(V.shape[1]):
+        slab = fourier_upsample_xy(
+            apply_amplitude_contrast(V[:, z], alpha=alpha), factor
+        )
+        t = torch.exp(1j * scat.sigma * pixel_size * slab)
+        wv = t if psi is None else t * psi
+        psi = torch.fft.ifft2(torch.fft.fft2(wv) * F)
+    return fourier_crop_xy(psi, n)
+
+
+@pytest.mark.parametrize(
+    "factor, sign", [(2, "negative"), (2, "positive"), (3, "negative")]
+)
+def test_multislice_supersample_matches_fine_grid_reference(factor, sign):
+    """`oversample` is exactly the fine-grid recursion, and differs from the
+    volume-grid one (the aliasing it removes is a real, visible difference)."""
+    torch.manual_seed(0)
+    n, nz = 32, 40
+    V = torch.rand(2, nz, n, n) * 4.0
+    scat = Scattering(
+        n,
+        1.0,
+        300.0,
+        alpha=0.07,
+        oversample=factor,
+        ews_curvature_sign=sign,
+        progressbars=False,
+    )
+    got = scat(V)
+    assert got.shape == (2, n, n)
+    assert torch.equal(got, _supersampled_reference(V, factor, alpha=0.07, sign=sign))
+    coarse = Scattering(
+        n, 1.0, 300.0, alpha=0.07, ews_curvature_sign=sign, progressbars=False
+    )(V)
+    assert (got - coarse).abs().max() > 1e-5
+
+
+def test_multislice_supersample_one_is_the_volume_grid_recursion():
+    """oversample=1 is bitwise the unsupersampled path, so it stays the
+    reference the other multislice tests pin."""
+    torch.manual_seed(1)
+    V = torch.rand(1, 12, 16, 16) * 4.0
+    a = Scattering(16, 1.0, 300.0, alpha=0.07, progressbars=False)(V)
+    b = Scattering(16, 1.0, 300.0, alpha=0.07, oversample=1, progressbars=False)(V)
+    assert torch.equal(a, b)
+
+
+def test_supersample_klim_cutoff_stays_a_fraction_of_the_volume_nyquist():
+    """`klim` names a physical frequency; refining the propagation grid must
+    not move it. At klim=0.5 the exit wave carries nothing above half the
+    VOLUME's Nyquist, whichever grid the recursion ran on."""
+    from specter.scattering._kernels import frequency_grid
+
+    torch.manual_seed(2)
+    n = 32
+    V = torch.rand(1, 20, n, n) * 4.0
+    psi = Scattering(n, 1.0, 300.0, klim=0.5, oversample=2, progressbars=False)(V)
+    k = frequency_grid(n, 1.0)
+    power = torch.fft.fft2(psi[0]).abs() ** 2
+    assert power[k > 0.25].sum() < 1e-10 * power[k <= 0.25].sum()
+
+
+@pytest.mark.parametrize("pad_fft", [False, True])
+def test_iterative_supersample_matches_batch_and_checkpointed(pad_fft):
+    """IterativeScattering's three multislice loops (plain, checkpointed,
+    absorptive) agree with each other and, at identity pose without padding,
+    with Scattering on the same fine grid."""
+    torch.manual_seed(3)
+    n, nz = 32, 23
+    V = torch.rand(2, nz, n, n) * 4.0
+    theta = build_affine_matrix(torch.eye(3).expand(2, 3, 3).contiguous())
+    it = IterativeScattering(
+        n,
+        1.0,
+        300.0,
+        alpha=0.07,
+        oversample=2,
+        pad_fft=pad_fft,
+        fft_pad_margin=4,
+        progressbars=False,
+    )
+    plain = it(V, theta)
+    assert plain.shape == (2, n, n)
+    assert torch.equal(plain, it.multislice(V, theta, checkpoint_chunks=5))
+    if not pad_fft:
+        batch = Scattering(n, 1.0, 300.0, alpha=0.07, oversample=2, progressbars=False)(
+            V
+        )
+        assert torch.equal(plain, batch)
+    it0 = IterativeScattering(
+        n,
+        1.0,
+        300.0,
+        alpha=0.0,
+        oversample=2,
+        pad_fft=pad_fft,
+        fft_pad_margin=4,
+        progressbars=False,
+    )
+    absorptive = it0.multislice_absorptive(V, torch.zeros_like(V), theta)
+    assert absorptive.shape == (2, n, n)
+    assert torch.allclose(absorptive, it0(V, theta), atol=1e-6)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, 2.0])
+def test_supersample_rejects_non_positive_integers(bad):
+    with pytest.raises(ValueError, match="oversample"):
+        Scattering(16, 1.0, 300.0, oversample=bad, progressbars=False)
+    with pytest.raises(ValueError, match="oversample"):
+        IterativeScattering(16, 1.0, 300.0, oversample=bad, progressbars=False)
+
+
+@pytest.mark.parametrize("model", ["rytov", "projection"])
+def test_single_exponential_models_oversample_their_exponential(model):
+    """Rytov and projection are linear up to one final exponential, which
+    aliases exactly like multislice's per-slice one; `oversample` takes it on
+    the fine grid. The linear phase is identical either way, so the
+    oversampled result is exp(upsample(log psi_1)) cropped, to float error."""
+    from specter.scattering._kernels import fourier_crop_xy, fourier_upsample_xy
+
+    torch.manual_seed(4)
+    n, nz = 32, 20
+    V = torch.rand(1, nz, n, n) * 4.0
+    kw = dict(scattering_model=model, nz=nz, alpha=0.07, progressbars=False)
+    coarse = Scattering(n, 1.0, 300.0, oversample=1, **kw)(V)
+    fine = Scattering(n, 1.0, 300.0, oversample=2, **kw)(V)
+    want = fourier_crop_xy(torch.exp(fourier_upsample_xy(torch.log(coarse), 2)), n)
+    assert torch.allclose(fine, want, atol=1e-5)
+    assert (fine - coarse).abs().max() > 1e-5
+    # the iterative class takes the same exponential
+    theta = build_affine_matrix(torch.eye(3).expand(1, 3, 3).contiguous())
+    it = IterativeScattering(
+        n, 1.0, 300.0, oversample=2, **{k: v for k, v in kw.items() if k != "nz"}
+    )
+    assert torch.allclose(it(V, theta), fine, atol=1e-5)
+
+
+@pytest.mark.parametrize("model", ["firstborn", "ctf"])
+def test_linear_models_ignore_oversample(model):
+    """No exponential, no product: the linear models cannot alias and the
+    setting must not change them."""
+    torch.manual_seed(5)
+    n, nz = 32, 20
+    V = torch.rand(1, nz, n, n) * 4.0
+    kw = dict(scattering_model=model, nz=nz, alpha=0.07, progressbars=False)
+    a = Scattering(n, 1.0, 300.0, oversample=1, **kw)(V)
+    b = Scattering(n, 1.0, 300.0, oversample=2, **kw)(V)
+    assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("sign", ["negative", "positive"])
+def test_multislice_matches_an_independent_physical_reference(sign):
+    """
+    Against a multislice written from the textbook pairing, transmission
+    ``exp(+i sigma V dz)`` and propagator ``exp(-i pi lambda dz k^2)``
+    (Kirkland 2010, Ch. 6), imaged through the same transfer function.
+
+    A strong specimen (1.8 rad of projected phase) makes the second-order
+    terms matter: the conjugate propagator SPECTER used until 2026-10-16 was
+    2.2e-3 of the image contrast off here, and the physical one is at float
+    precision. The negative sign's beam enters at slice 0 and the exit wave's
+    transfer function needs half the depth more underfocus than the
+    midplane's.
+    """
+    import math
+
+    from specter.constants import energy_to_wavelength, interaction_parameter
+    from specter.imaging import CTF, Poses, Specimen
+
+    torch.manual_seed(0)
+    n, nz, dx, df = 48, 120, 1.0, 10000.0
+    lam = float(energy_to_wavelength(300.0))
+    sig = float(interaction_parameter(300.0))
+    z, y, x = torch.meshgrid(
+        *(torch.arange(s, dtype=torch.float64) for s in (nz, n, n)), indexing="ij"
+    )
+    V = torch.zeros(nz, n, n, dtype=torch.float64)
+    for _ in range(300):
+        p = torch.tensor([nz / 2, n / 2, n / 2], dtype=torch.float64) + (
+            torch.rand(3, dtype=torch.float64) - 0.5
+        ) * torch.tensor([100.0, 30.0, 30.0], dtype=torch.float64)
+        V += 18.0 * torch.exp(
+            -((z - p[0]) ** 2 + (y - p[1]) ** 2 + (x - p[2]) ** 2) / (2 * 2.5**2)
+        )
+    k = torch.fft.fftfreq(n, dx, dtype=torch.float64)
+    k2 = k[:, None] ** 2 + k[None, :] ** 2
+    step = torch.exp(-1j * math.pi * lam * dx * k2)
+    order = range(nz) if sign == "negative" else range(nz - 1, -1, -1)
+    psi = torch.ones(n, n, dtype=torch.complex128)
+    for j in order:
+        psi = torch.fft.ifft2(
+            torch.fft.fft2(psi * torch.exp(1j * sig * dx * V[j])) * step
+        )
+    lens = torch.exp(1j * math.pi * lam * (df + nz * dx / 2) * k2)
+    reference = torch.fft.ifft2(torch.fft.fft2(psi) * lens).abs() ** 2
+
+    image = (
+        Specimen(V.float(), voxel_size=dx)
+        .scatter(
+            Poses.tilt_series([0.0]),
+            voltage=300.0,
+            ews_curvature_sign=sign,
+            oversample=1,
+            alpha=0.0,
+        )
+        .apply_ctf(CTF.from_values(df, cs=0.0))
+        .intensity(cc=None)
+        .pixels()[0]
+        .double()
+    )
+    contrast = (reference - reference.mean()).pow(2).mean().sqrt()
+    assert float(sig * dx * V.sum(0).max()) > 1.0
+    assert float((image - reference).pow(2).mean().sqrt() / contrast) < 2e-4

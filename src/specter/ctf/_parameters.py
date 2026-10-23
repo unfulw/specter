@@ -13,12 +13,12 @@ Notes
 -----
 Units follow torch-ctf's own convention throughout -- defocus/astigmatism
 in micrometers, voltage in kV, spherical_aberration in millimeters,
-phase_shift in degrees, pixel_size in Angstrom, amplitude_contrast as a
+phase_shift in degrees, pixel_size in Å, amplitude_contrast as a
 [0, 1] fraction. This is *not* the same convention as specter's older
 ``ctf_params`` dict (``aberrations.Aberration``), which takes dfu/dfv/cs
-directly in Angstrom. Callers migrating an existing Angstrom-based dict
-must convert explicitly (dfu/dfv Angstrom -> micrometers: divide by 1e4;
-cs Angstrom -> mm: divide by 1e7) -- no implicit conversion happens here.
+directly in Å. Callers migrating an existing Å-based dict
+must convert explicitly (dfu/dfv Å -> micrometers: divide by 1e4;
+cs Å -> mm: divide by 1e7) -- no implicit conversion happens here.
 """
 
 from __future__ import annotations
@@ -160,7 +160,7 @@ class CTFParameters(nn.Module):
         Amplitude contrast fraction, in [0, 1]. Default 0.0 -- deliberately
         *not* the conventional ~0.07-0.1, because by default specter's own
         multislice/projection scattering already applies amplitude
-        contrast at the specimen level via ``scattering.complex_potential``
+        contrast at the specimen level via ``potential.apply_amplitude_contrast``
         (see ``TransferFunction``'s ``specimen_absorption`` flag); a
         nonzero default here would silently double-count it for anyone
         using this class through :class:`TransferFunction` unchanged.
@@ -196,7 +196,7 @@ class CTFParameters(nn.Module):
         produces NaN, not a no-op. Use a small nonzero value (e.g. 1e-4) or
         omit ``lpp_params`` entirely instead.
     dose : float | torch.Tensor, optional
-        Cumulative electron dose in e-/Angstrom^2, for
+        Cumulative electron dose (fluence) in e⁻/Å², for
         :class:`~specter.ctf.TransferFunction`'s dose envelope (Grant &
         Grigorieff 2015). Not a torch-ctf argument at all -- like
         ``aberrations.Aberration``, dose describes a specific exposure, not
@@ -215,6 +215,18 @@ class CTFParameters(nn.Module):
         across a group of particles (e.g.
         ``{"astigmatism": micrograph_id}``) rather than fully per-particle
         or fully global.
+
+    References
+    ----------
+    .. [1] torch-ctf (v0.5.2): CTF functions for cryo-EM in torch. teamtomo.
+       https://github.com/teamtomo/torch-ctf
+    .. [2] Schwartz, O., Axelrod, J. J., Campbell, S. L., Turnbaugh, C., Glaeser,
+       R. M., & Müller, H. (2019). Laser phase plate for transmission electron
+       microscopy. *Nature Methods*, 16(10), 1016–1020.
+       https://doi.org/10.1038/s41592-019-0552-2
+    .. [3] Grant, T., & Grigorieff, N. (2015). Measuring the optimal exposure for
+       single particle cryo-EM using a 2.6 Å reconstruction of rotavirus VP6.
+       *eLife*, 4, e06980. https://doi.org/10.7554/eLife.06980
     """
 
     def __init__(
@@ -338,7 +350,7 @@ class CTFParameters(nn.Module):
         Parameters
         ----------
         pixel_size : float
-            Pixel size in Angstrom.
+            Pixel size in Å.
         image_shape : tuple[int, int]
             Shape of the 2D image the CTF is being computed for.
         idx : torch.Tensor | slice | int | None, optional

@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from specter.arrays import (
@@ -11,27 +12,29 @@ from specter.arrays import (
 # ---------------------------------------------------------------------------
 
 
-def test_trilinear_conserves_mass_when_in_bounds() -> None:
-    torch.manual_seed(0)
+@pytest.mark.parametrize(
+    ("voxelize", "seed"),
+    [(soft_voxelize_coordinates, 0), (soft_voxelize_xy_coordinates, 2)],
+    ids=["trilinear", "xy"],
+)
+def test_voxelize_conserves_mass_when_in_bounds(voxelize, seed: int) -> None:
+    torch.manual_seed(seed)
     coords = (torch.rand(20, 3) - 0.5) * 5  # well within a (10,10,10) grid
-    volume = soft_voxelize_coordinates(coords, (10, 10, 10), 1.0)
+    volume = voxelize(coords, (10, 10, 10), 1.0)
     assert torch.allclose(volume.sum(), torch.tensor(20.0), atol=1e-4)
 
 
-def test_trilinear_batched_matches_looped_unbatched() -> None:
-    torch.manual_seed(1)
+@pytest.mark.parametrize(
+    ("voxelize", "seed"),
+    [(soft_voxelize_coordinates, 1), (soft_voxelize_xy_coordinates, 3)],
+    ids=["trilinear", "xy"],
+)
+def test_voxelize_batched_matches_looped_unbatched(voxelize, seed: int) -> None:
+    torch.manual_seed(seed)
     coords = (torch.rand(3, 15, 3) - 0.5) * 5
-    batched = soft_voxelize_coordinates(coords, (10, 10, 10), 1.0)
-    looped = torch.stack(
-        [soft_voxelize_coordinates(coords[b], (10, 10, 10), 1.0) for b in range(3)]
-    )
+    batched = voxelize(coords, (10, 10, 10), 1.0)
+    looped = torch.stack([voxelize(coords[b], (10, 10, 10), 1.0) for b in range(3)])
     assert torch.allclose(batched, looped, atol=1e-6)
-
-
-def test_trilinear_unbatched_input_returns_unbatched_output() -> None:
-    coords = torch.zeros(5, 3)
-    volume = soft_voxelize_coordinates(coords, (8, 8, 8), 1.0)
-    assert volume.shape == (8, 8, 8)
 
 
 def test_trilinear_single_coordinate_splats_to_nearest_8_voxels() -> None:
@@ -44,28 +47,34 @@ def test_trilinear_single_coordinate_splats_to_nearest_8_voxels() -> None:
     assert torch.allclose(nonzero, torch.full_like(nonzero, 0.125), atol=1e-6)
 
 
-def test_trilinear_out_of_bounds_coordinates_are_dropped() -> None:
-    coords = torch.tensor([[100.0, 100.0, 100.0]])
-    volume = soft_voxelize_coordinates(coords, (8, 8, 8), 1.0)
-    assert torch.allclose(volume.sum(), torch.tensor(0.0))
-
-
-def test_trilinear_periodic_conserves_mass_for_out_of_bounds() -> None:
-    coords = torch.tensor([[100.0, 100.0, 100.0]])
-    volume = soft_voxelize_coordinates(coords, (8, 8, 8), 1.0, periodic=True)
-    assert torch.allclose(volume.sum(), torch.tensor(1.0), atol=1e-4)
+@pytest.mark.parametrize(
+    ("voxelize", "coord", "kwargs", "expected_sum", "atol"),
+    [
+        (soft_voxelize_coordinates, [100.0, 100.0, 100.0], {}, 0.0, 1e-8),
+        (soft_voxelize_xy_coordinates, [100.0, 100.0, 0.0], {}, 0.0, 1e-8),
+        (
+            soft_voxelize_coordinates,
+            [100.0, 100.0, 100.0],
+            {"periodic": True},
+            1.0,
+            1e-4,
+        ),
+    ],
+    ids=["trilinear_dropped", "xy_dropped", "trilinear_periodic_conserves_mass"],
+)
+def test_voxelize_out_of_bounds_coordinates(
+    voxelize, coord, kwargs: dict, expected_sum: float, atol: float
+) -> None:
+    """An out-of-bounds coordinate is dropped, unless the grid is periodic,
+    in which case it wraps and its whole mass is kept."""
+    coords = torch.tensor([coord])
+    volume = voxelize(coords, (8, 8, 8), 1.0, **kwargs)
+    assert torch.allclose(volume.sum(), torch.tensor(expected_sum), atol=atol)
 
 
 # ---------------------------------------------------------------------------
 # soft_voxelize_xy_coordinates
 # ---------------------------------------------------------------------------
-
-
-def test_xy_conserves_mass_when_in_bounds() -> None:
-    torch.manual_seed(2)
-    coords = (torch.rand(20, 3) - 0.5) * 5
-    volume = soft_voxelize_xy_coordinates(coords, (10, 10, 10), 1.0)
-    assert torch.allclose(volume.sum(), torch.tensor(20.0), atol=1e-4)
 
 
 def test_xy_hard_z_assignment_hits_single_z_slice() -> None:
@@ -77,32 +86,9 @@ def test_xy_hard_z_assignment_hits_single_z_slice() -> None:
     assert nonzero_z_slices == 1
 
 
-def test_xy_batched_matches_looped_unbatched() -> None:
-    torch.manual_seed(3)
-    coords = (torch.rand(3, 15, 3) - 0.5) * 5
-    batched = soft_voxelize_xy_coordinates(coords, (10, 10, 10), 1.0)
-    looped = torch.stack(
-        [soft_voxelize_xy_coordinates(coords[b], (10, 10, 10), 1.0) for b in range(3)]
-    )
-    assert torch.allclose(batched, looped, atol=1e-6)
-
-
-def test_xy_out_of_bounds_coordinates_are_dropped() -> None:
-    coords = torch.tensor([[100.0, 100.0, 0.0]])
-    volume = soft_voxelize_xy_coordinates(coords, (8, 8, 8), 1.0)
-    assert torch.allclose(volume.sum(), torch.tensor(0.0))
-
-
 # ---------------------------------------------------------------------------
 # tile_volume_from_blocks_blended
 # ---------------------------------------------------------------------------
-
-
-def test_blended_output_shape_matches_target() -> None:
-    torch.manual_seed(0)
-    blocks = torch.rand(4, 8, 8, 8)
-    out = tile_volume_from_blocks_blended(blocks, (2, 20, 20, 20))
-    assert out.shape == (2, 20, 20, 20)
 
 
 def test_blended_conserves_sum() -> None:
@@ -113,11 +99,21 @@ def test_blended_conserves_sum() -> None:
     assert torch.allclose(out.sum(), expected, atol=1e-3)
 
 
-def test_blended_without_conserve_sum_is_still_finite() -> None:
+def test_blended_without_conserve_sum_preserves_a_constant_field() -> None:
+    torch.manual_seed(2)
+    blocks = torch.full((4, 8, 8, 8), 3.5)
+    out = tile_volume_from_blocks_blended(blocks, (1, 20, 20, 20), conserve_sum=False)
+    torch.testing.assert_close(out, torch.full_like(out, 3.5))
+
+
+def test_blended_without_conserve_sum_stays_within_source_bounds() -> None:
     torch.manual_seed(2)
     blocks = torch.rand(4, 8, 8, 8)
     out = tile_volume_from_blocks_blended(blocks, (1, 20, 20, 20), conserve_sum=False)
     assert torch.isfinite(out).all()
+    assert out.min() >= blocks.min() - 1e-6
+    assert out.max() <= blocks.max() + 1e-6
+    assert out.std() > 0
 
 
 def test_blended_handles_non_integer_multiple_target() -> None:
@@ -144,3 +140,34 @@ def test_blended_tiny_overlap_has_no_zero_weight_artifact() -> None:
     out = tile_volume_from_blocks_blended(blocks, (1, 32, 32, 32), overlap_frac=1 / 16)
     assert torch.isfinite(out).all()
     assert out.min() > 0
+
+
+def test_a_cpu_splat_adds_duplicates_in_a_fixed_order():
+    """
+    The deterministic splat must not depend on how torch threads it. Through
+    ``index_put_(accumulate=True)`` the CPU added duplicate indices across
+    threads in scheduling order, so the same coordinates gave a different
+    volume on every call, at any thread count above one.
+    """
+    from specter.arrays._voxelize import _scatter_splat
+
+    g = torch.Generator().manual_seed(0)
+    indices = torch.randint(0, 8, (200_000, 3), generator=g)
+    weights = torch.rand(200_000, generator=g)
+    threads = torch.get_num_threads()
+    volumes = []
+    try:
+        for n in (1, 8, 8):
+            torch.set_num_threads(n)
+            volume = torch.zeros(8, 8, 8)
+            _scatter_splat(volume, indices, weights)
+            volumes.append(volume)
+        # A non-contiguous target takes the same order.
+        torch.set_num_threads(8)
+        transposed = torch.zeros(8, 8, 8).transpose(0, 2)
+        _scatter_splat(transposed, indices[:, [2, 1, 0]], weights)
+    finally:
+        torch.set_num_threads(threads)
+    assert torch.equal(volumes[0], volumes[1])
+    assert torch.equal(volumes[1], volumes[2])
+    assert torch.equal(transposed.transpose(0, 2), volumes[0])

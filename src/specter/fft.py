@@ -1,10 +1,17 @@
+"""
+FFT wrappers with a consistent centring convention, FFT-based convolution,
+and the Fourier shell correlation.
+"""
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Sequence
 
 import torch
 import torch.nn.functional as F
 from scipy.fft import next_fast_len
+from specter.options import ConvMode
 
 
 def fft2(
@@ -180,7 +187,7 @@ def ifftn(
 def fftconvolve(
     in1: torch.Tensor,
     in2: torch.Tensor,
-    mode: str = "full",
+    mode: ConvMode = "full",
     axes: int | Sequence[int] | None = None,
 ) -> torch.Tensor:
     """From scipy fftconvolve.
@@ -351,6 +358,60 @@ def spatial_convolve3d_same(
     return out
 
 
+def spatial_convolve2d_same(
+    images: torch.Tensor,
+    kernel: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Direct (non-FFT) 'same'-mode 2D convolution of a batch of images with a
+    single shared kernel, matching ``fftconvolve(images, kernel, mode="same",
+    axes=(-2, -1))`` exactly -- including its centered-crop convention for
+    even-sized kernel axes (see :func:`_centered`).
+
+    The 2D twin of :func:`spatial_convolve3d_same`, and the reason it exists
+    is the same: ``F.conv2d(..., padding="same")`` pads *asymmetrically* when
+    a kernel axis is even, which offsets the result half a pixel relative to
+    the centered convention every other potential path in specter uses. Even
+    kernels are the common case, not the exotic one -- 20 of the 36 pixel
+    sizes between 0.5 and 4.0 Å produce one (see
+    :func:`specter.potential.compute_supersampling_parameters`).
+
+    No chunking counterpart to :func:`spatial_convolve3d_same`'s is needed:
+    the 2D path convolves single ``(ny, nx)`` slices, which stay far below
+    the cuDNN spatial-size limit that motivates chunking in 3D.
+
+    ``conv2d`` computes cross-correlation (no kernel flip), so the kernel is
+    flipped here to recover true convolution. Atomic potential kernels are
+    radially symmetric, making the flip a no-op for them, but this is a
+    general-purpose convolution and should behave like one.
+
+    Parameters
+    ----------
+    images : torch.Tensor
+        Shape (B, Y, X).
+    kernel : torch.Tensor
+        Shape (Y', X') or (1, Y', X'); applied to every image in the batch.
+
+    Returns
+    -------
+    torch.Tensor
+        Convolved images, shape (B, Y, X).
+    """
+    if kernel.ndim == 3:
+        kernel = kernel.squeeze(0)
+    ky, kx = kernel.shape
+    weight = (
+        kernel.flip([0, 1])
+        .to(device=images.device, dtype=images.dtype)
+        .unsqueeze(0)
+        .unsqueeze(0)
+    )
+    full = F.conv2d(images.unsqueeze(1), weight, padding=(ky - 1, kx - 1)).squeeze(1)
+    y0, x0 = (ky - 1) // 2, (kx - 1) // 2
+    y, x = images.shape[-2:]
+    return full[:, y0 : y0 + y, x0 : x0 + x]
+
+
 def _freq_domain_conv(
     in1: torch.Tensor,
     in2: torch.Tensor,
@@ -409,7 +470,17 @@ def _freq_domain_conv(
     sp1 = fft(in1, fshape, dim=axes)
     sp2 = fft(in2, fshape, dim=axes)
 
-    ret = ifft(sp1 * sp2, fshape, dim=axes)
+    if torch.is_grad_enabled() and (in1.requires_grad or in2.requires_grad):
+        ret = ifft(sp1 * sp2, fshape, dim=axes)
+    else:
+        # The product is a third spectrum-sized complex array held while both
+        # inputs' spectra are still alive; for a 512^3 ice volume each is
+        # 0.6 GB, and the transient sum was the peak of the whole particle
+        # forward pass. Multiply into sp1 and release sp2 before the inverse.
+        sp1.mul_(sp2)
+        del sp2
+        ret = ifft(sp1, fshape, dim=axes)
+        del sp1
 
     if calc_fast_len:
         fslice = tuple([slice(sz) for sz in shape])
@@ -432,9 +503,9 @@ def _centered(
 
 
 def fourier_shell_correlation(
-    vol1: torch.Tensor,
-    vol2: torch.Tensor,
-    pixelsize: float = 1.0,
+    volume1: torch.Tensor,
+    volume2: torch.Tensor,
+    pixel_size: float = 1.0,
     res_cutoff: float | None = None,
     randomise_phases_beyond: float | None = None,
     return_real: bool = True,
@@ -442,17 +513,22 @@ def fourier_shell_correlation(
     """
     Compute the Fourier Shell Correlation (FSC) between two 3D volumes.
 
+    The FSC of Harauz & van Heel (1986) [1]_: the normalised cross-correlation
+    of the two volumes' Fourier coefficients over each shell of constant
+    spatial frequency.
+
     Parameters
     ----------
-    vol1, vol2 : torch.Tensor
+    volume1, volume2 : torch.Tensor
         Real-space 3D volumes of shape (N, N, N).
-    pixelsize : float, optional
-        Pixel size in Angstroms (or consistent units). Default is 1.
+    pixel_size : float, optional
+        Pixel size in Å (or consistent units). Default is 1.
     res_cutoff : float | None, optional
         High-resolution cutoff. Frequencies beyond 1/res_cutoff are zeroed.
     randomise_phases_beyond : float | None, optional
         Resolution limit beyond which phases are randomised, for
-        phase-randomisation FSC (gold-standard artefact validation).
+        phase-randomisation FSC (gold-standard artefact validation; Chen et
+        al. 2013 [2]_).
     return_real : bool, optional
         If True (default), return real-part FSC (standard definition).
         If False, return the magnitude of the complex cross-correlation per shell.
@@ -460,48 +536,82 @@ def fourier_shell_correlation(
     Returns
     -------
     k : torch.Tensor
-        Spatial frequency axis (units: 1/pixelsize).
+        Spatial frequency axis (units: 1/pixelsize). Shells run out to the
+        *corners* of the Fourier cube, so the axis extends past Nyquist by a
+        factor of sqrt(3); those trailing shells are sampled from the corner
+        directions alone. Pass ``k_max=1/(2*pixel_size)`` to `plots.fsc_resolution`
+        to keep a crossing in that aliased tail out of a reported resolution.
     fsc : torch.Tensor
         FSC curve, one value per Fourier shell.
+
+    Raises
+    ------
+    ValueError
+        If the volumes differ in shape, or are not cubic. Shells are binned by
+        voxel-index radius, which coincides with physical frequency only when
+        every axis has the same length; a non-cubic volume would otherwise
+        return a silently wrong ``k`` axis.
+
+    References
+    ----------
+    .. [1] Harauz, G., & van Heel, M. (1986). Exact filters for general
+       geometry three dimensional reconstruction. *Optik*, 73, 146–156.
+    .. [2] Chen, S., McMullan, G., Faruqi, A. R., Murshudov, G. N., Short,
+       J. M., Scheres, S. H. W., & Henderson, R. (2013). High-resolution noise
+       substitution to measure overfitting and validate resolution in 3D
+       structure determination by single particle electron cryomicroscopy.
+       *Ultramicroscopy*, 135, 24–35.
+       https://doi.org/10.1016/j.ultramic.2013.06.004
     """
     # Lazy import to avoid circular dependency (arrays imports fft)
     from .arrays import radial_profile_3d
 
-    n = vol1.shape[0]
-    device = vol1.device
+    if volume1.shape != volume2.shape:
+        raise ValueError(
+            f"Volumes must have the same shape, got {tuple(volume1.shape)} "
+            f"and {tuple(volume2.shape)}."
+        )
+    if volume1.ndim != 3 or len(set(volume1.shape)) != 1:
+        raise ValueError(
+            "fourier_shell_correlation requires cubic (N, N, N) volumes, got "
+            f"{tuple(volume1.shape)}."
+        )
 
-    vol1_f = fft3(vol1, shift=True)
-    vol2_f = fft3(vol2, shift=True)
+    n = volume1.shape[0]
+    device = volume1.device
+
+    volume1_f = fft3(volume1, shift=True)
+    volume2_f = fft3(volume2, shift=True)
 
     # Apply resolution cutoff and/or phase randomisation if requested.
     # k-grid is fftshifted to match the shifted FFT output (DC at center).
     if res_cutoff is not None or randomise_phases_beyond is not None:
-        kx = torch.fft.fftshift(torch.fft.fftfreq(n, pixelsize, device=device))
+        kx = torch.fft.fftshift(torch.fft.fftfreq(n, pixel_size, device=device))
         kxx, kyy, kzz = torch.meshgrid(kx, kx, kx, indexing="ij")
         k_mag = torch.sqrt(kxx**2 + kyy**2 + kzz**2)
 
         if res_cutoff is not None:
             mask = k_mag > (1.0 / res_cutoff)
-            vol1_f = vol1_f.clone()
-            vol2_f = vol2_f.clone()
-            vol1_f[mask] = 0.0
-            vol2_f[mask] = 0.0
+            volume1_f = volume1_f.clone()
+            volume2_f = volume2_f.clone()
+            volume1_f[mask] = 0.0
+            volume2_f[mask] = 0.0
 
         if randomise_phases_beyond is not None:
             rand_mask = k_mag > (1.0 / randomise_phases_beyond)
             rand_phase1 = torch.rand(n, n, n, device=device) * (2 * torch.pi)
             rand_phase2 = torch.rand(n, n, n, device=device) * (2 * torch.pi)
-            phase1 = torch.angle(vol1_f)
-            phase2 = torch.angle(vol2_f)
+            phase1 = torch.angle(volume1_f)
+            phase2 = torch.angle(volume2_f)
             phase1[rand_mask] = rand_phase1[rand_mask]
             phase2[rand_mask] = rand_phase2[rand_mask]
-            vol1_f = vol1_f.abs() * torch.exp(1j * phase1)
-            vol2_f = vol2_f.abs() * torch.exp(1j * phase2)
+            volume1_f = volume1_f.abs() * torch.exp(1j * phase1)
+            volume2_f = volume2_f.abs() * torch.exp(1j * phase2)
 
     # Cross-spectrum F1 * conj(F2) and power spectra.
-    cross = vol1_f * vol2_f.conj()
-    norm1 = vol1_f.real**2 + vol1_f.imag**2  # |F1|^2, avoids sqrt in .abs()
-    norm2 = vol2_f.real**2 + vol2_f.imag**2
+    cross = volume1_f * volume2_f.conj()
+    norm1 = volume1_f.real**2 + volume1_f.imag**2  # |F1|^2, avoids sqrt in .abs()
+    norm2 = volume2_f.real**2 + volume2_f.imag**2
 
     # Radial averages — DC is at (n//2, n//2, n//2), matching the default center.
     cross_r = radial_profile_3d(cross.real)
@@ -517,78 +627,18 @@ def fourier_shell_correlation(
     denom = torch.sqrt(norm1_r * norm2_r).clamp(min=1e-10)
     fsc = num / denom
 
-    # Frequency axis: shell index × frequency spacing (1 / (N * pixelsize))
-    dk = 1.0 / (n * float(pixelsize))
+    # Frequency axis: shell index × frequency spacing (1 / (N * pixel_size))
+    dk = 1.0 / (n * float(pixel_size))
     k = torch.arange(len(fsc), device=device) * dk
 
     return k, fsc
-
-
-def halfmap_fsc_weight_2d(
-    halfmap1: torch.Tensor,
-    halfmap2: torch.Tensor,
-    pixelsize: float,
-    clamp_negative: bool = True,
-) -> torch.Tensor:
-    """
-    Compute FSC from two masked half-maps and map it onto a 2D rfft2 frequency
-    grid for use as a loss weight in the Reconstructor Fourier-space loss.
-
-    The returned tensor has shape (H, W//2+1), matching torch.fft.rfft2 output,
-    and can be multiplied directly against squared residuals::
-
-        loss = mean(weight * |img_f - out_f|^2) / (H * W)
-
-    High-FSC (well-resolved) shells get weight ≈ 1; low-FSC (noisy) shells
-    get weight ≈ 0, naturally suppressing noise without clamping or epsilon tricks.
-
-    Parameters
-    ----------
-    halfmap1, halfmap2 : torch.Tensor
-        Masked half-map volumes, shape (N, N, N).  Apply solvent masking before
-        passing (e.g. use the masked half-maps from a cryoSPARC refinement job).
-    pixelsize : float
-        Pixel size in Å.
-    clamp_negative : bool, optional
-        If True (default), clamp FSC values below 0 to 0 before mapping.
-        Negative FSC occurs at high resolution due to noise and should not
-        contribute negatively to the loss.
-
-    Returns
-    -------
-    weight_2d : torch.Tensor
-        FSC mapped to shape (H, W//2+1).
-    """
-    H, W = halfmap1.shape[-2], halfmap1.shape[-1]
-    device = halfmap1.device
-
-    k, fsc = fourier_shell_correlation(halfmap1, halfmap2, pixelsize=pixelsize)
-
-    if clamp_negative:
-        fsc = fsc.clamp(min=0.0)
-
-    # 2D physical-frequency grid for rfft2 half-plane layout
-    kx = torch.fft.fftfreq(H, d=pixelsize, device=device)  # (H,)
-    ky = torch.fft.rfftfreq(W, d=pixelsize, device=device)  # (W//2+1,)
-    KX, KY = torch.meshgrid(kx, ky, indexing="ij")
-    k_mag = torch.sqrt(KX**2 + KY**2)  # (H, W//2+1)
-
-    # Linear interpolation of 1D FSC onto the 2D grid
-    k_flat = k_mag.reshape(-1).clamp(k[0], k[-1])
-    idx = (torch.searchsorted(k.contiguous(), k_flat.contiguous()) - 1).clamp(
-        0, len(k) - 2
-    )
-    t = (k_flat - k[idx]) / (k[idx + 1] - k[idx]).clamp(min=1e-10)
-    weight_flat = fsc[idx] + t * (fsc[idx + 1] - fsc[idx])
-
-    return weight_flat.reshape(H, W // 2 + 1)
 
 
 def _apply_conv_mode(
     ret: torch.Tensor,
     s1: Sequence[int],
     s2: Sequence[int],
-    mode: str,
+    mode: ConvMode,
     axes: list[int],
 ) -> torch.Tensor:
     """From scipy.signal._signaltools
@@ -628,3 +678,252 @@ def _apply_conv_mode(
         return _centered(ret, shape_valid).clone()
     else:
         raise ValueError("acceptable mode flags are 'valid', 'same', or 'full'")
+
+
+def apply_radial_envelope_(
+    v: torch.Tensor,
+    pixel_size: float,
+    envelope: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    """
+    Multiply a ``(Z, Y, X)`` volume by a radial envelope in Fourier space, in place.
+
+    The shared step of :func:`specter.potential.apply_dose_damage` (damage
+    to a specimen's potential) and :func:`specter.ice.apply_solvent_exposure`
+    (the solvent's loss of coherence over an exposure): both are isotropic
+    filters of a 3D field, so rotating the field commutes with them.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Real volume, ``(Z, Y, X)``, filtered in place on its own device.
+    pixel_size : float
+        Voxel size in Angstrom.
+    envelope : callable
+        Maps a 1D tensor of |k| in 1/Angstrom to the factor applied there.
+        Tabulated once on a radial grid; it should be 1 at k = 0 to keep
+        the volume's mean.
+
+    Notes
+    -----
+    A CUDA canvas the device can hold once but not twice (thick ice in a
+    large box) cannot also hold its half-spectrum. On a CUDA out-of-memory
+    error the transform runs on the host instead and the result is copied
+    back into `v`: slow, but the same arithmetic. Both callers take this
+    path, so neither can fail where the other falls back.
+    """
+    try:
+        _apply_radial_envelope_on_device_(v, pixel_size, envelope)
+    except torch.OutOfMemoryError:
+        if not v.is_cuda:
+            raise
+        torch.cuda.empty_cache()
+        host = v.cpu()
+        _apply_radial_envelope_on_device_(host, pixel_size, envelope)
+        v.copy_(host)
+        del host
+
+
+def _apply_radial_envelope_on_device_(
+    v: torch.Tensor,
+    pixel_size: float,
+    envelope: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    """:func:`apply_radial_envelope_` on `v`'s own device, with no fallback."""
+    spectrum = _radial_rfft3(v)
+    _multiply_radial_envelope(spectrum, spectrum, v.shape, pixel_size, envelope)
+    _radial_irfft3_into(spectrum, v)
+    del spectrum
+
+
+_RADIAL_FFT_MAX_ELEMENTS = 1 << 22
+_RADIAL_FFT_SINGLE_BATCH_ELEMENTS = 1 << 26
+
+
+def _radial_chunks(nz: int, ny: int, nkx: int) -> tuple[int, int]:
+    """Keep small single-batch plans; bound large FFT batches to ~2^22."""
+    # Changing a cuFFT batch can change its last-bit rounding. A tiny change
+    # in an expected electron count can then change the random stream in
+    # the coincidence detector. Preserve the existing single-batch plans
+    # when the whole half-spectrum fits the previous 2^26-element budget.
+    if nz * ny * nkx <= _RADIAL_FFT_SINGLE_BATCH_ELEMENTS:
+        return nz, ny
+    slab = max(1, min(nz, _RADIAL_FFT_MAX_ELEMENTS // max(1, ny * nkx)))
+    ychunk = max(1, min(ny, _RADIAL_FFT_MAX_ELEMENTS // max(1, nz * nkx)))
+    return slab, ychunk
+
+
+def _radial_rfft3(v: torch.Tensor) -> torch.Tensor:
+    """
+    The 3D half-spectrum of a ``(Z, Y, X)`` volume, computed separably.
+
+    The half-spectrum is as large as the volume itself, and it is the one
+    transient this keeps. A single rfftn/irfftn pair is not that: cuFFT's
+    3D workspace took the peak to 5x the canvas (26.8 GiB for 5.3 GiB at
+    1368 x 1024^2), which is exactly the thick-ice case that matters. So
+    the transform is done separably and chunked -- rfft2 over (Y, X) a
+    z-slab at a time into a preallocated spectrum, fft along Z a y-chunk
+    at a time in place, and the inverse the same way back -- so large-field
+    scratch stays near 2^22 elements per batch, with a minimum of one xy
+    plane or one y-row of complete z-lines. Smaller fields whose
+    complete half-spectrum fits 2^26 elements retain their previous single
+    batches, preserving cuFFT rounding and seeded detector realizations.
+    These are batches of independent 2D transforms or independent z-lines,
+    not truncated spatial transforms:
+    every frequency and the full 3D volume are still processed.
+    """
+    nz, ny, nx = v.shape
+    nkx = nx // 2 + 1
+    slab, ychunk = _radial_chunks(nz, ny, nkx)
+    spectrum = torch.empty((nz, ny, nkx), dtype=torch.complex64, device=v.device)
+    for z0 in range(0, nz, slab):
+        z1 = min(nz, z0 + slab)
+        spectrum[z0:z1] = torch.fft.rfft2(v[z0:z1])
+    for y0 in range(0, ny, ychunk):
+        y1 = min(ny, y0 + ychunk)
+        spectrum[:, y0:y1] = torch.fft.fft(spectrum[:, y0:y1], dim=0)
+    return spectrum
+
+
+# Interpolation keeps float coordinates and two int64 indices, unlike the
+# FFT's single complex chunk. Bound it separately and reuse scratch so
+# weighting does not add several GiB above a thick padded half-spectrum.
+_RADIAL_ENVELOPE_MAX_ELEMENTS = 1 << 22
+
+
+def _multiply_radial_envelope(
+    spectrum: torch.Tensor,
+    out: torch.Tensor,
+    shape: Sequence[int],
+    pixel_size: float,
+    envelope: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    """``out = spectrum * envelope(|k|)``, a z-slab at a time; `out` may be `spectrum`."""
+    nz, ny, nx = shape
+    dev = spectrum.device
+    slab = max(1, min(nz, _RADIAL_ENVELOPE_MAX_ELEMENTS // (ny * (nx // 2 + 1))))
+    kz = torch.fft.fftfreq(nz, d=pixel_size, device=dev)
+    ky = torch.fft.fftfreq(ny, d=pixel_size, device=dev)
+    kx = torch.fft.rfftfreq(nx, d=pixel_size, device=dev)
+    kyx = ky[:, None] ** 2 + kx[None, :] ** 2
+    # The envelope is a function of |k| alone, so it is tabulated once on a
+    # fine radial grid and read back by linear interpolation rather than
+    # evaluated on every voxel of every slab. That matters for the frame sum,
+    # which is a loop over frames each gathering a per-frequency weight: on a
+    # 600 x 1200^2 canvas evaluating it per slab cost 2.4x the whole forward
+    # pass. 4096 points over the corner frequency is a spacing of ~2e-4 1/A
+    # against an envelope whose scale of variation is ~1e-2.
+    k_max = float(
+        torch.sqrt(kz.abs().max() ** 2 + ky.abs().max() ** 2 + kx.abs().max() ** 2)
+    )
+    n_table = 4096
+    k_table = torch.linspace(0.0, k_max, n_table, device=dev)
+    env_table = envelope(k_table)
+    for z0 in range(0, nz, slab):
+        z1 = min(nz, z0 + slab)
+        # These are private scratch arrays. Reuse their storage as their
+        # previous values die, preserving the existing operation order and
+        # the same 4096-point table and interpolation arithmetic.
+        pos = torch.sqrt(kz[z0:z1, None, None] ** 2 + kyx[None])
+        pos.div_(k_max).mul_(n_table - 1).clamp_(0, n_table - 1)
+        lo = pos.floor()
+        i0 = lo.long()
+        frac = pos.sub_(lo)
+        del lo
+        i1 = (i0 + 1).clamp_(max=n_table - 1)
+        weight = env_table[i0]
+        weight.lerp_(env_table[i1], frac)
+        if out is spectrum:
+            spectrum[z0:z1] *= weight
+        else:
+            torch.mul(spectrum[z0:z1], weight, out=out[z0:z1])
+        del pos, frac, i0, i1, weight
+
+
+def _radial_irfft3_into(spectrum: torch.Tensor, v: torch.Tensor) -> None:
+    """Invert :func:`_radial_rfft3` into `v`, overwriting `spectrum` on the way."""
+    nz, ny, nx = v.shape
+    slab, ychunk = _radial_chunks(nz, ny, nx // 2 + 1)
+    for y0 in range(0, ny, ychunk):
+        y1 = min(ny, y0 + ychunk)
+        spectrum[:, y0:y1] = torch.fft.ifft(spectrum[:, y0:y1], dim=0)
+    for z0 in range(0, nz, slab):
+        z1 = min(nz, z0 + slab)
+        v[z0:z1] = torch.fft.irfft2(spectrum[z0:z1], s=(ny, nx))
+
+
+class RadialSpectrum:
+    """
+    A volume's 3D spectrum, kept for filtering it by many radial envelopes.
+
+    :func:`apply_radial_envelope_` transforms a volume, filters it and
+    transforms it back, once. A caller that needs the same volume under
+    several envelopes (one damage state per tilt of a series) would repeat
+    the forward transform each time; this keeps its result instead, so each
+    filtered copy costs one inverse transform. Every copy is identical to
+    :func:`apply_radial_envelope_` applied to a copy of the volume.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Real volume, ``(Z, Y, X)``. Not modified, and not referenced after
+        construction.
+    pixel_size : float
+        Voxel size in Angstrom.
+
+    Notes
+    -----
+    Resident memory is the half-spectrum, about the volume's own size in
+    complex64, plus a second half-spectrum of scratch allocated on the first
+    :meth:`filter_into`, which the separable inverse transform overwrites.
+    """
+
+    def __init__(self, v: torch.Tensor, pixel_size: float) -> None:
+        if v.ndim != 3:
+            raise ValueError(f"expected a (Z, Y, X) volume, got shape {v.shape}")
+        self.shape = tuple(v.shape)
+        self.dtype = v.dtype
+        self.pixel_size = pixel_size
+        self.spectrum = _radial_rfft3(v)
+        self._work: torch.Tensor | None = None
+
+    @property
+    def device(self) -> torch.device:
+        """Where the spectrum, and every filtered copy, lives."""
+        return self.spectrum.device
+
+    def to(self, device: torch.device | str) -> RadialSpectrum:
+        """Move the spectrum to `device`, in place, returning ``self``."""
+        self.spectrum = self.spectrum.to(device)
+        self._work = None
+        return self
+
+    def filter_into(
+        self,
+        out: torch.Tensor,
+        envelope: Callable[[torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Write the volume filtered by `envelope` into `out`.
+
+        Parameters
+        ----------
+        out : torch.Tensor
+            Real ``(Z, Y, X)`` destination on :attr:`device`.
+        envelope : callable
+            As for :func:`apply_radial_envelope_`.
+
+        Returns
+        -------
+        torch.Tensor
+            `out`.
+        """
+        if tuple(out.shape) != self.shape or out.device != self.device:
+            raise ValueError("out must match the spectrum's volume shape and device")
+        if self._work is None:
+            self._work = torch.empty_like(self.spectrum)
+        _multiply_radial_envelope(
+            self.spectrum, self._work, self.shape, self.pixel_size, envelope
+        )
+        _radial_irfft3_into(self._work, out)
+        return out

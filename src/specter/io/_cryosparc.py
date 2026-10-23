@@ -1,15 +1,22 @@
+"""
+Reads imaging parameters, poses and CTF terms from a CryoSPARC ``.cs``
+file.
+"""
+
 from __future__ import annotations
 
+import warnings
+from collections.abc import Callable
+from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import roma
 import torch
 from cryosparc.dataset import Dataset
-from rich.console import Console
-
-from ._common import _select_particles
-
-_console = Console()
+from .. import logger
+from ..constants import energy_to_wavelength
+from ._common import _select_particles, _uniform_scalar
 
 
 def _load_csfile_parameters(
@@ -31,49 +38,87 @@ def _load_csfile_parameters(
     Returns
     -------
     tuple
-        ``(voltage_kv, pixel_size, alpha, rotations, translations_A, ctf_params,
+        ``(voltage_kv, pixel_size, alpha, rotations, translations_angstrom, ctf_params,
         scale, anisomag, split)`` for every particle in the dataset.
     """
     dataset = Dataset.load(csfile_path)
 
-    # extract translations
+    # extract translations. `alignments3D/shift` is in pixels of the grid the
+    # ALIGNMENT was done on, so it must be scaled by the alignment's own pixel
+    # size -- which is not necessarily the images'.
     translations_px = torch.as_tensor(dataset["alignments3D/shift"])
-    pixel_size = torch.as_tensor(dataset["alignments3D/psize_A"])
-    translations_A = translations_px * pixel_size[..., None]
-    if torch.allclose(pixel_size[0], pixel_size.mean()):
-        pixel_size = pixel_size[0]
+    alignment_psize = torch.as_tensor(dataset["alignments3D/psize_A"])
+    translations_angstrom = translations_px * alignment_psize[..., None]
+
+    # The pixel size to RENDER at is the images', `blob/psize_A`. These differ
+    # whenever the refinement was run binned: a 2x-binned refinement records
+    # alignments3D/psize_A = 2 * blob/psize_A, and taking the alignment value
+    # renders the specimen at half the sampling into the same box -- a field of
+    # view twice too wide, silently. Measured on EMPIAR-11377's J205
+    # (alignments3D 1.462, images 0.731): every pair-by-pair pose correlation
+    # collapsed to the shuffled level and the background noise floor came out
+    # at 0.62 of the experiment's instead of 2.15.
+    pixel_size = alignment_psize
+    try:
+        # Both a real `Dataset` and a plain mapping raise KeyError for a
+        # missing column, so ask rather than sniffing for a `fields` method.
+        image_psize: torch.Tensor | None = torch.as_tensor(dataset["blob/psize_A"])
+    except KeyError:
+        image_psize = None
+    if image_psize is not None:
+        if not torch.allclose(image_psize, alignment_psize):
+            warnings.warn(
+                f"{csfile_path}: the images are at "
+                f"{float(image_psize.flatten()[0]):.4f} A/px "
+                f"(blob/psize_A) but the alignment was done at "
+                f"{float(alignment_psize.flatten()[0]):.4f} A/px "
+                "(alignments3D/psize_A), i.e. a binned refinement. Rendering at "
+                "the images' pixel size; shifts are still converted with the "
+                "alignment's.",
+                stacklevel=3,
+            )
+        pixel_size = image_psize
     else:
-        _console.print(
-            "[yellow]Warning:[/yellow] pixel size is not the same for all particles."
+        # No `blob/psize_A` means this file cannot say what its images are
+        # sampled at, and the alignment value is the only thing available --
+        # which is exactly the case that bites, because a passthrough with no
+        # blob columns is what a binned refinement emits. Say so rather than
+        # proceeding silently; the caller can check the stack's own header.
+        warnings.warn(
+            f"{csfile_path}: no blob/psize_A, so the "
+            f"pixel size is taken from alignments3D/psize_A "
+            f"({float(alignment_psize.flatten()[0]):.4f} A/px). If the "
+            "refinement was binned this is NOT the pixel size of the images; "
+            "check it against the particle stack before rendering.",
+            stacklevel=3,
         )
+
+    pixel_size = _uniform_scalar(
+        pixel_size,
+        "blob/psize_A" if image_psize is not None else "alignments3D/psize_A",
+        csfile_path,
+    )
 
     # extract spherical aberration
     cs_mm = torch.as_tensor(dataset["ctf/cs_mm"])
-    cs_A = cs_mm * 1e7
+    cs_angstrom = cs_mm * 1e7
 
     # extract defocus
     dfang_rad = torch.as_tensor(dataset["ctf/df_angle_rad"])
     dfang_deg = dfang_rad / torch.pi * 180
-    dfu_A = torch.as_tensor(dataset["ctf/df1_A"])
-    dfv_A = torch.as_tensor(dataset["ctf/df2_A"])
+    dfu_angstrom = torch.as_tensor(dataset["ctf/df1_A"])
+    dfv_angstrom = torch.as_tensor(dataset["ctf/df2_A"])
 
     # extract amplitude contrast
-    alpha = torch.as_tensor(dataset["ctf/amp_contrast"])
-    if torch.allclose(alpha[0], alpha.mean()):
-        alpha = alpha[0]
-    else:
-        _console.print(
-            "[yellow]Warning:[/yellow] amplitude contrast is not the same for all particles."
-        )
+    alpha = _uniform_scalar(
+        torch.as_tensor(dataset["ctf/amp_contrast"]), "ctf/amp_contrast", csfile_path
+    )
 
     # extract voltage
-    voltage_kv = torch.as_tensor(dataset["ctf/accel_kv"])
-    if torch.allclose(voltage_kv[0], voltage_kv.mean()):
-        voltage_kv = voltage_kv[0]
-    else:
-        _console.print(
-            "[yellow]Warning:[/yellow] voltage is not the same for all particles."
-        )
+    voltage_kv = _uniform_scalar(
+        torch.as_tensor(dataset["ctf/accel_kv"]), "ctf/accel_kv", csfile_path
+    )
+    wavelength_angstrom = energy_to_wavelength(voltage_kv)
 
     # extract rotations
     pose = torch.as_tensor(dataset["alignments3D/pose"], dtype=torch.float32)
@@ -86,19 +131,42 @@ def _load_csfile_parameters(
     split = torch.as_tensor(dataset["alignments3D/split"].astype(int))
 
     # extract beamtilt
-    beamtiltx_rad = torch.arcsin(torch.as_tensor(dataset["ctf/tilt_A"][:, 0] / cs_A))
-    beamtilty_rad = torch.arcsin(torch.as_tensor(dataset["ctf/tilt_A"][:, 1] / cs_A))
+    beamtiltx_rad = torch.arcsin(
+        torch.as_tensor(dataset["ctf/tilt_A"][:, 0] / cs_angstrom)
+    )
+    beamtilty_rad = torch.arcsin(
+        torch.as_tensor(dataset["ctf/tilt_A"][:, 1] / cs_angstrom)
+    )
 
     # extract phaseshift
     phaseshift_rad = torch.as_tensor(dataset["ctf/phase_shift_rad"])
 
     # extract ctf shift, and add to translations
-    beamshift_A = torch.as_tensor(dataset["ctf/shift_A"])
-    translations_A -= beamshift_A
+    beamshift_angstrom = torch.as_tensor(dataset["ctf/shift_A"])
+    translations_angstrom -= beamshift_angstrom
 
-    # extract trefoil
-    trefoil1 = torch.as_tensor(dataset["ctf/trefoil_A"][:, 0] / 1000)
-    trefoil2 = torch.as_tensor(dataset["ctf/trefoil_A"][:, 1] / 1000)
+    # extract trefoil. CryoSPARC's ctf/trefoil_A is a raw Å-scale
+    # coefficient; specter's trefoil1/trefoil2 (see
+    # aberrations._functions.trefoil) are the direct k^3-domain phase
+    # coefficients in Å³, related by chi_trefoil =
+    # (2*pi/3)*wavelength^2*trefoil_angstrom -- see newctf.py's
+    # params_to_coeffs_odd/gen_basis_odd for the CryoSPARC-side derivation.
+    trefoil_angstrom = torch.as_tensor(dataset["ctf/trefoil_A"])
+    trefoil1 = (2 * torch.pi / 3) * wavelength_angstrom**2 * trefoil_angstrom[:, 0]
+    trefoil2 = (2 * torch.pi / 3) * wavelength_angstrom**2 * trefoil_angstrom[:, 1]
+
+    # extract tetrafoil. CryoSPARC's ctf/tetra_A holds 4 raw Å-scale
+    # coefficients spanning secondary astigmatism (n=4, m=+-2) and true
+    # tetrafoil (n=4, m=+-4); specter's tetrafoil1-4 (see
+    # aberrations._functions.tetrafoil) are the direct k^4-domain phase
+    # coefficients in Å⁴. See newctf.py's
+    # params_to_coeffs_even/gen_basis_even for the CryoSPARC-side
+    # derivation of these prefactors (including the sign/index mapping).
+    tetra_angstrom = torch.as_tensor(dataset["ctf/tetra_A"])
+    tetrafoil1 = -2 * torch.pi * wavelength_angstrom**3 * tetra_angstrom[:, 0]
+    tetrafoil2 = 2 * torch.pi * wavelength_angstrom**3 * tetra_angstrom[:, 1]
+    tetrafoil3 = (torch.pi / 2) * wavelength_angstrom**3 * tetra_angstrom[:, 2]
+    tetrafoil4 = -(torch.pi / 2) * wavelength_angstrom**3 * tetra_angstrom[:, 3]
 
     # extract per-particle scale factors
     scale = torch.as_tensor(dataset["alignments3D/alpha"])
@@ -116,7 +184,7 @@ def _load_csfile_parameters(
         anisomag = torch.inverse(anisomag.mT)
 
         # correct for anisotropic shift
-        corrected_shifts = translations_A.unsqueeze(
+        corrected_shifts = translations_angstrom.unsqueeze(
             -1
         )  # Add a dimension to make it (B, 2, 1)
 
@@ -125,18 +193,22 @@ def _load_csfile_parameters(
 
         # Remove the last dimension to get (B, 2)
         corrected_shifts = corrected_shifts.squeeze(-1)
-        translations_A = corrected_shifts
+        translations_angstrom = corrected_shifts
 
     ctf_params = {
-        "cs": cs_A,
-        "dfu": dfu_A,
-        "dfv": dfv_A,
+        "cs": cs_angstrom,
+        "dfu": dfu_angstrom,
+        "dfv": dfv_angstrom,
         "dfang": dfang_deg,
         "tiltx": beamtiltx_rad,
         "tilty": beamtilty_rad,
         "phaseshift": phaseshift_rad,
         "trefoil1": trefoil1,
         "trefoil2": trefoil2,
+        "tetrafoil1": tetrafoil1,
+        "tetrafoil2": tetrafoil2,
+        "tetrafoil3": tetrafoil3,
+        "tetrafoil4": tetrafoil4,
     }
 
     return (
@@ -144,7 +216,7 @@ def _load_csfile_parameters(
         pixel_size,
         alpha,
         rotations,
-        translations_A,
+        translations_angstrom,
         ctf_params,
         scale,
         anisomag,
@@ -154,7 +226,7 @@ def _load_csfile_parameters(
 
 def extract_parameters_from_csfile(
     csfile_path: str,
-    return_class: Literal["0", "1", "all"] = "all",
+    halfset: Literal["A", "B", "all"] = "all",
     rotation_representation: Literal["quaternion", "rotvec"] = "quaternion",
     n_particles: int | None = None,
 ) -> tuple:
@@ -165,27 +237,27 @@ def extract_parameters_from_csfile(
     ----------
     csfile_path : str
         Path of the .cs file.
-    return_class : str, optional
-        Specifies which particle class to return. Options are '0', '1', or 'all'.
-        Default is 'all'.
+    halfset : str, optional
+        Which gold-standard half-set to return, from ``alignments3D/split``
+        (raw values 0 and 1). Options are 'A', 'B', or 'all'. Default is 'all'.
     rotation_representation : str, optional
         Representation of rotations. 'quaternion' or 'rotvec'. Default is 'quaternion'.
     n_particles : int, optional
         If given, only the first ``n_particles`` particles (after filtering by
-        ``return_class``) are returned. Default is None (return all).
+        ``halfset``) are returned. Default is None (return all).
 
     Returns
     -------
     voltage_kv : torch.Tensor
         Voltage in kV.
     pixel_size : torch.Tensor
-        Pixel sizes in Ångstrom.
+        Pixel sizes in Å.
     alpha : torch.Tensor
         Amplitude contrast ratio.
     rotations : torch.Tensor
         Quaternions with shape (N, 4) or rotation vectors.
-    translations_A : torch.Tensor
-        xy-translations in Ångstrom with shape (N, 2).
+    translations_angstrom : torch.Tensor
+        xy-translations in Å with shape (N, 2).
     ctf_params : torch.Tensor
         CTF parameters with shape (N, 7). Parameters are (Cs, dfu, dfv, dfang, tiltx, tilty, phaseshift).
     scale : torch.Tensor
@@ -195,41 +267,42 @@ def extract_parameters_from_csfile(
     indices : torch.Tensor
         Indices of the extracted particles from the dataset.
     halfset_labels : torch.Tensor or None
-        1-D integer tensor of length ``N`` with values ``0`` or ``1`` from
-        ``alignments3D/split``, ready to pass as ``halfset_labels`` to
-        :func:`~specter.ghostbuster.run_halfsets`.
-        Only returned when ``return_class == "all"``; ``None`` otherwise.
+        1-D integer tensor of length ``N`` with the raw ``alignments3D/split``
+        values (0 or 1) -- 0 corresponds to halfset 'A', 1 to halfset 'B'.
+        Only returned when ``halfset == "all"``; ``None`` otherwise.
     """
     (
         voltage_kv,
         pixel_size,
         alpha,
         rotations,
-        translations_A,
+        translations_angstrom,
         ctf_params,
         scale,
         anisomag,
         split,
     ) = _load_csfile_parameters(csfile_path, rotation_representation)
 
-    if return_class == "all":
+    if halfset == "all":
         mask = torch.ones_like(split, dtype=torch.bool)
         indices = torch.arange(len(split))
         halfset_labels: torch.Tensor | None = split
-    else:  # "0" or "1"
-        mask = split == int(return_class)
+    else:  # "A" or "B"
+        mask = split == {"A": 0, "B": 1}[halfset]
         indices = torch.squeeze(torch.nonzero(mask))
         halfset_labels = None
 
-    indices, rotations, translations_A, ctf_params, scale, anisomag = _select_particles(
-        mask,
-        indices,
-        rotations,
-        translations_A,
-        ctf_params,
-        scale,
-        anisomag,
-        n_particles,
+    indices, rotations, translations_angstrom, ctf_params, scale, anisomag = (
+        _select_particles(
+            mask,
+            indices,
+            rotations,
+            translations_angstrom,
+            ctf_params,
+            scale,
+            anisomag,
+            n_particles,
+        )
     )
     if halfset_labels is not None and n_particles is not None:
         halfset_labels = halfset_labels[:n_particles]
@@ -239,10 +312,148 @@ def extract_parameters_from_csfile(
         pixel_size,
         alpha,
         rotations,
-        translations_A,
+        translations_angstrom,
         ctf_params,
         scale,
         anisomag,
         indices,
         halfset_labels,
     )
+
+
+def _blob_columns(dataset: object) -> tuple[np.ndarray, np.ndarray] | None:
+    """``(blob/path, blob/idx)`` of a loaded dataset, or None if it carries no images."""
+    if "blob/idx" not in dataset or "blob/path" not in dataset:  # type: ignore[operator]
+        return None
+    return (
+        np.asarray(dataset["blob/path"]).astype(str),  # type: ignore[index]
+        np.asarray(dataset["blob/idx"]).astype(np.int64),  # type: ignore[index]
+    )
+
+
+def _row_order(uid: np.ndarray, other_uid: np.ndarray) -> np.ndarray | None:
+    """Index array reordering ``other_uid``'s rows onto ``uid``'s, or None if they differ.
+
+    Sibling files of one particle group carry the same particles, but nothing
+    guarantees the same row order, so they are matched on ``uid`` rather than
+    position. Returning None on any mismatch is what keeps an unrelated ``.cs``
+    sitting in the same directory from being paired in silently.
+    """
+    if len(uid) != len(other_uid):
+        return None
+    ascending = np.argsort(other_uid)
+    position = np.searchsorted(other_uid[ascending], uid)
+    if np.any(position >= len(ascending)):
+        return None
+    order = ascending[position]
+    return order if np.array_equal(other_uid[order], uid) else None
+
+
+def _sibling_columns(
+    csfile_path: str | Path, columns: Callable[[object], tuple[np.ndarray, ...] | None]
+) -> tuple[np.ndarray, ...] | None:
+    """
+    ``columns`` of a ``.cs`` file, or of the sibling that holds its particles.
+
+    A job that rewrites its images keeps their blob columns in its other
+    ``.cs`` output, so when ``csfile_path`` carries none, the sibling ``.cs``
+    files in its directory are searched for one holding the same particles,
+    matched on ``uid`` and reordered onto this file's rows.
+    """
+    csfile_path = Path(csfile_path)
+    dataset = Dataset.load(str(csfile_path))
+    found = columns(dataset)
+    if found is not None:
+        return found
+    if "uid" not in dataset:
+        return None
+
+    uid = np.asarray(dataset["uid"])
+    for sibling in sorted(csfile_path.parent.glob("*.cs")):
+        if sibling.resolve() == csfile_path.resolve():
+            continue
+        try:
+            other = Dataset.load(str(sibling))
+        except Exception:  # noqa: BLE001 - an unreadable neighbour is not our problem
+            continue
+        found = columns(other)
+        if found is None or "uid" not in other:
+            continue
+        order = _row_order(uid, np.asarray(other["uid"]))
+        if order is None:
+            continue
+        logger.info("particle blob columns read from %s", sibling.name)
+        return tuple(column[order] for column in found)
+    return None
+
+
+def particle_stack_references(
+    csfile_path: str | Path,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Per-row ``(blob/path, blob/idx)`` for the particles a ``.cs`` file describes.
+
+    A CryoSPARC particle image is addressed by ``blob/path`` and ``blob/idx``,
+    never by its row number. A restack job writes its output stack in the order
+    it read its inputs, which is not the order of the rows it emits: on a
+    1000-particle restack of the CryoSPARC tutorial set, row ``i`` refers to
+    slice ``(i + 370) % 1000``. Reading the stack sequentially instead pairs
+    every pose with a different particle's image, and no rotationally averaged
+    statistic shows it -- only a matched-index correlation does
+    (:func:`specter.match.matched_index_correlation`).
+
+    Poses and blobs routinely live in different files of the same particle
+    group: a restack job puts the alignments in ``*_passthrough_particles.cs``
+    and the images in ``restacked_particles.cs``. When ``csfile_path`` carries
+    no blob columns of its own, sibling ``.cs`` files in the same directory are
+    searched for one holding the same particles, matched on ``uid``.
+
+    Parameters
+    ----------
+    csfile_path : str or Path
+        Path of the ``.cs`` file.
+
+    Returns
+    -------
+    tuple of numpy.ndarray, or None
+        ``(paths, indices)`` in the file's own row order, where ``paths`` are
+        the project-relative stack paths and ``indices`` the slice of each
+        stack. None when neither this file nor any sibling carries images.
+    """
+    found = _sibling_columns(csfile_path, _blob_columns)
+    return None if found is None else (found[0], found[1])
+
+
+def _sign_column(dataset: object) -> tuple[np.ndarray] | None:
+    """``blob/sign`` of a loaded dataset, or None if it does not record one."""
+    if "blob/sign" not in dataset:  # type: ignore[operator]
+        return None
+    return (np.asarray(dataset["blob/sign"], dtype=np.float32),)  # type: ignore[index]
+
+
+def particle_data_signs(csfile_path: str | Path) -> np.ndarray | None:
+    """
+    Per-row CryoSPARC data sign, ``blob/sign``, of a ``.cs`` file's particles.
+
+    CryoSPARC's Data Sign says which way round a stack stores its particles:
+    +1 dark on a light background, the polarity the microscope records, and
+    -1 light on a dark background, the inverted polarity RELION and CryoSPARC
+    extraction write. CryoSPARC multiplies each stored image by its sign
+    before it displays or processes it, so ``image * sign`` is the recorded
+    polarity whichever way the stack was written. Like the image addresses,
+    the sign lives with the blob columns, so a passthrough file's siblings
+    are searched for it (:func:`particle_stack_references`).
+
+    Parameters
+    ----------
+    csfile_path : str or Path
+        Path of the ``.cs`` file.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        ``(n,)`` float32 of +1 and -1 in the file's row order, or None when
+        neither the file nor a sibling records the sign.
+    """
+    found = _sibling_columns(csfile_path, _sign_column)
+    return None if found is None else found[0]

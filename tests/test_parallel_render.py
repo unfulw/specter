@@ -3,7 +3,8 @@
 species (processes, build_pdb_cache_concurrently) and render their
 PotentialBuilder templates (threads, build_templates_concurrently). The
 thread-pool tests use dummy build functions (pure/stateless helper); the
-process-pool tests use real, already-cached PDB codes since correctness
+process-pool tests use real PDB codes resolved from the tracked
+fixtures in tests/test_data/ (never the network) since correctness
 there depends on real pickling across a process boundary, which a dummy
 function wouldn't exercise (covered end-to-end otherwise by
 tests/test_tomogram_pipeline_membrane.py and tests/test_membrane_generator.py).
@@ -18,6 +19,9 @@ import threading
 import time
 
 import pytest
+from pathlib import Path
+
+from specter.config import default_pdb_cache_dir
 import torch
 
 import specter.specimen._parallel_render as parallel_render_module
@@ -26,52 +30,61 @@ from specter.specimen._parallel_render import (
     RECOMMENDED_MAX_RENDER_WORKERS,
     build_pdb_cache_concurrently,
     build_templates_concurrently,
-    recommend_render_devices,
     recommend_render_workers,
     resolve_render_devices,
     resolve_render_workers,
 )
+from conftest import monomer_library
 
 
-def test_resolve_render_devices_defaults_to_single_device():
-    assert resolve_render_devices("cpu", None) == [torch.device("cpu")]
-    assert resolve_render_devices("cpu", []) == [torch.device("cpu")]
+def _visible_render_devices() -> list[torch.device]:
+    """What `render_devices="auto"` must resolve to on this host."""
+    if torch.cuda.is_available():
+        return [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+    return [torch.device("cpu")]
 
 
-def test_resolve_render_devices_honors_explicit_pool():
-    devices = resolve_render_devices("cpu", ["cpu", "cpu"])
-    assert devices == [torch.device("cpu"), torch.device("cpu")]
+@pytest.mark.parametrize(
+    "pool, expected",
+    [
+        (None, [torch.device("cpu")]),
+        ([], [torch.device("cpu")]),
+        (["cpu", "cpu"], [torch.device("cpu"), torch.device("cpu")]),
+        ("auto", _visible_render_devices()),
+    ],
+    ids=[
+        "none_defaults_to_single",
+        "empty_defaults_to_single",
+        "explicit_pool",
+        "auto",
+    ],
+)
+def test_resolve_render_devices(pool, expected: list[torch.device]) -> None:
+    assert resolve_render_devices("cpu", pool) == expected
 
 
-def test_build_templates_concurrently_serial_matches_keys():
+@pytest.mark.parametrize(
+    "keys, max_workers", [([0, 1, 2], 1), ([0, 1, 2, 3], 4)], ids=["serial", "parallel"]
+)
+def test_build_templates_concurrently_produces_every_key(
+    keys: list[int], max_workers: int
+) -> None:
     calls = []
 
     def build_one(key: int, device: torch.device) -> torch.Tensor:
         calls.append(key)
-        return torch.tensor([key])
-
-    result = build_templates_concurrently(
-        keys=[0, 1, 2],
-        build_one=build_one,
-        devices=[torch.device("cpu")],
-        max_workers=1,
-    )
-    assert calls == [0, 1, 2]  # max_workers=1 runs strictly in order
-    assert {k: v.item() for k, v in result.items()} == {0: 0, 1: 1, 2: 2}
-
-
-def test_build_templates_concurrently_parallel_produces_same_result():
-    def build_one(key: int, device: torch.device) -> torch.Tensor:
         time.sleep(0.01)
         return torch.tensor([key])
 
     result = build_templates_concurrently(
-        keys=[0, 1, 2, 3],
+        keys=keys,
         build_one=build_one,
         devices=[torch.device("cpu")],
-        max_workers=4,
+        max_workers=max_workers,
     )
-    assert {k: v.item() for k, v in result.items()} == {0: 0, 1: 1, 2: 2, 3: 3}
+    if max_workers == 1:
+        assert calls == keys  # max_workers=1 runs strictly in order
+    assert {k: v.item() for k, v in result.items()} == {k: k for k in keys}
 
 
 def test_build_templates_concurrently_actually_overlaps():
@@ -111,39 +124,63 @@ def test_build_templates_concurrently_round_robins_devices():
     ]
 
 
-def test_build_pdb_cache_concurrently_serial():
-    cache = build_pdb_cache_concurrently(
-        pdb_sources=["1mbo"], pdb_cache_dir="pdb-data", max_workers=1
-    )
-    assert set(cache) == {"1mbo"}
-    assert cache["1mbo"].coordinates.shape[0] > 0
-
-
 def test_build_pdb_cache_concurrently_below_threshold_skips_process_pool(monkeypatch):
+    """
+    A handful of small structures is parsed serially, not in a process pool.
+
+    Three test structures are a few seconds of parsing between them, far less
+    than the pool's own measured spawn cost, so paying it would be a net loss --
+    see `_process_pool_is_worth_it`.
+    """
+
     def _boom(*args, **kwargs):
         raise AssertionError(
-            "ProcessPoolExecutor must not be used below "
-            "_MIN_SOURCES_FOR_PROCESS_POOL -- see that constant's own comment"
+            "ProcessPoolExecutor must not be used when the estimated parse "
+            "work cannot repay its spawn cost -- see _process_pool_is_worth_it"
         )
 
     monkeypatch.setattr(parallel_render_module, "ProcessPoolExecutor", _boom)
     cache = build_pdb_cache_concurrently(
-        pdb_sources=["1mbo", "1fa2", "1a6m"], pdb_cache_dir="pdb-data", max_workers=8
+        pdb_sources=["1mbo", "1bxn", "1a6m"],
+        pdb_cache_dir=str(Path(__file__).parent / "test_data"),
+        max_workers=8,
     )
-    assert set(cache) == {"1mbo", "1fa2", "1a6m"}
+    assert set(cache) == {"1mbo", "1bxn", "1a6m"}
 
 
+# Enough real structures for `_process_pool_is_worth_it` to choose the pool.
+_TABLE_SOURCES = [d["code"] for d in CRYOETSIM_PARTICLE_TABLE[:27]]
+
+
+def _table_sources_cached() -> bool:
+    """Whether every above-threshold source is already downloaded.
+
+    These two tests need 27 real structures (~32 MB) to make the process pool
+    the chosen path, which is too much to commit to git, so
+    they are opt-in on a populated cache. Guarding on it keeps a clean clone
+    from silently fetching 32 MB from RCSB in the middle of a test run.
+    """
+    cache = Path(default_pdb_cache_dir())
+    return all((cache / f"{code}-assembly1.cif").is_file() for code in _TABLE_SOURCES)
+
+
+_requires_table_sources = pytest.mark.skipif(
+    not _table_sources_cached(),
+    reason="needs the 27 CRYOETSIM_PARTICLE_TABLE structures in the PDB cache",
+)
+
+
+@_requires_table_sources
 def test_build_pdb_cache_concurrently_parallel_matches_serial():
-    # Above _MIN_SOURCES_FOR_PROCESS_POOL, so this genuinely exercises the
-    # process-pool path (see the below-threshold test above for the
-    # fallback-to-serial case).
-    n = parallel_render_module._MIN_SOURCES_FOR_PROCESS_POOL + 2
-    sources = [d["code"] for d in CRYOETSIM_PARTICLE_TABLE[:n]]
+    # Enough estimated parse work to choose the pool, so this genuinely
+    # exercises the process-pool path (see the below-threshold test above for
+    # the fallback-to-serial case).
+    sources = _TABLE_SOURCES
     serial = build_pdb_cache_concurrently(
-        pdb_sources=sources, pdb_cache_dir="pdb-data", max_workers=1
+        pdb_sources=sources, pdb_cache_dir=default_pdb_cache_dir(), max_workers=1
     )
     parallel = build_pdb_cache_concurrently(
-        pdb_sources=sources, pdb_cache_dir="pdb-data", max_workers=4
+        pdb_sources=sources, pdb_cache_dir=default_pdb_cache_dir(), max_workers=4
     )
     assert set(parallel) == set(serial) == set(sources)
     for source in sources:
@@ -158,42 +195,54 @@ def test_build_pdb_cache_concurrently_parallel_matches_serial():
         assert torch.allclose(parallel[source].coordinates, serial[source].coordinates)
 
 
-def test_build_pdb_cache_concurrently_deduplicates_sources():
-    n = parallel_render_module._MIN_SOURCES_FOR_PROCESS_POOL + 2
-    sources = [d["code"] for d in CRYOETSIM_PARTICLE_TABLE[:n]]
+def test_build_pdb_cache_concurrently_deduplicates_accession_case(monkeypatch):
+    # Regression test: dedup used to be by raw string, so a config naming
+    # one structure two ways ("1FA2" as a target, "1fa2" as a filler) paid
+    # for a second download and a second parse/bond-typing pass. The
+    # returned dict still has to carry BOTH spellings, since callers look
+    # up by `spec.pdb_source` verbatim.
+    import specter.pdb as pdb_module
+
+    built = []
+
+    # A subclass, not a wrapper function: PDB.__init__ reaches back through
+    # the module-global `PDB` name for `PDB.fetch_pdb_file`, so whatever
+    # replaces it has to still be the class.
+    class CountingPDB(pdb_module.PDB):
+        def __init__(self, source, *args, **kwargs):
+            built.append(source)
+            super().__init__(source, *args, **kwargs)
+
+    monkeypatch.setattr(pdb_module, "PDB", CountingPDB)
+
     cache = build_pdb_cache_concurrently(
-        pdb_sources=sources + sources[:3],  # duplicate a few sources
-        pdb_cache_dir="pdb-data",
-        max_workers=4,
+        pdb_sources=["1mbo", "1MBO", "1bxn"],
+        pdb_cache_dir=str(Path(__file__).parent / "test_data"),
+        max_workers=1,
     )
-    assert set(cache) == set(sources)
+
+    assert set(cache) == {"1mbo", "1MBO", "1bxn"}
+    assert cache["1mbo"] is cache["1MBO"]
+    assert sorted(built) == ["1BXN", "1MBO"]
 
 
-def test_recommend_render_workers_caps_at_measured_sweet_spot():
-    assert recommend_render_workers(1000) == RECOMMENDED_MAX_RENDER_WORKERS
-
-
-def test_recommend_render_workers_never_exceeds_species_count():
-    assert recommend_render_workers(3) == 3
-    assert recommend_render_workers(1) == 1
+def test_build_pdb_cache_concurrently_ticks_once_per_input_source():
+    # `on_result` sizes a caller's progress bar by its own source count, so
+    # aliases folded together internally still each need their own tick or
+    # the bar never reaches its total.
+    ticks = []
+    build_pdb_cache_concurrently(
+        pdb_sources=["1mbo", "1MBO", "1bxn"],
+        pdb_cache_dir=str(Path(__file__).parent / "test_data"),
+        max_workers=1,
+        on_result=ticks.append,
+    )
+    assert sorted(ticks) == ["1MBO", "1bxn", "1mbo"]
 
 
 def test_recommend_render_workers_floors_at_one():
     assert recommend_render_workers(0) == 1
     assert recommend_render_workers(-5) == 1
-
-
-def test_recommend_render_devices_matches_visible_gpus():
-    devices = recommend_render_devices()
-    if torch.cuda.is_available():
-        assert devices == [f"cuda:{i}" for i in range(torch.cuda.device_count())]
-    else:
-        assert devices is None
-
-
-def test_resolve_render_workers_passes_through_non_auto():
-    assert resolve_render_workers(3, n_species=100) == 3
-    assert resolve_render_workers(1, n_species=100) == 1
 
 
 def test_resolve_render_workers_resolves_auto():
@@ -203,11 +252,188 @@ def test_resolve_render_workers_resolves_auto():
     assert resolve_render_workers("auto", n_species=3) == 3
 
 
-def test_resolve_render_devices_resolves_auto():
-    devices = resolve_render_devices("cpu", "auto")
-    if torch.cuda.is_available():
-        assert devices == [
-            torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())
-        ]
-    else:
-        assert devices == [torch.device("cpu")]
+# readd_hydrogens has to survive the process boundary: the PDB cache is built
+# in spawned workers, which get a fresh interpreter and only the arguments
+# packed into the task tuple. $CLIBD_MON reaches them through the inherited
+# environment, the flag through the tuple -- both are checked here, on the
+# serial and pooled branches, since they build their PDBs by different code.
+
+
+@pytest.mark.skipif(monomer_library() is None, reason="no monomer library available")
+@pytest.mark.parametrize("max_workers", [1, 2], ids=["serial", "process-pool"])
+def test_build_pdb_cache_forwards_readd_hydrogens(monkeypatch, max_workers):
+    from pathlib import Path
+
+    from specter.specimen._parallel_render import build_pdb_cache_concurrently
+
+    monkeypatch.setenv("CLIBD_MON", monomer_library())
+    cif = str(Path(__file__).parent / "test_data" / "1mbo.cif")
+
+    def n_hydrogens(readd):
+        cache = build_pdb_cache_concurrently(
+            pdb_sources=[cif],
+            pdb_cache_dir=str(Path(cif).parent),
+            max_workers=max_workers,
+            compute_atom_species=True,
+            readd_hydrogens=readd,
+        )
+        return int((cache[cif].atomic_numbers == 1).sum())
+
+    # 1mbo carries no hydrogens, so True adds them and False must not.
+    assert n_hydrogens(True) > 0
+    assert n_hydrogens(False) == 0
+
+
+def test_estimated_parse_seconds_scales_with_file_size(tmp_path):
+    """
+    The parse-cost estimate reads the structure file's size, not just its name.
+
+    This is what replaced a fixed threshold on the NUMBER of sources: parse cost
+    spans ~40x across the structures one tomogram config loads, so a count says
+    nothing about whether a process pool can repay its spawn cost.
+    """
+    from specter.specimen._parallel_render import _estimated_parse_seconds
+
+    small = tmp_path / "aaaa-assembly1.cif"
+    large = tmp_path / "bbbb-assembly1.cif"
+    small.write_bytes(b"x" * 200_000)
+    large.write_bytes(b"x" * 20_000_000)
+
+    t_small = _estimated_parse_seconds("aaaa", str(tmp_path))
+    t_large = _estimated_parse_seconds("bbbb", str(tmp_path))
+
+    assert t_large > 10 * t_small
+    # An un-cached source has no size to read and must not be estimated at zero,
+    # or a pool of them would always look free.
+    assert _estimated_parse_seconds("zzzz", str(tmp_path)) > 1.0
+
+
+def test_estimated_parse_seconds_accepts_a_direct_path(tmp_path):
+    """A `pdb_source` given as a path is sized directly, not looked up in the cache."""
+    from specter.specimen._parallel_render import _estimated_parse_seconds
+
+    path = tmp_path / "structure.cif"
+    path.write_bytes(b"x" * 10_000_000)
+
+    assert _estimated_parse_seconds(str(path), "") > 6.0
+
+
+def test_process_pool_is_worth_it_matches_measured_crossover():
+    """
+    The serial-vs-pool decision reproduces the measured crossover.
+
+    Reference points measured on real structures with 8 workers: a net LOSS
+    at an estimated ~24 s of serial work (measured 0.96x), a clear win by
+    ~42 s (measured 1.49x) and ~90 s (2.81x). Pinning both sides matters --
+    a count-based rule gets the 90 s case wrong in one direction and a pile
+    of tiny structures wrong in the other.
+    """
+    from specter.specimen._parallel_render import _process_pool_is_worth_it
+
+    # one 26 s structure plus three small ones: not worth a pool
+    assert not _process_pool_is_worth_it([26.0, 0.7, 4.0, 1.4], max_workers=8)
+    # add two more large ones and it is
+    assert _process_pool_is_worth_it([26.0, 0.7, 4.0, 1.4, 18.0, 1.1], max_workers=8)
+    # the default tomogram config's 24 sources
+    assert _process_pool_is_worth_it([26.0, 18.0] + [2.5] * 22, max_workers=8)
+
+    # A single worker can never overlap anything, and an empty list has no work.
+    assert not _process_pool_is_worth_it([26.0] * 50, max_workers=1)
+    assert not _process_pool_is_worth_it([], max_workers=8)
+
+    # Many tiny structures stay serial: 20 x 0.5 s cannot repay the spawn cost.
+    assert not _process_pool_is_worth_it([0.5] * 20, max_workers=8)
+
+
+@_requires_table_sources
+def test_build_pdb_cache_concurrently_submits_expensive_sources_first(monkeypatch):
+    """
+    The pool receives its most expensive sources first.
+
+    Callers pass sources sorted alphabetically, which is uncorrelated with cost
+    and on the default tomogram config puts the two priciest structures near the
+    end. Starting the longest task last adds its whole duration to the makespan
+    rather than overlapping it, worth a measured 35.6s -> 31.5s.
+    """
+    from specter.specimen._parallel_render import _estimated_parse_seconds
+
+    submitted: list[str] = []
+
+    class _RecordingPool:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def submit(self, fn, args):
+            submitted.append(args[0])
+
+            class _Fut:
+                def result(self_inner):
+                    return None
+
+            return _Fut()
+
+    monkeypatch.setattr(parallel_render_module, "ProcessPoolExecutor", _RecordingPool)
+    monkeypatch.setattr(parallel_render_module, "as_completed", lambda futures: [])
+    # The first parse, whatever this machine's cache holds: once every source
+    # has a parsed entry each one costs the same 0.15 s to load, the pool is not
+    # worth spawning, and nothing is submitted at all.
+    import specter.pdb
+
+    monkeypatch.setattr(specter.pdb, "_parsed_cache_path", lambda *args: None)
+
+    sources = sorted(_TABLE_SOURCES)
+    build_pdb_cache_concurrently(
+        pdb_sources=sources,
+        pdb_cache_dir=default_pdb_cache_dir(),
+        max_workers=8,
+    )
+
+    assert sorted(submitted) == sorted(sources)
+    costs = [_estimated_parse_seconds(s, default_pdb_cache_dir()) for s in submitted]
+    assert costs == sorted(costs, reverse=True)
+    assert submitted != sources, "submission order should not still be alphabetical"
+
+
+def test_estimated_parse_seconds_is_small_when_the_parse_is_cached(
+    tmp_path, no_monomer_library
+):
+    """A source whose parse is already in the parsed-structure cache loads in a
+    fraction of a second regardless of its file size, and the pool decision
+    must see that: the shipped tomogram config (26 cached sources) was
+    spawning a process pool whose start-up was the entire loading phase."""
+    from specter.pdb import _parsed_cache_path
+    from specter.specimen._parallel_render import (
+        _PARSED_CACHE_LOAD_S,
+        _estimated_parse_seconds,
+    )
+
+    big = tmp_path / "cccc-assembly1.cif"
+    big.write_bytes(b"x" * 20_000_000)
+    flags = dict(
+        compute_atom_species=True, readd_hydrogens="auto", monomer_library_path=None
+    )
+
+    uncached = _estimated_parse_seconds("cccc", str(tmp_path), **flags)
+    assert uncached > 10.0
+
+    # write the parsed-cache entry this exact parse would produce
+    parsed = _parsed_cache_path(str(tmp_path), str(big), True, "auto", None)
+    assert parsed is not None
+    import os
+
+    os.makedirs(os.path.dirname(parsed), exist_ok=True)
+    open(parsed, "wb").write(b"\0")
+    assert (
+        _estimated_parse_seconds("cccc", str(tmp_path), **flags) == _PARSED_CACHE_LOAD_S
+    )
+    # ...and only for the same flags: a different parse is a different entry
+    assert (
+        _estimated_parse_seconds("cccc", str(tmp_path), compute_atom_species=False)
+        > 10.0
+    )

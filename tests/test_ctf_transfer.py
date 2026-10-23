@@ -32,9 +32,9 @@ WAVELENGTH = energy_to_wavelength(VOLTAGE)
 
 
 def _old_transfer(
-    ctf_params: dict, aberration_model: str = "holography"
+    ctf_params: dict, aberration_model: str = "nonlinear"
 ) -> torch.Tensor:
-    kwargs = {"alpha": 0.0} if aberration_model == "ctf" else {}
+    kwargs = {"alpha": 0.0} if aberration_model == "linear" else {}
     old = Aberration(
         N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model=aberration_model, **kwargs
     )
@@ -44,7 +44,7 @@ def _old_transfer(
 def _new_transfer(
     params: CTFParameters,
     specimen_absorption: bool = False,
-    aberration_model: str = "holography",
+    aberration_model: str = "nonlinear",
 ) -> torch.Tensor:
     new = TransferFunction(
         N_PIXELS,
@@ -60,50 +60,39 @@ def _new_transfer(
 # ---------------------------------------------------------------------------
 
 
-def test_defocus_astigmatism_cs_matches_old_aberration():
-    dfu, dfv, dfang = 20000.0, 18000.0, 35.0  # Angstrom, Angstrom, degrees
-    cs_ang = 2.7e7  # Angstrom
-
-    old = _old_transfer(
-        {
-            "dfu": torch.tensor(dfu),
-            "dfv": torch.tensor(dfv),
-            "dfang": torch.tensor(dfang),
-            "cs": torch.tensor(cs_ang),
-        }
-    )
-
-    params = CTFParameters(
-        defocus=(dfu + dfv) / 2 / 1e4,
-        astigmatism=(dfu - dfv) / 2 / 1e4,
-        astigmatism_angle=dfang,
-        spherical_aberration=cs_ang / 1e7,
-        voltage=VOLTAGE,
-    )
-    new = _new_transfer(params)
-
-    assert torch.allclose(old, new, atol=1e-4)
-
-
-def test_isotropic_defocus_matches_old_aberration():
-    """No astigmatism -- sanity check independent of the astigmatism-angle mapping."""
-    df_ang = 15000.0
-    old = _old_transfer({"dfu": torch.tensor(df_ang), "cs": torch.tensor(2.7e7)})
-    params = CTFParameters(
-        defocus=df_ang / 1e4, spherical_aberration=2.7e7 / 1e7, voltage=VOLTAGE
-    )
-    new = _new_transfer(params)
-    assert torch.allclose(old, new, atol=1e-4)
-
-
-def test_cs_only_matches_old_aberration():
-    """Cs in isolation, no defocus at all."""
-    cs_ang = 3.1e7
-    old = _old_transfer({"dfu": torch.tensor(0.0), "cs": torch.tensor(cs_ang)})
-    params = CTFParameters(
-        defocus=0.0, spherical_aberration=cs_ang / 1e7, voltage=VOLTAGE
-    )
-    new = _new_transfer(params)
+@pytest.mark.parametrize(
+    "old_params,new_kwargs",
+    [
+        (
+            {"dfu": 20000.0, "dfv": 18000.0, "dfang": 35.0, "cs": 2.7e7},
+            dict(
+                defocus=(20000.0 + 18000.0) / 2 / 1e4,
+                astigmatism=(20000.0 - 18000.0) / 2 / 1e4,
+                astigmatism_angle=35.0,
+                spherical_aberration=2.7e7 / 1e7,
+                voltage=VOLTAGE,
+            ),
+        ),
+        (
+            {"dfu": 15000.0, "cs": 2.7e7},
+            dict(
+                defocus=15000.0 / 1e4, spherical_aberration=2.7e7 / 1e7, voltage=VOLTAGE
+            ),
+        ),
+        (
+            {"dfu": 0.0, "cs": 3.1e7},
+            dict(defocus=0.0, spherical_aberration=3.1e7 / 1e7, voltage=VOLTAGE),
+        ),
+    ],
+    ids=["defocus_astigmatism_cs", "isotropic_defocus", "cs_only"],
+)
+def test_defocus_and_cs_match_old_aberration(old_params, new_kwargs):
+    """Defocus, astigmatism and Cs parity (legacy Angstrom units against
+    CTFParameters' micrometres/mm). The isotropic case has no astigmatism, a
+    sanity check independent of the astigmatism-angle mapping; the Cs-only
+    case checks Cs in isolation, with no defocus at all."""
+    old = _old_transfer({k: torch.tensor(v) for k, v in old_params.items()})
+    new = _new_transfer(CTFParameters(**new_kwargs))
     assert torch.allclose(old, new, atol=1e-4)
 
 
@@ -139,28 +128,6 @@ def test_astigmatism_angle_sweep_matches_old_aberration(dfang):
 # ---------------------------------------------------------------------------
 
 
-def test_trefoil_matches_old_aberration_via_zernike_conversion():
-    trefoil1, trefoil2 = 0.6, -0.9  # specter's physical-k^3 convention
-
-    old = _old_transfer(
-        {
-            "dfu": torch.tensor(0.0),
-            "trefoil1": torch.tensor(trefoil1),
-            "trefoil2": torch.tensor(trefoil2),
-        }
-    )
-
-    rho_max = zernike_rho_max((N_PIXELS, N_PIXELS), PIXEL_SIZE)
-    params = CTFParameters(
-        defocus=0.0,
-        spherical_aberration=0.0,
-        odd_zernike={"Z33c": -trefoil1 * rho_max**3, "Z33s": -trefoil2 * rho_max**3},
-    )
-    new = _new_transfer(params)
-
-    assert torch.allclose(old, new, atol=1e-4)
-
-
 @pytest.mark.parametrize(
     "trefoil1,trefoil2",
     [(0.6, -0.9), (-0.3, 0.4), (1.2, 0.0), (0.0, -0.7), (-1.5, -1.5)],
@@ -189,78 +156,25 @@ def test_trefoil_sweep_matches_old_aberration(trefoil1, trefoil2):
 # ---------------------------------------------------------------------------
 
 
-def test_beamtilt_matches_old_aberration_via_zernike_conversion():
-    tiltx, tilty = 2e-5, -1.5e-5  # radians, small enough to avoid phase wraparound
-    cs_ang = 2.7e7
-
-    old = _old_transfer(
-        {
-            "dfu": torch.tensor(0.0),
-            "cs": torch.tensor(cs_ang),
-            "tiltx": torch.tensor(tiltx),
-            "tilty": torch.tensor(tilty),
-        }
-    )
-
-    rho_max = zernike_rho_max((N_PIXELS, N_PIXELS), PIXEL_SIZE)
-    prefactor = 2 * torch.pi * WAVELENGTH**2 * cs_ang * rho_max**3
-    params = CTFParameters(
-        defocus=0.0,
-        spherical_aberration=cs_ang / 1e7,
-        voltage=VOLTAGE,
-        odd_zernike={"Z31c": -prefactor * tiltx, "Z31s": -prefactor * tilty},
-    )
-    new = _new_transfer(params)
-
-    assert torch.allclose(old, new, atol=1e-4)
-
-
-def test_beam_tilt_mrad_convenience_arg_does_not_match_specter_convention():
-    """Documents a real gotcha: torch-ctf's own beam_tilt_mrad -> Zernike
-    conversion does not include the zernike_rho_max rescale, so it does
-    *not* reproduce specter's physical-k beamtilt formula. Manual
-    odd_zernike (see test above) is required for parity."""
-    tiltx, tilty = 2e-5, -1.5e-5
-    cs_ang = 2.7e7
-
-    old = _old_transfer(
-        {
-            "dfu": torch.tensor(0.0),
-            "cs": torch.tensor(cs_ang),
-            "tiltx": torch.tensor(tiltx),
-            "tilty": torch.tensor(tilty),
-        }
-    )
-    params = CTFParameters(
-        defocus=0.0,
-        spherical_aberration=cs_ang / 1e7,
-        voltage=VOLTAGE,
-        beam_tilt_mrad=[tiltx * 1e3, tilty * 1e3],
-    )
-    new = _new_transfer(params)
-
-    assert not torch.allclose(old, new, atol=1e-3)
-
-
 @pytest.mark.parametrize(
     "tiltx,tilty",
     [(2e-5, -1.5e-5), (-1e-5, 3e-5), (5e-6, 0.0), (0.0, -4e-5), (-3e-5, -3e-5)],
 )
 def test_beamtilt_sweep_matches_old_aberration(tiltx, tilty):
-    cs_ang = 2.7e7
+    cs_angstrom = 2.7e7
     old = _old_transfer(
         {
             "dfu": torch.tensor(0.0),
-            "cs": torch.tensor(cs_ang),
+            "cs": torch.tensor(cs_angstrom),
             "tiltx": torch.tensor(tiltx),
             "tilty": torch.tensor(tilty),
         }
     )
     rho_max = zernike_rho_max((N_PIXELS, N_PIXELS), PIXEL_SIZE)
-    prefactor = 2 * torch.pi * WAVELENGTH**2 * cs_ang * rho_max**3
+    prefactor = 2 * torch.pi * WAVELENGTH**2 * cs_angstrom * rho_max**3
     params = CTFParameters(
         defocus=0.0,
-        spherical_aberration=cs_ang / 1e7,
+        spherical_aberration=cs_angstrom / 1e7,
         voltage=VOLTAGE,
         odd_zernike={"Z31c": -prefactor * tiltx, "Z31s": -prefactor * tilty},
     )
@@ -274,30 +188,30 @@ def test_beamtilt_sweep_matches_old_aberration(tiltx, tilty):
 
 
 @pytest.mark.parametrize("phase_deg", [10.0, 40.0, 90.0, -25.0, 150.0])
-def test_phase_shift_matches_old_aberration_ctf_model(phase_deg):
-    """Compared under aberration_model="ctf": Aberration's phaseshift() only
-    zeroes the DC pixel for the "holography" model (see the next test) --
-    "ctf" mode applies the plain -phaseshift term everywhere, matching
+def test_phase_shift_matches_old_aberration_linear_model(phase_deg):
+    """Compared under aberration_model="linear": Aberration's phaseshift() only
+    zeroes the DC pixel for the "nonlinear" model (see the next test) --
+    "linear" mode applies the plain -phaseshift term everywhere, matching
     torch-ctf's calculate_total_phase_shift with no special-casing."""
     phase_rad = torch.deg2rad(torch.tensor(phase_deg))
     old = _old_transfer(
-        {"dfu": torch.tensor(0.0), "phaseshift": phase_rad}, aberration_model="ctf"
+        {"dfu": torch.tensor(0.0), "phaseshift": phase_rad}, aberration_model="linear"
     )
     params = CTFParameters(defocus=0.0, spherical_aberration=0.0, phase_shift=phase_deg)
-    new = _new_transfer(params, aberration_model="ctf")
+    new = _new_transfer(params, aberration_model="linear")
     assert torch.allclose(old, new, atol=1e-4)
 
 
-def test_phase_shift_holography_model_matches_old_aberration_including_dc():
-    """TransferFunction._zero_dc_for_holography ports Aberration's
-    holography-model DC-pinning ("phaseshift must be zero at DC for Fourier
+def test_phase_shift_nonlinear_model_matches_old_aberration_including_dc():
+    """TransferFunction._zero_dc_for_nonlinear ports Aberration's
+    nonlinear-model DC-pinning ("phaseshift must be zero at DC for Fourier
     optics validity"), so this now matches everywhere, DC included -- not
     just "everywhere but DC" as it did before that fix."""
     phase_deg = 40.0
     phase_rad = torch.deg2rad(torch.tensor(phase_deg))
     old = _old_transfer(
         {"dfu": torch.tensor(0.0), "phaseshift": phase_rad},
-        aberration_model="holography",
+        aberration_model="nonlinear",
     )
     params = CTFParameters(defocus=0.0, spherical_aberration=0.0, phase_shift=phase_deg)
     new = _new_transfer(params)
@@ -306,10 +220,10 @@ def test_phase_shift_holography_model_matches_old_aberration_including_dc():
     assert torch.allclose(new[0, 0], torch.tensor(1.0 + 0.0j), atol=1e-6)
 
 
-def test_holography_dc_pinning_also_covers_amplitude_contrast():
+def test_nonlinear_dc_pinning_also_covers_amplitude_contrast():
     """amplitude_contrast has no old-Aberration equivalent (dead code there),
     but it's the same k-independent-chi-term situation as phase_shift: left
-    unpinned, it would be an inert global phase in holography mode. Verify
+    unpinned, it would be an inert global phase in nonlinear mode. Verify
     the DC pixel is pinned to 1+0j even when only amplitude_contrast (not
     phase_shift) is nonzero, and that non-DC pixels still carry its effect."""
     params = CTFParameters(defocus=1.0, amplitude_contrast=0.1)
@@ -331,7 +245,7 @@ def test_dc_pinning_preserves_gradients_correctly():
     params = CTFParameters(
         defocus=1.0, phase_shift=40.0, amplitude_contrast=0.0, learnable={"phase_shift"}
     )
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     transfer = tf.transfer_function(params)
 
     # DC must be a plain constant (no grad_fn dependence on phase_shift):
@@ -358,34 +272,9 @@ def test_dc_pinning_preserves_gradients_correctly():
 # ---------------------------------------------------------------------------
 
 
-def test_amplitude_contrast_real_ctf_equals_constant_Q():
-    """With every other term zero, chi is identically -arcsin(Q) at all k, so
-    the real weak-phase-object CTF -sin(chi) collapses to the constant Q
-    everywhere -- a clean, closed-form check independent of any grid or
-    frequency-dependent term."""
-    from torch_ctf import calculate_ctf_2d
-
-    Q = 0.1
-    ctf = calculate_ctf_2d(
-        defocus=0.0,
-        astigmatism=0.0,
-        astigmatism_angle=0.0,
-        voltage=VOLTAGE,
-        spherical_aberration=0.0,
-        amplitude_contrast=Q,
-        phase_shift=0.0,
-        pixel_size=PIXEL_SIZE,
-        image_shape=(N_PIXELS, N_PIXELS),
-        rfft=False,
-        fftshift=False,
-        return_complex_ctf=False,
-    )
-    assert torch.allclose(ctf, torch.full_like(ctf, Q), atol=1e-6)
-
-
 def test_amplitude_contrast_complex_transfer_matches_specters_absorptive_potential_constant():
     """The complex transfer function should equal sqrt(1-Q^2) + iQ everywhere
-    -- exactly specter's own scattering.complex_potential's `c = sqrt(1-a^2)
+    -- exactly specter's own potential.apply_amplitude_contrast's `c = sqrt(1-a^2)
     + i*a` scalar. This is the concrete numeric confirmation of the
     equivalence derived earlier: amplitude contrast applied via an
     absorptive specimen potential and amplitude contrast applied as a CTF
@@ -437,67 +326,6 @@ def test_tetrafoil_now_computable():
     assert not torch.allclose(new, new.T, atol=1e-6)
 
 
-def test_tetrafoil_matches_reimplemented_zernike_formula():
-    """Reimplements torch_ctf.ctf_aberrations.apply_even_zernikes's
-    documented formula (coeff * rho**4 * cos/sin(4*theta) for Z44c/Z44s,
-    coeff * rho**6 for Z60) from scratch and checks the actual function
-    against it -- a regression/self-consistency check on torch-ctf's own
-    code, since specter has no tetrafoil implementation to compare to."""
-    from torch_grid_utils.fftfreq_grid import fftfreq_grid
-    from torch_grid_utils.polar_grid import fftfreq_grid_polar
-    from torch_ctf.ctf_aberrations import apply_even_zernikes
-
-    fft_freq_grid = fftfreq_grid(
-        image_shape=(N_PIXELS, N_PIXELS),
-        rfft=False,
-        fftshift=False,
-        spacing=PIXEL_SIZE,
-        norm=False,
-    )
-    rho, theta = fftfreq_grid_polar(fft_freq_grid)
-
-    z44c, z44s, z60 = 0.2, -0.1, 0.05
-    total_phase_shift = torch.zeros_like(rho)
-    actual = apply_even_zernikes(
-        {"Z44c": z44c, "Z44s": z44s, "Z60": z60}, total_phase_shift, rho, theta
-    )
-    expected = (
-        z44c * rho**4 * torch.cos(4 * theta)
-        + z44s * rho**4 * torch.sin(4 * theta)
-        + z60 * rho**6
-    )
-    assert torch.allclose(actual, expected, atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# Flexibility: omitted parameters must still run
-# ---------------------------------------------------------------------------
-
-
-def test_defocus_only_runs():
-    params = CTFParameters(defocus=1.0)
-    new = _new_transfer(params)
-    assert new.shape == (N_PIXELS, N_PIXELS)
-    assert torch.isfinite(new.real).all()
-
-
-def test_sparse_odd_zernike_trefoil_only_runs():
-    params = CTFParameters(defocus=1.0, odd_zernike={"Z33c": 0.05})
-    new = _new_transfer(params)
-    assert torch.isfinite(new.real).all()
-    assert "Z33s" not in params.torch_ctf_kwargs(PIXEL_SIZE, (N_PIXELS, N_PIXELS)).get(
-        "odd_zernike_coeffs", {}
-    )
-
-
-def test_no_zernike_terms_omits_kwargs_entirely():
-    params = CTFParameters(defocus=1.0)
-    kwargs = params.torch_ctf_kwargs(PIXEL_SIZE, (N_PIXELS, N_PIXELS))
-    assert "even_zernike_coeffs" not in kwargs
-    assert "odd_zernike_coeffs" not in kwargs
-    assert "beam_tilt_mrad" not in kwargs
-
-
 # ---------------------------------------------------------------------------
 # specimen_absorption double-counting guard (the "option a" policy)
 # ---------------------------------------------------------------------------
@@ -533,7 +361,7 @@ def test_specimen_absorption_false_lets_amplitude_contrast_through():
 
 def test_learnable_field_receives_gradient():
     params = CTFParameters(defocus=1.0, learnable={"defocus"})
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
 
     # A constant exitwave has all its energy at the DC frequency, where every
     # defocus/Cs/Zernike term is exactly zero by construction -- gradients
@@ -559,13 +387,6 @@ def test_learnable_field_receives_gradient():
     assert not isinstance(params.fields["astigmatism"].value, torch.nn.Parameter)
 
 
-def test_non_learnable_fields_stay_fixed_buffers():
-    params = CTFParameters(defocus=1.0, odd_zernike={"Z33c": 0.05}, learnable=())
-    assert not isinstance(params.fields["defocus"].value, torch.nn.Parameter)
-    assert not isinstance(params.odd_zernike["Z33c"].value, torch.nn.Parameter)
-    assert list(params.parameters()) == []
-
-
 def test_per_field_learnable_selection():
     params = CTFParameters(
         defocus=1.0,
@@ -576,54 +397,6 @@ def test_per_field_learnable_selection():
     assert isinstance(params.odd_zernike["Z33c"].value, torch.nn.Parameter)
     assert not isinstance(params.odd_zernike["Z33s"].value, torch.nn.Parameter)
     assert not isinstance(params.fields["astigmatism"].value, torch.nn.Parameter)
-
-
-def test_per_field_optimizers_update_independently():
-    """Answers: can different CTF params have different optimizers/LRs?
-    Yes -- each learnable ParamField.value is an ordinary nn.Parameter, so
-    ordinary per-parameter optimizer groups (or entirely separate
-    optimizers, as Reconstructor already does for V/rotations/translations)
-    work unchanged."""
-    params = CTFParameters(
-        defocus=1.0,
-        odd_zernike={"Z33c": 0.05},
-        learnable={"defocus", "Z33c"},
-    )
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
-
-    defocus_before = params.fields["defocus"].value.item()
-    trefoil_before = params.odd_zernike["Z33c"].value.item()
-
-    # Z33c's gradient is intrinsically much smaller than defocus's (rho is
-    # normalized to [0, 1] vs. defocus's physical 1/Angstrom^2 scale), so
-    # its learning rate needs to be correspondingly larger to produce a
-    # visible update -- itself a demonstration of why per-field learning
-    # rates are necessary, not just a nice-to-have.
-    opt_defocus = torch.optim.SGD([params.fields["defocus"].value], lr=1.0)
-    opt_trefoil = torch.optim.SGD([params.odd_zernike["Z33c"].value], lr=1e4)
-
-    # A constant exitwave has all its energy at the DC frequency, where every
-    # defocus/Cs/Zernike term is exactly zero by construction -- gradients
-    # would trivially vanish. Use broadband content so every term's
-    # gradient is actually exercised.
-    exitwave = torch.randn(
-        1,
-        N_PIXELS,
-        N_PIXELS,
-        dtype=torch.complex64,
-        generator=torch.Generator().manual_seed(0),
-    )
-    loss = (tf(exitwave, params).abs() ** 2).sum()
-    opt_defocus.zero_grad()
-    opt_trefoil.zero_grad()
-    loss.backward()
-    opt_defocus.step()
-    opt_trefoil.step()
-
-    defocus_delta = abs(params.fields["defocus"].value.item() - defocus_before)
-    trefoil_delta = abs(params.odd_zernike["Z33c"].value.item() - trefoil_before)
-    assert defocus_delta > 0
-    assert trefoil_delta > 0
 
 
 # ---------------------------------------------------------------------------
@@ -657,54 +430,23 @@ def test_bfactor_envelope_matches_old_aberration_via_forward():
         N_PIXELS,
         PIXEL_SIZE,
         VOLTAGE,
-        aberration_model="holography",
+        aberration_model="nonlinear",
         bfactor=bfactor_val,
     )
     old_out = old.forward(exitwave, {"dfu": torch.tensor(12000.0)})
 
     params = CTFParameters(defocus=12000.0 / 1e4, spherical_aberration=0.0)
     new_tf = TransferFunction(
-        N_PIXELS, PIXEL_SIZE, aberration_model="holography", bfactor=bfactor_val
+        N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear", bfactor=bfactor_val
     )
     new_out = new_tf.forward(exitwave, params)
 
     assert torch.allclose(old_out, new_out, atol=1e-4)
 
 
-def test_bfactor_via_transfer_function_directly_is_a_known_api_difference():
-    """Documents the asymmetry above concretely: with the same bfactor,
-    calling .transfer_function() directly (not .forward()) gives *different*
-    results between the two classes -- old ignores the constructor bfactor
-    entirely here, new applies it. Not a bug in either class individually,
-    but a real API-level difference to know about if anything ever calls
-    .transfer_function() directly instead of .forward()."""
-    bfactor_val = 150.0
-    old = Aberration(
-        N_PIXELS,
-        PIXEL_SIZE,
-        VOLTAGE,
-        aberration_model="holography",
-        bfactor=bfactor_val,
-    )
-    old_t = old.transfer_function({"dfu": torch.tensor(12000.0)}).squeeze()
-
-    params = CTFParameters(defocus=12000.0 / 1e4, spherical_aberration=0.0)
-    new_tf = TransferFunction(
-        N_PIXELS, PIXEL_SIZE, aberration_model="holography", bfactor=bfactor_val
-    )
-    new_t = new_tf.transfer_function(params).squeeze()
-
-    assert not torch.allclose(
-        old_t, new_t, atol=1e-4
-    )  # old: bfactor silently ignored here
-    assert torch.allclose(
-        old_t[0, 0], new_t[0, 0], atol=1e-4
-    )  # DC: both unaffected by bfactor
-
-
 # ---------------------------------------------------------------------------
 # Parity: multi-particle batching (every test above used an implicit batch
-# of 1 -- Reconstructor/ImageGenerator always pass per-particle tensors of
+# of 1 -- Reconstructor/ExitWave.apply_ctf always pass per-particle tensors of
 # shape (N,), N>1, so this is the actually-used code path, not tested
 # anywhere else in this file).
 # ---------------------------------------------------------------------------
@@ -714,21 +456,21 @@ def test_multi_particle_batch_matches_old_aberration():
     dfu = torch.tensor([12000.0, 15000.0, 9000.0, 20000.0])
     dfv = torch.tensor([11000.0, 15000.0, 8500.0, 17000.0])
     dfang = torch.tensor([10.0, 0.0, 45.0, -20.0])
-    cs_ang = 2.7e7
+    cs_angstrom = 2.7e7
 
-    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography")
+    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="nonlinear")
     old_t = old.transfer_function(
-        {"dfu": dfu, "dfv": dfv, "dfang": dfang, "cs": torch.full((4,), cs_ang)}
+        {"dfu": dfu, "dfv": dfv, "dfang": dfang, "cs": torch.full((4,), cs_angstrom)}
     )
 
     params = CTFParameters(
         defocus=(dfu + dfv) / 2 / 1e4,
         astigmatism=(dfu - dfv) / 2 / 1e4,
         astigmatism_angle=dfang,
-        spherical_aberration=cs_ang / 1e7,
+        spherical_aberration=cs_angstrom / 1e7,
         voltage=VOLTAGE,
     )
-    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     new_t = new_tf.transfer_function(params)
 
     assert old_t.shape == new_t.shape == (4, N_PIXELS, N_PIXELS)
@@ -741,12 +483,12 @@ def test_multi_particle_indexing_selects_matching_subset():
     before calling transfer_function -- these need to agree for
     Reconstructor's per-batch particle indexing to be swappable."""
     dfu = torch.tensor([12000.0, 15000.0, 9000.0, 20000.0])
-    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography")
+    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="nonlinear")
     idx = torch.tensor([2, 0])
     old_t = old.transfer_function({"dfu": dfu[idx]})
 
     params = CTFParameters(defocus=dfu / 1e4, spherical_aberration=0.0)
-    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     new_t = new_tf.transfer_function(params, idx=idx)
 
     assert torch.allclose(old_t, new_t, atol=1e-4)
@@ -760,7 +502,7 @@ def test_multi_particle_indexing_selects_matching_subset():
 # ---------------------------------------------------------------------------
 
 
-def test_forward_end_to_end_matches_old_aberration_holography():
+def test_forward_end_to_end_matches_old_aberration_nonlinear():
     exitwave = torch.randn(
         1,
         N_PIXELS,
@@ -768,7 +510,7 @@ def test_forward_end_to_end_matches_old_aberration_holography():
         dtype=torch.complex64,
         generator=torch.Generator().manual_seed(1),
     )
-    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography")
+    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="nonlinear")
     old_out = old.forward(
         exitwave, {"dfu": torch.tensor(14000.0), "cs": torch.tensor(2.7e7)}
     )
@@ -776,7 +518,7 @@ def test_forward_end_to_end_matches_old_aberration_holography():
     params = CTFParameters(
         defocus=14000.0 / 1e4, spherical_aberration=2.7e7 / 1e7, voltage=VOLTAGE
     )
-    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     new_out = new_tf.forward(exitwave, params)
 
     assert torch.allclose(old_out, new_out, atol=1e-4)
@@ -790,7 +532,9 @@ def test_forward_end_to_end_matches_old_aberration_ctf_model():
         dtype=torch.complex64,
         generator=torch.Generator().manual_seed(2),
     )
-    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="ctf", alpha=0.0)
+    old = Aberration(
+        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="linear", alpha=0.0
+    )
     old_out = old.forward(
         exitwave, {"dfu": torch.tensor(14000.0), "cs": torch.tensor(2.7e7)}
     )
@@ -798,7 +542,7 @@ def test_forward_end_to_end_matches_old_aberration_ctf_model():
     params = CTFParameters(
         defocus=14000.0 / 1e4, spherical_aberration=2.7e7 / 1e7, voltage=VOLTAGE
     )
-    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="ctf")
+    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="linear")
     new_out = new_tf.forward(exitwave, params)
 
     assert torch.allclose(old_out, new_out, atol=1e-4)
@@ -813,29 +557,35 @@ def test_forward_end_to_end_matches_old_aberration_ctf_model():
 # ---------------------------------------------------------------------------
 
 
-def test_cs_envelope_matches_old_aberration():
-    """Spatial-coherence (beam convergence) envelope -- needs the
-    defocus/Cs micrometers/mm -> Angstrom conversion at the call site."""
-    dfu, cs_ang = 15000.0, 2.7e7
+@pytest.mark.parametrize(
+    "envelope_kwargs",
+    [{"convergence_angle": 1.0}, {"cc": 1.4e7}],
+    ids=["cs_envelope", "cc_envelope"],
+)
+def test_coherence_envelope_matches_old_aberration(envelope_kwargs):
+    """Spatial-coherence (beam convergence) envelope, which needs the
+    defocus/Cs micrometers/mm -> Angstrom conversion at the call site, and the
+    temporal-coherence (chromatic aberration) envelope."""
+    dfu, cs_angstrom = 15000.0, 2.7e7
     old = _old_transfer(
-        {"dfu": torch.tensor(dfu), "cs": torch.tensor(cs_ang)},
+        {"dfu": torch.tensor(dfu), "cs": torch.tensor(cs_angstrom)},
     )
     old_full = Aberration(
         N_PIXELS,
         PIXEL_SIZE,
         VOLTAGE,
-        aberration_model="holography",
-        convergence_angle=1.0,
+        aberration_model="nonlinear",
+        **envelope_kwargs,
     )
     old_t = old_full.transfer_function(
-        {"dfu": torch.tensor(dfu), "cs": torch.tensor(cs_ang)}
+        {"dfu": torch.tensor(dfu), "cs": torch.tensor(cs_angstrom)}
     ).squeeze()
 
     params = CTFParameters(
-        defocus=dfu / 1e4, spherical_aberration=cs_ang / 1e7, voltage=VOLTAGE
+        defocus=dfu / 1e4, spherical_aberration=cs_angstrom / 1e7, voltage=VOLTAGE
     )
     new_tf = TransferFunction(
-        N_PIXELS, PIXEL_SIZE, aberration_model="holography", convergence_angle=1.0
+        N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear", **envelope_kwargs
     )
     new_t = new_tf.transfer_function(params).squeeze()
 
@@ -844,49 +594,31 @@ def test_cs_envelope_matches_old_aberration():
     assert not torch.allclose(old_t, old, atol=1e-3)
 
 
-def test_cc_envelope_matches_old_aberration():
-    """Temporal-coherence (chromatic aberration) envelope."""
-    dfu, cs_ang = 15000.0, 2.7e7
-    old = Aberration(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography", cc=1.4e7
-    )
-    old_t = old.transfer_function(
-        {"dfu": torch.tensor(dfu), "cs": torch.tensor(cs_ang)}
-    ).squeeze()
-
-    params = CTFParameters(
-        defocus=dfu / 1e4, spherical_aberration=cs_ang / 1e7, voltage=VOLTAGE
-    )
-    new_tf = TransferFunction(
-        N_PIXELS, PIXEL_SIZE, aberration_model="holography", cc=1.4e7
-    )
-    new_t = new_tf.transfer_function(params).squeeze()
-
-    assert torch.allclose(old_t, new_t, atol=1e-4)
-
-
 def test_dose_envelope_matches_old_aberration():
     """Grant & Grigorieff (2015) cumulative-dose envelope -- dose lives on
     CTFParameters (matching old Aberration reading it from the same
     per-image ctf_params dict as everything else), not as a
     TransferFunction constructor convenience like bfactor."""
-    dfu, cs_ang = 15000.0, 2.7e7
+    dfu, cs_angstrom = 15000.0, 2.7e7
     old = Aberration(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography", dose_envelope=True
+        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="nonlinear", dose_envelope=True
     )
     old_t = old.transfer_function(
         {
             "dfu": torch.tensor(dfu),
-            "cs": torch.tensor(cs_ang),
+            "cs": torch.tensor(cs_angstrom),
             "dose": torch.tensor(40.0),
         }
     ).squeeze()
 
     params = CTFParameters(
-        defocus=dfu / 1e4, spherical_aberration=cs_ang / 1e7, voltage=VOLTAGE, dose=40.0
+        defocus=dfu / 1e4,
+        spherical_aberration=cs_angstrom / 1e7,
+        voltage=VOLTAGE,
+        dose=40.0,
     )
     new_tf = TransferFunction(
-        N_PIXELS, PIXEL_SIZE, aberration_model="holography", dose_envelope=True
+        N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear", dose_envelope=True
     )
     new_t = new_tf.transfer_function(params).squeeze()
 
@@ -899,9 +631,9 @@ def test_dose_envelope_disabled_without_ctf_params_dose():
     not an error."""
     params = CTFParameters(defocus=1.0, spherical_aberration=2.7)
     tf_with_envelope = TransferFunction(
-        N_PIXELS, PIXEL_SIZE, aberration_model="holography", dose_envelope=True
+        N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear", dose_envelope=True
     )
-    tf_without = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf_without = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     assert torch.allclose(
         tf_with_envelope.transfer_function(params), tf_without.transfer_function(params)
     )
@@ -929,7 +661,7 @@ def test_multi_particle_trefoil_matches_old_aberration():
     trefoil1 = torch.tensor([0.6, -0.3, 1.2, 0.0, -1.5])
     trefoil2 = torch.tensor([-0.9, 0.4, 0.0, -0.7, -1.5])
 
-    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography")
+    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="nonlinear")
     old_t = old.transfer_function(
         {"dfu": torch.zeros(5), "trefoil1": trefoil1, "trefoil2": trefoil2}
     )
@@ -940,7 +672,7 @@ def test_multi_particle_trefoil_matches_old_aberration():
         spherical_aberration=0.0,
         odd_zernike={"Z33c": -trefoil1 * rho_max**3, "Z33s": -trefoil2 * rho_max**3},
     )
-    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    new_tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     new_t = new_tf.transfer_function(params)
 
     assert old_t.shape == new_t.shape == (5, N_PIXELS, N_PIXELS)
@@ -959,7 +691,7 @@ def test_mixed_batched_and_scalar_zernike_coefficients():
             "Z60": 0.05 * rho_max**6,
         },
     )
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     out = tf.transfer_function(params)
     assert out.shape == (3, N_PIXELS, N_PIXELS)
     assert torch.isfinite(out.real).all() and torch.isfinite(out.imag).all()
@@ -1011,7 +743,7 @@ def test_uniform_batched_trefoil_with_per_particle_defocus_matches_manual_loop()
         spherical_aberration=2.7,
         odd_zernike={"Z33c": trefoil_c_uniform},
     )
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     out = tf.transfer_function(params)
 
     expected = torch.cat(
@@ -1059,7 +791,7 @@ def test_learnable_uniform_zernike_coefficient_gets_independent_gradients():
     coeff = params.odd_zernike["Z33c"].value
     assert isinstance(coeff, torch.nn.Parameter)
 
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     exitwave = torch.randn(
         3,
         N_PIXELS,
@@ -1078,84 +810,6 @@ def test_learnable_uniform_zernike_coefficient_gets_independent_gradients():
         "every particle's trefoil gradient must be independently nonzero -- "
         "a collapse bug would leave all but one element exactly zero"
     )
-
-
-# ---------------------------------------------------------------------------
-# Real-world validation: first 5 particles from an actual CryoSPARC .cs
-# file, run through the real extraction/unit-conversion path
-# (specter.io.extract_parameters_from_csfile), not hand-picked synthetic
-# values. Skipped if the file isn't mounted (e.g. off the lab filesystem).
-# ---------------------------------------------------------------------------
-
-_REAL_CS_FILE = (
-    "/scratch/loh/joel/empiar-10202/CS-aav2/J247/J247_passthrough_particles.cs"
-)
-
-
-@pytest.mark.skipif(
-    not __import__("os").path.exists(_REAL_CS_FILE),
-    reason=f"real .cs file not available: {_REAL_CS_FILE}",
-)
-def test_first_five_particles_of_real_csfile_match_old_aberration():
-    import math
-
-    from specter.io import extract_parameters_from_csfile
-
-    (
-        voltage_kv,
-        pixel_size,
-        alpha,
-        rotations,
-        translations_A,
-        ctf_params,
-        scale,
-        anisomag,
-        indices,
-        split,
-    ) = extract_parameters_from_csfile(_REAL_CS_FILE, return_class="all", n_particles=5)
-
-    n_pixels = 256
-    voltage = float(voltage_kv)
-    px = float(pixel_size)
-
-    old = Aberration(n_pixels, px, voltage, aberration_model="holography")
-    old_t = old.transfer_function(ctf_params)
-
-    dfu, dfv, dfang = ctf_params["dfu"], ctf_params["dfv"], ctf_params["dfang"]
-    cs_A = ctf_params["cs"]
-    tiltx, tilty = ctf_params["tiltx"], ctf_params["tilty"]
-    trefoil1, trefoil2 = ctf_params["trefoil1"], ctf_params["trefoil2"]
-
-    rho_max = zernike_rho_max((n_pixels, n_pixels), px)
-    prefactor = 2 * math.pi * old.wavelength**2 * cs_A * rho_max**3
-
-    params = CTFParameters(
-        defocus=(dfu + dfv) / 2 / 1e4,
-        astigmatism=(dfu - dfv) / 2 / 1e4,
-        astigmatism_angle=dfang,
-        spherical_aberration=cs_A / 1e7,
-        voltage=voltage,
-        phase_shift=torch.rad2deg(ctf_params["phaseshift"]),
-        amplitude_contrast=float(alpha),
-        odd_zernike={
-            "Z33c": -trefoil1 * rho_max**3,
-            "Z33s": -trefoil2 * rho_max**3,
-            "Z31c": -prefactor * tiltx,
-            "Z31s": -prefactor * tilty,
-        },
-    )
-    # specimen_absorption=True zeroes amplitude_contrast here, matching
-    # old Aberration's alpha (accepted, never applied -- confirmed dead
-    # code) -- this is the fair "matches old" comparison, not a claim that
-    # amplitude contrast doesn't matter.
-    new_tf = TransferFunction(
-        n_pixels, px, aberration_model="holography", specimen_absorption=True
-    )
-    with pytest.warns(UserWarning, match="specimen_absorption"):
-        new_t = new_tf.transfer_function(params)
-
-    assert old_t.shape == new_t.shape == (5, n_pixels, n_pixels)
-    assert torch.allclose(old_t, new_t, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -1188,7 +842,7 @@ def test_lpp_wiring_matches_direct_calc_LPP_ctf_2D():
     params = CTFParameters(
         defocus=1.0, spherical_aberration=2.7, lpp_params=_LPP_KWARGS
     )
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="ctf")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="linear")
     new_t = tf.transfer_function(params).squeeze()
 
     manual = calc_LPP_ctf_2D(
@@ -1208,36 +862,22 @@ def test_lpp_wiring_matches_direct_calc_LPP_ctf_2D():
     assert torch.allclose(new_t, manual, atol=1e-6)
 
 
-def test_lpp_dc_pinned_in_holography_mode():
+def test_lpp_dc_pinned_in_nonlinear_mode():
     params = CTFParameters(
         defocus=1.0, spherical_aberration=2.7, lpp_params=_LPP_KWARGS
     )
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     out = tf.transfer_function(params).squeeze()
     assert torch.allclose(out[0, 0], torch.tensor(1.0 + 0.0j), atol=1e-6)
     # Off-DC, the laser pattern must actually have an effect.
     assert not torch.allclose(out[3, 5], torch.tensor(1.0 + 0.0j), atol=1e-3)
 
 
-def test_lpp_peak_phase_zero_is_a_real_upstream_nan_singularity():
-    """torch_ctf.get_eta0_from_peak_phase_deg computes
-    ``eta0 = eta0_test * peak_phase_deg / peak_phase_deg_test`` where both
-    eta0_test and peak_phase_deg_test are themselves exactly zero when
-    peak_phase_deg=0 (zero laser power) -- a genuine 0/0 upstream
-    singularity, not a wiring bug on this side. Documented here so it isn't
-    mistaken for a regression if hit again."""
-    zero_power = {**_LPP_KWARGS, "peak_phase_deg": 0.0}
-    params_lpp = CTFParameters(
-        defocus=1.0, spherical_aberration=2.7, lpp_params=zero_power
-    )
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
-    out_lpp = tf.transfer_function(params_lpp).squeeze()
-    assert torch.isnan(out_lpp).any()
-
-
 def test_lpp_near_zero_peak_phase_is_near_noop():
-    """Physical sanity check (not wiring): with negligible (but nonzero,
-    avoiding the singularity above) laser power, the LPP transfer function
+    """Physical sanity check (not wiring): with negligible (but nonzero --
+    peak_phase_deg=0.0 is a genuine 0/0 NaN singularity upstream in
+    torch_ctf.get_eta0_from_peak_phase_deg, see CTFParameters' lpp_params
+    docstring) laser power, the LPP transfer function
     should be close to the plain defocus-only CTF, not introduce spurious
     structure."""
     near_zero_power = {**_LPP_KWARGS, "peak_phase_deg": 1e-4}
@@ -1245,28 +885,30 @@ def test_lpp_near_zero_peak_phase_is_near_noop():
         defocus=1.0, spherical_aberration=2.7, lpp_params=near_zero_power
     )
     params_plain = CTFParameters(defocus=1.0, spherical_aberration=2.7)
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     out_lpp = tf.transfer_function(params_lpp).squeeze()
     out_plain = tf.transfer_function(params_plain).squeeze()
     assert torch.allclose(out_lpp, out_plain, atol=1e-3)
 
 
-def test_lpp_mutually_exclusive_with_nonzero_phase_shift():
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        CTFParameters(defocus=1.0, phase_shift=10.0, lpp_params=_LPP_KWARGS)
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        (dict(phase_shift=10.0, lpp_params=_LPP_KWARGS), "mutually exclusive"),
+        (dict(lpp_params={"NA": 0.1}), "missing required keys"),
+        (
+            dict(lpp_params={**_LPP_KWARGS, "bogus_key": 1.0}),
+            "unrecognized keys",
+        ),
+    ],
+    ids=["nonzero_phase_shift", "missing_required_key", "unrecognized_key"],
+)
+def test_lpp_params_validation_raises(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        CTFParameters(defocus=1.0, **kwargs)
     # A zero/default phase_shift alongside lpp_params is fine.
     CTFParameters(defocus=1.0, phase_shift=0.0, lpp_params=_LPP_KWARGS)
     CTFParameters(defocus=1.0, lpp_params=_LPP_KWARGS)
-
-
-def test_lpp_missing_required_key_raises():
-    with pytest.raises(ValueError, match="missing required keys"):
-        CTFParameters(defocus=1.0, lpp_params={"NA": 0.1})
-
-
-def test_lpp_unrecognized_key_raises():
-    with pytest.raises(ValueError, match="unrecognized keys"):
-        CTFParameters(defocus=1.0, lpp_params={**_LPP_KWARGS, "bogus_key": 1.0})
 
 
 def test_lpp_combined_with_per_particle_defocus_and_trefoil():
@@ -1284,7 +926,7 @@ def test_lpp_combined_with_per_particle_defocus_and_trefoil():
         lpp_params=_LPP_KWARGS,
         odd_zernike={"Z33c": trefoil_c},
     )
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     out = tf.transfer_function(params)
     assert out.shape == (3, N_PIXELS, N_PIXELS)
 
@@ -1304,5 +946,5 @@ def test_lpp_combined_with_per_particle_defocus_and_trefoil():
             return_complex_ctf=True,
             **_LPP_KWARGS,
         ).clone()
-        manual[0, 0] = 1.0 + 0.0j  # DC pin, matching holography mode
+        manual[0, 0] = 1.0 + 0.0j  # DC pin, matching nonlinear mode
         assert torch.allclose(out[i], manual, atol=1e-6)

@@ -1,0 +1,103 @@
+# Canonical default config for `specter reconstruct particle`.
+# Any field can be overridden on the command line, e.g.:
+#   specter reconstruct particle --config configs/reconstruct.toml --epochs 20
+
+# Full field docs: docs/user-guide/reconstruction.md.
+
+# Unlike the `specter simulate` commands, this one has no runnable default: the
+# paths under [data] are placeholders naming a real dataset. Point them at your
+# own .cs file and particle stack, or pass --cs_file/--mrc_file/
+# --dose_per_angstrom on the command line.
+
+# The .cs file supplies poses, CTF parameters and per-particle scale; the stack
+# supplies the images, paired with it by row -- row i of the .cs is slice i of
+# the stack. That is checked, not assumed: a CryoSPARC restack does not write
+# its stack in row order, and such a stack is refused rather than read wrong.
+# The Python function `specter.io.write_row_ordered_csfile` writes a row-ordered
+# .cs (and, with stack_out, a matching stack) from any CryoSPARC set.
+[data]
+cs_file = "path/to/particles.cs"
+mrc_file = "path/to/particles.mrcs"
+# address_by_blob_idx = false   # read mrc_file at the .cs file's blob/idx instead of
+                                # by row, to point straight at a CryoSPARC restack
+                                # without exporting a row-ordered copy of it first
+dose_per_angstrom = 40.0   # the dataset's real fluence, not a nominal one: it sets the
+                           # Poisson statistics the loss is weighted by
+# image_units = "normalized"   # "normalized" for a CryoSPARC/RELION stack; "counts"
+                               # for one already in electrons per pixel
+halfset = "gold"           # "gold" reconstructs A and B and computes the halfmap FSC
+                           # between them; "A" | "B" reconstructs just that half;
+                           # "all" ignores the split and reconstructs one volume
+# n_particles = 10000    # reconstruct only the first N, instead of all
+
+[optimisation]
+epochs = 5
+batchsize = 3
+solver = "converged"   # gold runs: after the Adam epochs, solve each half to the minimum
+                       # of the loss plus a Wiener prior from the Adam halves' FSC;
+                       # "adam" keeps the Adam maps
+solver_iterations = 4  # conjugate-gradient iterations per half, about an epoch each
+lr = 0.1               # volume learning rate; unset to freeze the volume
+scheduler = "LambdaLR"
+lr_decay = 0.1         # LambdaLR only: multiplier = 1 / (1 + lr_decay * sqrt(step))
+# init_volume = "start.mrc"   # start from this map (volts) instead of zeros
+# init_lowpass = 15.0         # low-pass the start to this resolution (A) first
+
+# Omit `symmetry` for C1. "exact" averages the point group without
+# interpolation; symmetry_batchsize applies only to the interpolating "real" and
+# "fourier" modes, and lowers their memory on a large box.
+[symmetry]
+# symmetry = "I1"
+symmetry_mode = "exact"
+# symmetry_batchsize = 3
+
+# One epoch on binned images: every file path, .cs field and physics setting is
+# exercised at a fraction of the cost. Run this before a multi-hour job.
+[sanity_check]
+test_run = false
+bin_factor = 8
+
+[compute]
+device = "cuda"        # cpu | cuda | cuda:1 | 0,1 (trains across both via DDP)
+precision = "16-mixed" # forced to 32 on CPU
+num_workers = 0       # images are already resident; worker processes add IPC overhead
+
+# Every run is numbered and tracked -- there is no untracked mode, the way
+# neither RELION nor CryoSPARC has one. The directory is
+# <output_dir>/[project/]reconstructions/J00N/, with a job.json recording every
+# parameter, the git commit and the run's status. Numbering is shared across job
+# types within a project. Pinning `job_id` resumes into an existing directory,
+# e.g. for a manual halfset="A" then halfset="B" pair.
+[job]
+# project = "empiar-10202"   # optional: splits one output_dir into named projects
+# job_id = "J001"
+# output_dir = "."           # the ROOT of the numbered job tree. Defaults to the project
+                             # root found by walking up from cwd for an existing .specter
+                             # marker, like git finds .git.
+
+# Reporting only -- these are never optimised against. cryosparc_ref is only
+# plotted when fsc_ref is given too, and takes a comma-separated "<A>,<B>" pair
+# for a gold-standard run.
+[reference]
+# fsc_ref = "path/to/reference.mrc"
+# fsc_mask = "path/to/mask.mrc"
+# cryosparc_ref = "path/to/cryosparc_volume.mrc"
+
+# Rotation, translation and defocus refinement are wired in, but no test checks
+# the recovered values against ground truth. Treat a run with these set as an
+# experiment rather than a result.
+[refinement]
+# lr_R = 1e-4
+# lr_T = 1e-2
+# lr_D = 1e2
+defocus_offset = 0.0   # Angstrom, added to every particle's dfu/dfv
+
+[advanced]
+scattering_model = "rytov"        # defaults to rytov rather than the simulator's multislice:
+                                  # the model runs once per particle per step, and rytov is the
+                                  # cheapest one that still carries Ewald-sphere curvature
+ews_curvature_sign = "negative"   # matches CryoSPARC
+rotate_mode = "real"
+# alpha = 0.1        # amplitude contrast; unset reads the .cs file's ctf/amp_contrast
+# bfactor = 100.0    # Angstrom^2 envelope damping high-resolution signal
+# klim = 0.2         # 1/Angstrom hard cutoff

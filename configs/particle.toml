@@ -2,26 +2,44 @@
 # Any field can be overridden on the command line, e.g.:
 #   specter simulate particles --config configs/particle.toml --n_particles 3000
 
-[potential]
-pdb_code = "6bdf"
+# Full field docs: docs/user-guide/particle-stack.md.
+
+# Where the particles come from. Left unset, the run synthesizes them and
+# everything below applies as written; given a file, the poses and
+# per-particle CTF come from it instead.
+[data]
+# cs_path = "path/to/particles.cs"      # a CryoSPARC .cs file
+# star_path = "path/to/particles.star"  # ... or a RELION .star file (mutually exclusive)
+
+[specimen]
+pdb_source = "6bdf"
 assembly = true
-num_pixels = 256
+n_pixels = 256
 pixel_size = 1.0              # Å
+ice_thickness = 0.0           # Å, 0 = minimum (particle box size)
 
 [microscope]
 voltage = 300.0                # kV
-dose = "20"                    # e⁻/Å²; single value, or "low,high" to sample per particle
+dose = 20.0                    # e⁻/Å²; single value, or [low, high] to sample per particle
 cs = 2.0                       # mm
 alpha = 0.1                    # unitless, amplitude contrast ratio
 
+[absorption]
+absorption_model = "alpha"         # alpha | inelastic_mfp -- inelastic_mfp derives the
+                                   # imaginary potential per material and sets alpha to 0
+# inelastic_mfp_solvent = 3950.0   # Å; unset = measured ice value at the run's voltage
+# inelastic_mfp_specimen = 2460.0  # Å; unset = the ice's value (no absorption contrast)
+# objective_aperture = 12.0        # mrad, inelastic_mfp only (70 µm on a Krios)
+
 [sampling]
-defocus = "5000,15000"          # Å; single value, or "low,high" to sample per particle
+defocus = [5000.0, 15000.0]    # Å; single value, or [low, high] to sample per particle
 shift = 2.0                    # Å
 n_particles = 20
 
 [models]
 scattering_model = "multislice"  # multislice | firstborn | projection | ctf
-detector_model = "none"          # none | perfect | k3_300kv | k3_200kv
+noise_model = "poisson"          # poisson | none
+detector_model = "none"          # none | perfect | k3_300kv | k3_200kv | k2_300kv | falcon4i_300kv | falcon4i_200kv | falcon3ec_300kv
 
 [postprocessing]
 normalize_particles = true
@@ -29,78 +47,127 @@ save_exitwaves = false
 save_clean_exitwaves = false
 
 [compute]
-device = "cpu"                   # cpu | cuda | cuda:0 | 0,1,2,3 (multi-GPU)
-batchsize = 5
+device = "cuda"                  # cpu | cuda | cuda:0 | 0,1,2,3 (multi-GPU)
+batchsize = "auto"               # particles per forward pass; "auto" takes the smaller of what
+                                 # fits the free memory on `device` and what is worth batching.
 
 [output]
-output_dir = "./output/"
+output_dir = "particles"
 filename = "particles"
 
-# --- Advanced: rarely touched, but available for tweaking ---
-[advanced]
-pdb_savefolder = "pdb-data"  # resolved relative to the repo root
-# cs_path = "path/to/particles.cs"  # uncomment to drive generation from a CryoSPARC .cs file
-# num_frames = 20                # frames, uncomment to override default (int(dose) if None)
-# convergence_angle = 1.0       # mrad, uncomment to enable the Cs envelope
-# cc = 2.0                      # mm, uncomment to enable the Cc envelope
-energy_spread = 0.7            # eV (FWHM)
-deltaV_V = 0.06e-6              # unitless (ΔV/V)
-deltaI_I = 0.01e-6               # unitless (ΔI/I)
-dose_envelope = false
-# bfactor = 50.0                # Å², uncomment to enable a B-factor envelope
-aberration_model = "holography"  # holography | ctf
-noise_model = "poisson"          # poisson | none
-coincidence_radius = "0"         # pixels; single value, or "low,high" to sample per particle
-ice_model = "gd"                 # gd | random | none
-ice_thickness = 0.0              # Å, 0 = minimum (particle box size)
-# ice_cache_dir = "ice-data/ice_cache"  # defaults to the bundled cache
-# crowd_min_distance = 100.0      # Å, uncomment to crowd particles; defaults to pdb.max_diameter
-# crowd_max_distance_z = 50.0     # Å
-potential_scale = "1"            # unitless; single value, or "low,high" (values < 1 approximate thicker ice)
-pad_fft = true
+[job]
+# project = "my-project"
+# job_id = "J001"
+# Tracked runs read output_dir above as the ROOT of the numbered tree
+# rather than as the folder files land in directly. Leave output_dir
+# unset to default that root to the project root found by walking up
+# from cwd for an existing .specter marker, like git finds .git.
 
-# potential building
-potential_parameterization = "shtyrov"   # shtyrov | kirkland | lobato
-potential_method = "analytic"            # analytic | 2d | 3d
+[advanced]
+
+# --- Structure handling ---
+# pdb_cache_dir = "~/.cache/specter/pdb"   # default; set $SPECTER_PDB_CACHE to move it,
+# monomer_library_path = "~/monomers" #  point to Monomer library or set at $CLIBD_MON
+# The default, "auto", needs no setting: it keeps hydrogens the file already
+# carries and adds them only when it has none
+# readd_hydrogens = "auto"     # auto | true | false
+
+# Damp each atom by its structure's own deposited B-factor instead of
+# rendering the model statically. Only a PER-ATOM B adds anything an
+# envelope cannot -- a uniform one is the same exp(-B k^2/4) as bfactor
+# below, so setting both double-counts. Needs scattering_factors = "shtyrov".
+# use_deposited_bfactors = false
+
+# --- Potential building ---
+scattering_factors = "shtyrov"   # shtyrov | kirkland | lobato
+potential_method = "analytic"    # analytic | 2d | 3d -- applies to the structure's own
+                                 # potential; ice is built separately
 # rcut = 6.0                     # Å, auto-detected per-structure if unset
 conv_backend = "fftconvolve"     # unused for potential_method="analytic"
-periodic = false                 # forces potential_method="3d" if true
+periodic = false                 # wrap atom density across the box faces when voxelizing.
+                                 # Keep false for a particle: a protein is a finite object.
+                                 # Requires potential_method="3d"; "analytic"/"2d" raise.
 # atom_species = ["C.3", "N.ar"]  # per-atom bonded species; auto-detected from PDB bonds if unset
 # shtyrov_params_path = "path/to/params.json"  # override the bundled Shtyrov parameter table
-# mmcif_filepath = "path/to/structure.cif"     # explicit mmCIF source for bond-typing
 
-# scattering
+# --- Envelopes and dose fractionation ---
+# n_frames = 20                # frames, uncomment to override default (int(dose) if None)
+# convergence_angle = 0.01     # mrad, illumination 1/e half-angle; enables the spatial-coherence envelope
+cc = 2.7                       # mm, Titan Krios objective; 0 disables the Cc focal spread
+energy_spread = 0.7            # eV (FWHM)
+deltaV_V = 0.06e-6             # unitless (ΔV/V)
+deltaI_I = 0.01e-6             # unitless (ΔI/I)
+# temporal_coherence = "envelope"  # Cc as an envelope on the CTF; default "integrated" sums
+                                   # the image over the focal spread (exact)
+dose_envelope = false
+# dose_envelope_target = "specimen"  # damage the specimen, not its ice (default transfer_function)
+# bfactor = 50.0               # Å², uncomment to enable a B-factor envelope
+coincidence_radius = 0.0       # pixels; single value, or [low, high] to sample per particle
+# dose_weights_path = "path/to/refm_empirical_dw.npy"  # per-frame exposure-filter weights;
+                                 # frames then summed in Fourier space under them
+# dose_weights_max_frequency = 0.5  # 1/Å of the weights' last bin; unset derives it
+# detector_pixel_size = 0.83    # Å, the movies' physical pixel when the particles were
+                                 # resampled; the detector MTF is evaluated on it
+
+# --- Scattering and numerics ---
 ews_curvature_sign = "positive"  # negative | positive, matches CryoSPARC's convention
-# klim = 0.5                     # 1/Å, reciprocal-space cutoff; unset uses the full Nyquist range
+# klim = 0.66                   # fraction of Nyquist, Kirkland's anti-aliasing bandlimit;
+                                 # unset keeps the full Nyquist range
 rotate_mode = "real"             # real | fourier
+pad_fft = true                   # real-space FFT headroom: a wider frame, same pixels, so the
+                                 # wave cannot wrap at the frame edge
+oversample = 2                  # the Fourier-space counterpart of pad_fft: finer pixels, same
+                                 # frame, so the transmission x wave product has room below
+                                 # Nyquist; 1 = the volume's own grid (aliases), 2 = converged
 
-# ice
-ice_parameterization = "shtyrov"  # kirkland | lobato | shtyrov
-ice_relax_steps = 0               # local MLBOP seam-relaxation steps, only used when ice_model="gd" tiles multiple cached blocks
+# --- Ice ---
+ice_model = "gd"                 # gd | random | none
+# ice_cache_dir = "ice"          # defaults to the cache bundled in the package
+bulk_scattering_factors = "kirkland"  # the ice, and any other non-biomolecular
+                                 # material. Deliberately not scattering_factors:
+                                 # Shtyrov is fitted for biomolecules
+ice_relax_steps = 0              # local MLBOP seam-relaxation steps, only used when
+                                 # ice_model="gd" tiles multiple cached blocks
+# ice_motion_variance = 0.38     # Å² per e⁻/Å², beam-induced water motion; unset = frozen ice
 
-# crowding
-crowd_chunk_size = 1              # crowding volumes rotated per GPU batch; raise for speed if you have RAM to spare
+# --- Crowding ---
+# crowd_min_distance = 100.0      # Å, uncomment to crowd particles; defaults to pdb.max_diameter
+# crowd_max_distance_z = 50.0     # Å, depth of the slab neighbours are placed in.
+                                  # Defaults to the particle box's own depth and
+                                  # deliberately does NOT follow ice_thickness --
+                                  # raising that is a contrast knob, not a
+                                  # specimen-density one, so at 2000 Å of ice the
+                                  # neighbours stay in the middle and the rest is water.
 # crowd_max_distance_xy = 200.0   # Å
+crowd_chunk_size = 1              # duplicate volumes rotated per batch; 1 is both the cheapest
+                                  # and the fastest, and peak memory grows linearly with it
 crowd_method = "3d"               # 2d | 3d
 # crowd_n_points = 50             # cap on the number of crowding duplicates
 crowd_seed = "origin"             # origin | random
 crowd_move_to_cpu = false
 water_air_interface = false
 
-# reproducibility
-# seed = 20260731                # RNG seed for pose/CTF/dose sampling; auto-generated and logged if unset
+# --- Aberrations (synthetic generation only; a .cs/.star file brings its own) ---
+astigmatism = 0.0                # Å, magnitude of dfu - dfv; single value or [low, high]
+astigmatism_angle = [0.0, 180.0] # degrees, dfang; irrelevant when astigmatism is 0
+phaseshift = 0.0                 # radians
+tiltx = 0.0                      # radians
+tilty = 0.0                      # radians
+trefoil1 = 0.0                   # Å^3, k^3 sin(3θ)
+trefoil2 = 0.0                   # Å^3, k^3 cos(3θ)
+tetrafoil1 = 0.0                 # Å^4, k^4 cos(2θ)  -- secondary astigmatism
+tetrafoil2 = 0.0                 # Å^4, k^4 sin(2θ)  -- secondary astigmatism
+tetrafoil3 = 0.0                 # Å^4, k^4 cos(4θ)  -- 4-fold tetrafoil
+tetrafoil4 = 0.0                 # Å^4, k^4 sin(4θ)  -- 4-fold tetrafoil
 
-# aberration richness for synthetic (non-.cs-driven) generation
-astigmatism = "0"                # Å, magnitude of dfu - dfv; single value or "low,high"
-astigmatism_angle = "0,180"      # degrees, dfang; irrelevant when astigmatism is 0
-phaseshift = "0"                 # radians
-tiltx = "0"                      # radians
-tilty = "0"                      # radians
-trefoil1 = "0"                   # Å^3
-trefoil2 = "0"                   # Å^3
-
-# anisotropic magnification -- identity (no correction) by default
+# --- Anisotropic magnification (identity = no correction) ---
 anisomag_m00 = 1.0
 anisomag_m01 = 0.0
 anisomag_m10 = 0.0
 anisomag_m11 = 1.0
+
+# --- Reproducibility ---
+# seed = 20260731                # RNG seed for pose/CTF/dose/ice/crowding/noise sampling;
+                                 # auto-generated and logged if unset. Per-particle draws are
+                                 # derived from (seed, particle index), so any batchsize and
+                                 # any number of devices reproduce the same stack.

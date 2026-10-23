@@ -1,3 +1,8 @@
+"""
+Readers for legacy molecular-dynamics water dumps (`MDSimDump`,
+`ExtXYZDump`), the inputs the ice targets were derived from.
+"""
+
 from __future__ import annotations
 
 import warnings
@@ -18,7 +23,7 @@ from ..arrays import (
 from ..coords import radial_distribution_function
 from ..fft import fft3
 from ..progress import track
-from ._energy import MLBOP
+from ._energy import MLBOP, mlbop_energy_summary
 
 
 class MDSimDump:
@@ -439,9 +444,9 @@ class MDSimDump:
             disable=not progressbar,
             transient=True,
         ):
-            with torch.no_grad():
-                result = model.compute_energy(coords, box_size=self.trim_size, pbc=pbc)
-            results.append({k: v.item() for k, v in result.items()})
+            results.append(
+                mlbop_energy_summary(coords, self.trim_size, pbc, model=model)
+            )
         return results
 
     def generate_ice(
@@ -474,7 +479,7 @@ class MDSimDump:
     def generate_big_ice(
         self,
         target_shape: tuple[int, int, int, int],
-        num_unique: int = 8,
+        n_unique: int = 8,
         frames: int | Sequence[int] | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
@@ -484,7 +489,7 @@ class MDSimDump:
         ----------
         target_shape : tuple of int
             Output shape ``(B, nz, ny, nx)``.
-        num_unique : int, optional
+        n_unique : int, optional
             Number of unique frames to sample as tile sources. Default is 8.
         frames : int or sequence of int or Tensor or None, optional
             Which frames to draw from. ``None`` uses all equilibrated frames
@@ -495,7 +500,7 @@ class MDSimDump:
         big_ice : torch.Tensor
             Tiled ice volume of shape ``target_shape``.
         """
-        cubes = self.generate_ice(batchsize=num_unique, frames=frames)
+        cubes = self.generate_ice(batchsize=n_unique, frames=frames)
         return tile_volume_from_blocks_blended(cubes, target_shape)
 
     def __repr__(self) -> str:
@@ -927,9 +932,7 @@ class ExtXYZDump:
             positions = torch.as_tensor(atoms.positions, dtype=torch.float32)
             cell = torch.as_tensor(atoms.cell.array, dtype=torch.float32)
             pbc = bool(np.any(atoms.pbc))
-            with torch.no_grad():
-                result = model.compute_energy(positions, box_size=cell, pbc=pbc)
-            results.append({k: v.item() for k, v in result.items()})
+            results.append(mlbop_energy_summary(positions, cell, pbc, model=model))
         return results
 
     def generate_ice(
@@ -966,7 +969,7 @@ class ExtXYZDump:
     def generate_big_ice(
         self,
         target_shape: tuple[int, int, int, int],
-        num_unique: int = 8,
+        n_unique: int = 8,
         frames: int | Sequence[int] | torch.Tensor | None = None,
         t_min: float | None = None,
         t_max: float | None = None,
@@ -978,7 +981,7 @@ class ExtXYZDump:
         ----------
         target_shape : tuple of int
             Output shape ``(B, nz, ny, nx)``.
-        num_unique : int, optional
+        n_unique : int, optional
             Number of unique frames to sample as tile sources. Default 8.
         frames : int or sequence of int or Tensor or None, optional
             See :meth:`get_coordinates`.
@@ -993,7 +996,7 @@ class ExtXYZDump:
             Tiled ice volume of shape ``target_shape``.
         """
         cubes = self.generate_ice(
-            batchsize=num_unique, frames=frames, t_min=t_min, t_max=t_max
+            batchsize=n_unique, frames=frames, t_min=t_min, t_max=t_max
         )
         return tile_volume_from_blocks_blended(cubes, target_shape)
 

@@ -1,7 +1,14 @@
+"""
+`TomogramGhostbuster`: the end-to-end cryo-ET reconstruction pipeline, from
+a tilt series and its geometry to a trained `TomogramReconstructor`.
+"""
+
 from __future__ import annotations
 
+from ..progress import console
+
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import Any, Sequence
 
 import mrcfile
 import roma
@@ -9,11 +16,14 @@ import torch
 import torch.nn as nn
 import torch.utils.data
 
-from ._run_helpers import build_trainer
+from ._helpers import _images_to_counts
+from ._pipeline_base import _GhostbusterBase
 from ._tomogram_reconstructor import TomogramReconstructor
+from ..settings import Optics, Propagation, TiltGeometry
+from specter.options import ImageUnits, Scheduler, TiltAxis
 
 
-class TomogramGhostbuster:
+class TomogramGhostbuster(_GhostbusterBase):
     """
     End-to-end tomogram reconstruction pipeline for cryo-ET tilt series.
 
@@ -21,13 +31,13 @@ class TomogramGhostbuster:
     drives it via a Lightning ``Trainer``.  The ``run`` / ``test_run`` API
     mirrors :class:`Ghostbuster`.
 
-    The forward model is noiseless; the observed images are compared directly
-    to ``|CTF(exitwave)|²``.  Images should be preprocessed so that their
-    intensity scale matches this quantity.  For simulated data from
-    :class:`~specter.imagegenerator.TiltSeriesGenerator`, pass
-    ``clean_images`` directly.  For experimental data, dividing by the
-    expected dose per pixel (``dose_per_angstrom * voxel_size²``) brings
-    images into the correct scale.
+    The forward model is noiseless and predicts electron counts per pixel,
+    ``dose_per_angstrom * voxel_size² * |CTF(exitwave)|²``, as the particle
+    pipeline's does. ``image_units`` says what the tilt series holds: counts
+    (the default, and what a motion-corrected tilt series and a simulated
+    one, detected by :meth:`~specter.imaging.Image.detect`, hold) are used
+    as they are, and a normalised series is mapped back to
+    counts from the dose.
 
     Parameters
     ----------
@@ -41,6 +51,9 @@ class TomogramGhostbuster:
     ctf_params : dict[str, torch.Tensor]
         Per-tilt CTF parameters; each value must have leading dimension
         ``N_tilts``.
+    dose_per_angstrom : float or torch.Tensor
+        Electron dose (fluence) per tilt image in e⁻/Å². Scalar, or a 1-D
+        tensor of length ``N_tilts`` for a dose that differs per tilt.
     angles : sequence of float or torch.Tensor, optional
         Tilt angles in degrees.  Mutually exclusive with ``quaternions``.
     quaternions : torch.Tensor, optional
@@ -49,50 +62,38 @@ class TomogramGhostbuster:
     translations : torch.Tensor, optional
         Per-tilt in-plane translations in Å ``(N_tilts, 2)``.  Defaults to
         zero.
-    tilt_axis : str
-        Tilt rotation axis (``"x"`` or ``"y"``).  Default ``"x"``.
+    tilt : TiltGeometry, optional
+        Tilt axis and edge tapers, see `TomogramReconstructor`. Default
+        ``TiltGeometry()``.
     nz : int, optional
         Z depth of the reconstructed volume in voxels.  Defaults to the image
         width (square volume).
     V_init : torch.Tensor, optional
         Initial volume ``(Z, Y, X)``.  Defaults to all-zeros.
-    flip_contrast : bool
-        Negate ``tilt_series`` on load (standard cryo-EM convention).
-        Default ``True``.
+    flip_contrast : bool, optional
+        Negate a normalised ``tilt_series`` before converting it to counts,
+        for a series stored with inverted contrast. ``None`` (the default)
+        flips normalised input and leaves counts alone; ``True`` with counts
+        is an error, since counts have a physical sign.
     lr : float, optional
         Learning rate for V.  ``None`` disables optimisation.
-    sparsity : float, optional
-        L1 regularisation weight on V.
     epochs : int
         Training epochs.  Default 5.
-    batch_size : int
+    batchsize : int
         Tilt images per optimisation step.  Default 1 (one tilt per step).
-    scattering_model : str
-        Wave propagation model.  Default ``"multislice"``.
-    aberration_model : str
-        CTF aberration model.  Default ``"holography"``.
-    aberration_backend : {"legacy", "torch_ctf"}, optional
-        Which engine computes the CTF/aberration transfer function.
-        ``"legacy"`` (default) uses ``aberrations.Aberration``; ``"torch_ctf"``
-        uses ``ctf.LegacyAberrationAdapter`` (verified parity, see
-        ``ImageGenerator``'s docstring). Opt-in only; not yet the default.
-    lpp_params : dict[str, float], optional
-        Laser-phase-plate config, in ``ctf.CTFParameters``-native units.
-        Requires ``aberration_backend="torch_ctf"``; raises at construction
-        time otherwise, since ``aberrations.Aberration`` has no LPP model.
-    klim : float, optional
-        Hard frequency cutoff.
-    alpha : float
-        Amplitude contrast ratio.  Default ``0.0``.
-    taper_width : int
-        XY cosine taper on V before each forward pass.  Default 0.
-    z_taper_width : int
-        Z cosine taper on V.  Default 0.
+    propagation : Propagation, optional
+        How the forward model computes the exit wave (model, amplitude
+        contrast, bandlimit). Default ``Propagation()``.
+    optics : Optics, optional
+        The aberration engine and phase plate. Default ``Optics()``.
     use_fov_mask : bool
-        Mask MSE loss to the real-FOV region per tilt.  Default ``True``.
+        Restrict the loss to the pixels the forward model can predict: the
+        real-FOV region per tilt, less the band at the field's edges that the
+        transfer function fills from outside it
+        (``TomogramReconstructor._edge_pads``). Default ``True``.
     scheduler : str
         LR scheduler.  Default ``"LambdaLR"``.
-    slice_batch_size : int
+    slice_batchsize : int
         Z-slice chunk size for ``IterativeScattering``.  Default 1.
     num_workers : int
         DataLoader worker processes.  Default 0.
@@ -100,6 +101,22 @@ class TomogramGhostbuster:
         Lightning ``Trainer`` precision.  Default ``"16-mixed"``.
     run_dir : str or Path, optional
         Output directory for volumes and metadata.
+    image_units : {"counts", "normalized"}
+        What ``tilt_series``' values are: electron counts per pixel, used as
+        is, or a series normalised to zero mean and unit variance, mapped
+        back to counts as ``sqrt(N) * x + N`` with ``N`` each tilt's dose per
+        pixel. Default ``"counts"``.
+    checkpoint_chunks : int or None
+        Split the multislice slice loop into chunks of this many slices and
+        run each under gradient checkpointing, trading one extra forward pass
+        per chunk for activation memory, see `TomogramReconstructor`.
+        ``None`` (the default) disables checkpointing.
+    lr_decay : float
+        Decay coefficient for the reciprocal-sqrt LR schedule. Default ``0.1``.
+    kmask : torch.Tensor, optional
+        3-D Fourier-space mask applied to V after every gradient update. Its
+        shape must be the reconstructed volume's. `test_run` bins the volume
+        and therefore runs without it. Default ``None`` (no mask).
     """
 
     def __init__(
@@ -108,51 +125,63 @@ class TomogramGhostbuster:
         voxel_size: float,
         voltage: float,
         ctf_params: dict[str, Any],
+        dose_per_angstrom: float | torch.Tensor,
         angles: Sequence[float] | torch.Tensor | None = None,
         quaternions: torch.Tensor | None = None,
         translations: torch.Tensor | None = None,
-        tilt_axis: str = "x",
+        tilt: TiltGeometry = TiltGeometry(),
         nz: int | None = None,
         V_init: torch.Tensor | None = None,
-        flip_contrast: bool = True,
+        flip_contrast: bool | None = None,
         lr: float | None = None,
-        sparsity: float | None = None,
         epochs: int = 5,
-        batch_size: int = 1,
-        scattering_model: str = "multislice",
-        aberration_model: str = "holography",
-        aberration_backend: Literal["legacy", "torch_ctf"] = "legacy",
-        lpp_params: dict[str, float] | None = None,
-        klim: float | None = None,
-        alpha: float = 0.0,
-        taper_width: int = 0,
-        z_taper_width: int = 0,
+        batchsize: int = 1,
+        propagation: Propagation = Propagation(),
+        optics: Optics = Optics(),
         use_fov_mask: bool = True,
-        scheduler: Literal[
-            "LambdaLR",
-            "OneCycleLR",
-            "CosineAnnealingWarmRestarts",
-            "MultiplicativeLR",
-        ] = "LambdaLR",
-        slice_batch_size: int = 1,
+        scheduler: Scheduler = "LambdaLR",
+        slice_batchsize: int = 1,
         num_workers: int = 0,
         precision: str = "16-mixed",
         run_dir: str | Path | None = None,
+        image_units: ImageUnits = "counts",
+        checkpoint_chunks: int | None = None,
+        lr_decay: float = 0.1,
+        kmask: torch.Tensor | None = None,
     ) -> None:
-        images = self._load_tilt_series(tilt_series, flip_contrast)
+        images = self._load_tilt_series(tilt_series)
         n_tilts, H, W = images.shape
-        print(
+        dose = torch.as_tensor(dose_per_angstrom, dtype=torch.float32).flatten()
+        if dose.numel() not in (1, n_tilts):
+            raise ValueError(
+                f"dose_per_angstrom has {dose.numel()} entries; expected 1 or "
+                f"one per tilt ({n_tilts})"
+            )
+        if flip_contrast is None:
+            flip_contrast = image_units == "normalized"
+        images = _images_to_counts(
+            images,
+            image_units,
+            (dose * voxel_size**2).reshape(-1, 1, 1),
+            flip_contrast,
+        )
+        console.print(
             f"  {n_tilts} tilts  |  {H}×{W} px  |  {voxel_size:.3f} Å/px  |  "
             f"{voltage:.0f} kV"
         )
 
-        quats = self._resolve_tilt_quaternions(angles, quaternions, tilt_axis)
+        quats = self._resolve_tilt_quaternions(angles, quaternions, tilt.tilt_axis)
         trans = (
             torch.zeros(n_tilts, 2, dtype=torch.float32)
             if translations is None
             else torch.as_tensor(translations, dtype=torch.float32)
         )
         volume_init = self._build_initial_volume(V_init, nz, nxy=W)
+        if kmask is not None and tuple(kmask.shape) != tuple(volume_init.shape):
+            raise ValueError(
+                f"kmask has shape {tuple(kmask.shape)}; it must match the "
+                f"reconstructed volume's {tuple(volume_init.shape)}"
+            )
 
         # Store preprocessed data and settings
         self._images = images
@@ -164,48 +193,40 @@ class TomogramGhostbuster:
         self._volume_init = volume_init
         self._voxel_size = voxel_size
         self._voltage = voltage
+        self._dose_per_angstrom = dose
 
         self.lr = lr
-        self.sparsity = sparsity
         self.epochs = epochs
-        self.batch_size = batch_size
-        self.scattering_model = scattering_model
-        self.aberration_model = aberration_model
-        self.aberration_backend = aberration_backend
-        self.lpp_params = lpp_params
-        self.klim = klim
-        self.alpha = alpha
-        self.taper_width = taper_width
-        self.z_taper_width = z_taper_width
+        self.batchsize = batchsize
+        self.propagation = propagation
+        self.optics = optics
+        self.tilt = tilt
         self.use_fov_mask = use_fov_mask
-        self.tilt_axis = tilt_axis
         self.scheduler = scheduler
-        self.slice_batch_size = slice_batch_size
+        self.slice_batchsize = slice_batchsize
         self.num_workers = num_workers
         self.precision = precision
         self.run_dir = Path(run_dir) if run_dir is not None else None
+        self.checkpoint_chunks = checkpoint_chunks
+        self.lr_decay = lr_decay
+        self.kmask = kmask
 
     @staticmethod
-    def _load_tilt_series(
-        tilt_series: torch.Tensor | str | Path, flip_contrast: bool
-    ) -> torch.Tensor:
-        """Load a tilt series from a tensor or an .mrc file path, optionally flipping contrast."""
+    def _load_tilt_series(tilt_series: torch.Tensor | str | Path) -> torch.Tensor:
+        """Load a tilt series from a tensor or an .mrc file path."""
         if isinstance(tilt_series, (str, Path)):
-            print(f"Loading tilt series from {Path(tilt_series).name} ...")
+            console.print(f"Loading tilt series from {Path(tilt_series).name} ...")
             with mrcfile.open(str(tilt_series)) as mrc:
                 images = torch.as_tensor(mrc.data.copy()).float()
         else:
             images = torch.as_tensor(tilt_series).float()
-
-        if flip_contrast:
-            images = -images
         return images
 
     @staticmethod
     def _resolve_tilt_quaternions(
         angles: Sequence[float] | torch.Tensor | None,
         quaternions: torch.Tensor | None,
-        tilt_axis: str,
+        tilt_axis: TiltAxis,
     ) -> torch.Tensor:
         """Resolve per-tilt rotation quaternions from either angles or explicit quaternions."""
         if angles is not None and quaternions is not None:
@@ -254,15 +275,15 @@ class TomogramGhostbuster:
         images: torch.Tensor,
         volume_init: torch.Tensor,
         voxel_size: float,
-        scattering_model: str,
-        batch_size: int,
+        batchsize: int,
+        kmask: torch.Tensor | None,
     ) -> tuple["TomogramReconstructor", torch.utils.data.DataLoader]:
         n_tilts = images.shape[0]
         idx = torch.arange(n_tilts)
         dataset = torch.utils.data.TensorDataset(images, idx)
         loader = torch.utils.data.DataLoader(
             dataset,
-            batch_size=batch_size,
+            batch_size=batchsize,
             shuffle=True,
             num_workers=self.num_workers,
         )
@@ -273,27 +294,24 @@ class TomogramGhostbuster:
             self._translations,
             self._ctf_params,
             self._voltage,
-            tilt_axis=self.tilt_axis,
+            self._dose_per_angstrom,
+            tilt=self.tilt,
             lr=self.lr,
-            sparsity=self.sparsity,
-            taper_width=self.taper_width,
-            z_taper_width=self.z_taper_width,
             use_fov_mask=self.use_fov_mask,
-            scattering_model=scattering_model,
-            aberration_model=self.aberration_model,
-            aberration_backend=self.aberration_backend,
-            lpp_params=self.lpp_params,
-            klim=self.klim,
-            alpha=self.alpha,
+            propagation=self.propagation,
+            optics=self.optics,
             scheduler=self.scheduler,
-            slice_batch_size=self.slice_batch_size,
+            lr_decay=self.lr_decay,
+            kmask=kmask,
+            slice_batchsize=self.slice_batchsize,
+            checkpoint_chunks=self.checkpoint_chunks,
             run_dir=self.run_dir,
         )
         return model, loader
 
     def run(
         self,
-        device: int | Sequence[int] = 0,
+        device: int | Sequence[int] | str = 0,
         callbacks: list[Any] | None = None,
     ) -> "TomogramReconstructor":
         """
@@ -302,12 +320,14 @@ class TomogramGhostbuster:
 
         Parameters
         ----------
-        device : int or sequence of int
+        device : int or sequence of int or {"cpu"}
             GPU index, or a sequence of GPU indices (e.g. ``[0, 1]``) to
             train across multiple GPUs via Lightning DDP. A single tomogram's
             tilt series is usually small (tens of tilts), so the benefit of
             splitting it across GPUs is more limited than for particle-stack
-            reconstruction. Ignored when CUDA is unavailable.
+            reconstruction. Pass ``"cpu"`` to force CPU
+            training; any other value uses the GPU when CUDA is
+            available and falls back to the CPU when it is not.
         callbacks : list, optional
             Additional Lightning callbacks.
 
@@ -318,28 +338,25 @@ class TomogramGhostbuster:
         """
         n_tilts = len(self._images)
         nz, nxy = self._volume_init.shape[0], self._volume_init.shape[-1]
-        use_gpu = torch.cuda.is_available()
-        _device_str = f"GPU {device}" if use_gpu else "CPU"
-        print(
+        console.print(
             f"Starting reconstruction: {n_tilts} tilts  |  "
-            f"volume {nz}×{nxy}×{nxy}  |  {self.scattering_model}  |  "
-            f"{self.epochs} epochs  |  batch {self.batch_size}  |  {_device_str}"
+            f"volume {nz}×{nxy}×{nxy}  |  {self.propagation.scattering_model}  |  "
+            f"{self.epochs} epochs  |  batch {self.batchsize}  |  "
+            f"{self._device_label(device)}"
         )
         model, loader = self._build_reconstructor_and_loader(
             self._images,
             self._volume_init,
             self._voxel_size,
-            self.scattering_model,
-            self.batch_size,
+            self.batchsize,
+            self.kmask,
         )
-        trainer = build_trainer(use_gpu, device, self.epochs, self.precision, callbacks)
-        trainer.fit(model, loader)
-        return model
+        return self._fit(model, loader, device, self.epochs, self.precision, callbacks)
 
     def test_run(
         self,
         bin_factor: int = 4,
-        device: int | Sequence[int] = 0,
+        device: int | Sequence[int] | str = 0,
         callbacks: list[Any] | None = None,
     ) -> "TomogramReconstructor":
         """
@@ -354,10 +371,10 @@ class TomogramGhostbuster:
         ----------
         bin_factor : int
             Spatial downsampling factor.  Default 4.
-        device : int or sequence of int
+        device : int or sequence of int or {"cpu"}
             GPU index, or a sequence of GPU indices (e.g. ``[0, 1]``) to run
-            across multiple GPUs via Lightning DDP. Ignored when CUDA is
-            unavailable.
+            across multiple GPUs via Lightning DDP, or ``"cpu"`` to force
+            CPU training.
         callbacks : list, optional
             Additional Lightning callbacks.
 
@@ -366,14 +383,15 @@ class TomogramGhostbuster:
         TomogramReconstructor
             Trained model after one epoch.
         """
-        print(
+        console.print(
             f"Test run: {len(self._images)} tilts  |  {bin_factor}× binned  |  1 epoch"
         )
-        pool = nn.AvgPool2d(bin_factor, stride=bin_factor)
-        images_binned = pool(self._images.unsqueeze(1)).squeeze(1) * bin_factor**2
-        voxel_size_binned = self._voxel_size * bin_factor
+        images_binned, voxel_size_binned = self._bin_images(bin_factor)
 
-        # Bin the initial volume in XY and Z with adaptive pooling
+        # Bin the initial volume in XY and Z as well. A voxel holds a
+        # potential in volts, not a per-voxel integral, so binning averages:
+        # the projected potential sum(V * dz) is then unchanged, as dz grows
+        # by bin_factor while the slice count shrinks by it.
         V_b = (
             nn.functional.avg_pool3d(
                 self._volume_init.unsqueeze(0).unsqueeze(0),
@@ -382,23 +400,21 @@ class TomogramGhostbuster:
             )
             .squeeze(0)
             .squeeze(0)
-            * bin_factor**3
         )
 
+        # A kmask is shaped for the full volume and does not survive binning.
+        kmask = self.kmask if bin_factor == 1 else None
+        if self.kmask is not None and kmask is None:
+            console.print(
+                "  [dim]kmask skipped: it does not match the binned volume[/dim]"
+            )
         model, loader = self._build_reconstructor_and_loader(
-            images_binned,
-            V_b,
-            voxel_size_binned,
-            self.scattering_model,
-            self.batch_size,
+            images_binned, V_b, voxel_size_binned, self.batchsize, kmask
         )
-        use_gpu = torch.cuda.is_available()
-        trainer = build_trainer(use_gpu, device, 1, "32", callbacks)
-        trainer.fit(model, loader)
-        v = model.V.detach()
-        print(
-            f"Test run passed — {bin_factor}× binned, {len(self._images)} tilts, "
-            f"volume {tuple(v.shape)}  |  "
-            f"V min={v.min():.4f}  max={v.max():.4f}  mean={v.mean():.4f}"
+        model = self._fit(model, loader, device, 1, "32", callbacks)
+        self._report_test_run(
+            model,
+            f"{bin_factor}× binned, {len(self._images)} tilts, "
+            f"volume {tuple(model.V.shape)}",
         )
         return model

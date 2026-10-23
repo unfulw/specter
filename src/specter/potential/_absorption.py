@@ -1,0 +1,901 @@
+"""
+Absorption: the imaginary part of the scattering potential.
+
+An electron leaves the elastic channel by several routes -- inelastic
+scattering (plasmon, ionisation), elastic scattering to angles outside the
+objective aperture, and thermal diffuse scattering. A simulator represents all
+of them together as the imaginary component of a complex potential, which
+damps the wave as it propagates rather than tracking where each electron went.
+
+This module holds absorption models that **transform a potential that already
+exists**. A model that instead computes the imaginary component *from atoms*
+-- the Weickenmeier-Kohl style absorptive form factors, say -- does not belong
+here: it needs atomic numbers, species and a Debye-Waller factor rather than a
+finished potential, so it belongs beside its elastic counterparts in
+`specter.atom` and is selected through `PotentialBuilder`,
+exactly as `kirkland`/`lobato`/`shtyrov` are. The split is by input, not by
+subject matter, which is easy to get wrong when looking for "the absorption
+code".
+
+Applied where slices materialise, not to the whole volume up front.
+`IterativeScattering` never holds the volume -- `_iter_slices` rotates and
+fetches on demand -- so there is no "before propagation" moment to convert in.
+And `complex64` is exactly twice `float32`: converting a 300x1200x1200 tomogram
+up front takes it from 1.73 GB to 3.46 GB, which is the regime that class
+exists to avoid. Per slice the complex form is ~11.5 MB at a time. `Scattering`
+converts the whole volume instead, because it already has it and its boxes are
+small enough that doubling fits. Hoisting either call for tidiness would fail
+as an out-of-memory on a production tomogram, not as a test failure.
+
+Whatever applies absorption, the stage after it has to be told: `Aberration`
+takes `specimen_absorption`, and setting it wrongly double-counts amplitude
+contrast at both the specimen and the lens.
+"""
+
+from __future__ import annotations
+
+import math
+import warnings
+
+import torch
+
+from ..atom._atomic_potentials import kirkland_atomic_potential_3d_fourier
+from ..constants import (
+    bohr_radius,
+    electron_charge_volt_angstrom,
+    energy_to_wavelength,
+    interaction_parameter,
+    rest_mass_energy,
+)
+from ._occupancy import (
+    FULL_OCCUPANCY_POTENTIAL_V,
+    potential_occupancy,
+    potential_occupancy_slabs,
+)
+
+INELASTIC_MFP_ICE_A = 3950.0
+r"""
+Apparent inelastic mean free path of amorphous ice at 300 kV, in Angstrom.
+
+Measured: 395 +/- 11 nm on a Krios with a BioQuantum energy filter (Rice et
+al., 2018, *J. Struct. Biol.* **204**, 38-44), agreeing with the ~400 nm of
+Yonekura et al. (2006). Simulated independently at 3956 A by Himes &
+Grigorieff (2021, *IUCrJ* **8**, 943-953).
+
+This is the *apparent* mean free path -- what leaves the recorded zero-loss
+channel through a real objective aperture and energy slit -- which is the
+quantity a simulator of filtered images needs. The computed *total* inelastic
+mean free path is shorter, ~350 nm (Vulović et al., 2013, Fig. 1, from the
+Langmore & Smith cross section), and using it would over-absorb by 13%.
+
+**Do not scale this to another voltage.** The Langmore-Smith energy dependence
+gives Lambda(300)/Lambda(120) = 1.39 where measurement gives 1.70 (partial,
+4.2 mrad) to 2.45 (total): Feja & Aebi (1999) measure 232 nm and 161 nm at
+120 kV, and Yesibolati et al. (2020) find the standard models underestimate
+lambda for water outright. Another voltage needs its own measurement; the
+measured values are collected in :data:`INELASTIC_MFP_ICE_BY_KV`.
+
+References
+----------
+.. [1] Rice, W. J., Cheng, A., Noble, A. J., Eng, E. T., Kim, L. Y.,
+   Carragher, B., & Potter, C. S. (2018). Routine determination of ice
+   thickness for cryo-EM grids. *Journal of Structural Biology*, 204(1),
+   38–44. https://doi.org/10.1016/j.jsb.2018.06.007
+.. [2] Yonekura, K., Braunfeld, M. B., Maki-Yonekura, S., & Agard, D. A.
+   (2006). Electron energy filtering significantly improves amplitude
+   contrast of frozen-hydrated protein at 300 kV. *Journal of Structural
+   Biology*, 156(3), 524–536. https://doi.org/10.1016/j.jsb.2006.07.016
+.. [3] Himes, B., & Grigorieff, N. (2021). Cryo-TEM simulations of amorphous
+   radiation-sensitive samples using multislice wave propagation. *IUCrJ*,
+   8(6), 943–953. https://doi.org/10.1107/S2052252521008538
+.. [4] Vulović, M., Ravelli, R. B. G., van Vliet, L. J., Koster, A. J.,
+   Lazić, I., Lücken, U., Rullgård, H., Öktem, O., & Rieger, B. (2013). Image
+   formation modeling in cryo-electron microscopy. *Journal of Structural
+   Biology*, 183(1), 19–32. https://doi.org/10.1016/j.jsb.2013.05.008
+.. [5] Langmore, J. P., & Smith, M. F. (1992). Quantitative energy-filtered
+   electron microscopy of biological molecules in ice. *Ultramicroscopy*,
+   46(1–4), 349–373. https://doi.org/10.1016/0304-3991(92)90024-E
+.. [6] Feja, B., & Aebi, U. (1999). Determination of the inelastic mean free
+   path of electrons in vitrified ice layers for on-line thickness
+   measurements by zero-loss imaging. *Journal of Microscopy*, 193(1), 15–19.
+   https://doi.org/10.1046/j.1365-2818.1999.00436.x
+.. [7] Yesibolati, M. N., Laganá, S., Kadkhodazadeh, S., Mikkelsen, E. K.,
+   Sun, H., Kasama, T., Hansen, O., Zaluzec, N. J., & Mølhave, K. (2020).
+   Electron inelastic mean free path in water. *Nanoscale*, 12(40),
+   20649–20657. https://doi.org/10.1039/D0NR04352D
+"""
+
+INELASTIC_MFP_ICE_BY_KV: dict[float, float] = {
+    300.0: INELASTIC_MFP_ICE_A,
+    120.0: 2030.0,
+}
+r"""
+Measured apparent inelastic mean free paths of amorphous ice, in Angstrom,
+keyed by accelerating voltage in kV. Read through :func:`ice_inelastic_mfp`,
+which estimates every other voltage from these.
+
+- 300 kV: :data:`INELASTIC_MFP_ICE_A`, 395 +/- 11 nm.
+- 120 kV: 203 +/- 33 nm, from the ratio of unfiltered to zero-loss intensity
+  against vesicle thickness measured from tilted views (Grimm et al., 1996,
+  *Ultramicroscopy* **63**, 169-179). Feja & Aebi (1999, *J. Microsc.* **193**,
+  15-19) bracket it with 232 nm at a 4.2 mrad acceptance and 161 nm total.
+
+No energy-filtered measurement of ice has been found at 200 kV or 100 kV. The
+200 kV figures in Rice et al. (2018) are for elastic scattering beyond the
+objective aperture, a different quantity (see :func:`aperture_mfp_ice`). Add
+an entry only with a measurement behind it; it then replaces the estimate.
+
+References
+----------
+.. [1] Grimm, R., Typke, D., Bärmann, M., & Baumeister, W. (1996).
+   Determination of the inelastic mean free path in ice by examination of
+   tilted vesicles and automated most probable loss imaging.
+   *Ultramicroscopy*, 63(3–4), 169–179.
+   https://doi.org/10.1016/0304-3991(96)00035-6
+.. [2] Feja, B., & Aebi, U. (1999). Determination of the inelastic mean free
+   path of electrons in vitrified ice layers for on-line thickness
+   measurements by zero-loss imaging. *Journal of Microscopy*, 193(1), 15–19.
+   https://doi.org/10.1046/j.1365-2818.1999.00436.x
+.. [3] Rice, W. J., Cheng, A., Noble, A. J., Eng, E. T., Kim, L. Y.,
+   Carragher, B., & Potter, C. S. (2018). Routine determination of ice
+   thickness for cryo-EM grids. *Journal of Structural Biology*, 204(1),
+   38–44. https://doi.org/10.1016/j.jsb.2018.06.007
+"""
+
+#: One-sigma relative uncertainty of each entry of INELASTIC_MFP_ICE_BY_KV.
+_ICE_MFP_REL_ERR: dict[float, float] = {300.0: 11.0 / 395.0, 120.0: 33.0 / 203.0}
+
+
+def _beta2(voltage_kv: float) -> float:
+    """Squared electron speed over c, relativistically."""
+    gamma = 1.0 + voltage_kv * 1.0e3 / rest_mass_energy()
+    return 1.0 - 1.0 / gamma**2
+
+
+def ice_inelastic_mfp(voltage_kv: float) -> float:
+    r"""
+    The inelastic mean free path of amorphous ice at a voltage.
+
+    A measured value from :data:`INELASTIC_MFP_ICE_BY_KV` where one exists.
+    Elsewhere, a power law in :math:`\beta^2` through the two measurements
+    nearest `voltage_kv`,
+
+    .. math::
+        \Lambda(V) = \Lambda_2 \left(\beta^2(V)/\beta^2(V_2)\right)^{p},
+        \qquad p = \frac{\ln(\Lambda_2/\Lambda_1)}
+                          {\ln(\beta^2(V_2)/\beta^2(V_1))},
+
+    interpolating between them or extrapolating beyond, with a warning that
+    gives the estimate and its uncertainty. Pinning the curve to both
+    measurements is what makes this usable where a formula is not: the
+    standard cross-section formulas miss the measured 300/120 kV ratio by up
+    to 1.8x (see :data:`INELASTIC_MFP_ICE_A`), but that error sits in the
+    overall slope, which the two measurements fix; only the curve's shape
+    between them is assumed. Power law, Bethe-type and linear-in-:math:`\beta^2`
+    shapes agree within 3 % at 200 kV and 5 % at 100 kV, so the uncertainty
+    is carried by the measurements, propagated through `p`: about 7 % at
+    200 kV and 20 % at 100 kV, plus up to 5 % from the shape. Either is
+    smaller than leaving inelastic absorption out altogether.
+
+    Parameters
+    ----------
+    voltage_kv : float
+        Accelerating voltage in kV.
+
+    Returns
+    -------
+    float
+        Mean free path in Angstrom.
+
+    Warns
+    -----
+    UserWarning
+        When `voltage_kv` has no measurement and the value is estimated.
+
+    References
+    ----------
+    .. [1] Rice, W. J., Cheng, A., Noble, A. J., Eng, E. T., Kim, L. Y.,
+       Carragher, B., & Potter, C. S. (2018). Routine determination of ice
+       thickness for cryo-EM grids. *Journal of Structural Biology*, 204(1),
+       38–44. https://doi.org/10.1016/j.jsb.2018.06.007
+    .. [2] Grimm, R., Typke, D., Bärmann, M., & Baumeister, W. (1996).
+       Determination of the inelastic mean free path in ice by examination of
+       tilted vesicles and automated most probable loss imaging.
+       *Ultramicroscopy*, 63(3–4), 169–179.
+       https://doi.org/10.1016/0304-3991(96)00035-6
+    """
+    for kv, mfp in INELASTIC_MFP_ICE_BY_KV.items():
+        if abs(voltage_kv - kv) < 0.5:
+            return mfp
+    kvs = sorted(INELASTIC_MFP_ICE_BY_KV)
+    below = [kv for kv in kvs if kv < voltage_kv]
+    above = [kv for kv in kvs if kv > voltage_kv]
+    if below and above:
+        v1, v2 = below[-1], above[0]
+        how = "interpolated"
+    elif above:
+        v1, v2 = above[0], above[1]
+        how = "extrapolated"
+    else:
+        v1, v2 = below[-2], below[-1]
+        how = "extrapolated"
+    l1, l2 = INELASTIC_MFP_ICE_BY_KV[v1], INELASTIC_MFP_ICE_BY_KV[v2]
+    span = math.log(_beta2(v2) / _beta2(v1))
+    p = math.log(l2 / l1) / span
+    mfp = l2 * (_beta2(voltage_kv) / _beta2(v2)) ** p
+    # d ln(Lambda) = w1 d ln(L1) + w2 d ln(L2): the weights follow from p.
+    w1 = -math.log(_beta2(voltage_kv) / _beta2(v2)) / span
+    w2 = 1.0 - w1
+    rel = math.hypot(w1 * _ICE_MFP_REL_ERR[v1], w2 * _ICE_MFP_REL_ERR[v2])
+    warnings.warn(
+        f"No measured inelastic mean free path of ice at {voltage_kv:g} kV; "
+        f"using {mfp:.0f} A +/- {100 * rel:.0f} %, {how} as a power law in "
+        f"beta^2 from the measurements at {v1:g} and {v2:g} kV. Pass "
+        "inelastic_mfp_solvent to use a measured value instead.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return mfp
+
+
+INELASTIC_MFP_PROTEIN_A = 2460.0
+r"""
+Inelastic mean free path of protein at 300 kV, in Angstrom. Provisional.
+
+Derived, not measured: ``nu = sigma_inel/sigma_el = 20/Z`` per element
+(Reimer & Ross-Messemer, 1990) against isolated-atom elastic cross sections,
+evaluated for protein's composition (H 0.492, C 0.313, N 0.094, O 0.101 by
+atom fraction, Vulović et al. 2013; taken at 1.35 g/cm^3) and for water at
+0.94 g/cm^3 (``ice.density_of_amorphous_ice``), with the
+ratio anchored to :data:`INELASTIC_MFP_ICE_A` so the absolute normalisation
+of ``nu`` never has to be trusted. That gives 0.62 x ice.
+
+It is a 300 kV value because the ice it is anchored to is. Both materials lose
+energy mainly to valence plasmons, so the *ratio* should move far less with
+voltage than either mean free path does; at another voltage use 0.62 x
+:func:`ice_inelastic_mfp`, noting that this ratio is itself unmeasured there.
+
+**This number carries real uncertainty and it propagates.** Excluding hydrogen
+from the ``nu`` weighting -- defensible, since ``20/Z`` was measured on
+elemental specimens and Z = 1 is far outside that calibration -- gives 0.485 x
+ice, or 1915 A. A Malis/Egerton-style estimate gives 317 nm, but that formula
+carries no density term at all, which is why it puts protein and ice nearly
+together; a mean free path is ``1/(n sigma)`` and density cannot drop out.
+Scaling instead by valence-electron density, the quantity plasmon losses
+follow to first order (0.319 e/A^3 for protein against 0.251 for ice), gives
+~3110 A. The readings span 1915-3170 A, and the better-motivated physical
+picture does not favour the shorter end.
+
+What rides on it: the amplitude contrast a particle carries against the water
+it displaces is ``(V_ab,protein - V_ab,ice) / (V_0,protein - V_0,ice)``, which
+is 0.048 at 2460 A and 0.020 at 3170 A (inelastic term only, protein mean
+inner potential 7.0 V). Replace this with a measurement when one exists.
+
+**External check at 300 kV.** Yonekura et al. (2006, *J. Struct. Biol.*
+**156**, 524-536) measured the amplitude contrast of a flagellar filament in
+600-1600 A of ice with a < 10 eV energy slit and a 12 mrad objective aperture:
+6.9 +/- 1.9 %. Adding the aperture term (:func:`aperture_mfp_protein`,
+:func:`aperture_mfp_ice`) this value predicts 4.2-5.7 % (protein inner
+potential 7.89-7.0 V), within 1.4 sigma; 3170 A predicts 2.0-2.8 % and the
+valence-density estimate 2.2-3.0 %, both about 2 sigma low. Two things keep
+this from moving the value toward 1915 A (6.9-9.4 %), which fits best:
+
+- The same paper's *unfiltered* values (2.7 +/- 1.0 % protein, 5.8 +/- 1.8 %
+  carbon) exceed the aperture-only prediction (0.6-0.9 %) by 2-5 %. If that
+  excess is a bias of their first-CTF-zero method it is also in the filtered
+  values, and 6.9 % less ~2 % lands on this value; if it is unfiltered-only
+  physics, the shorter value is favoured. The paper cannot tell them apart.
+- Its carbon film (9.5 +/- 2.0 %, filtered) sits 2.5 sigma above what this
+  method predicts for carbon anchored to ice (4.6 %), and 1.3 sigma above the
+  hydrogen-excluded variant (7.0 %). That is the same direction, but carbon is
+  not a material this model renders, and the unfiltered excess applies there
+  too.
+
+The analytic ratio above understates what a full simulation gives. The
+effective amplitude contrast of 6BDF in 400 A of ice at 300 kV with the 12 mrad
+aperture, measured from a simulated defocus series at this value, is 0.070
+(docs/concepts/scattering/index.md), on top of Yonekura's 6.9 %. A simulation
+of their own measurement, filament in ice imaged at overfocus with the
+amplitude contrast read from the first zero, would still be the cleaner test
+of the two readings above.
+
+References
+----------
+.. [1] Reimer, L., & Ross-Messemer, M. (1990). Contrast in the electron
+   spectroscopic imaging mode of a TEM. *Journal of Microscopy*, 159(2),
+   143–160. https://doi.org/10.1111/j.1365-2818.1990.tb04772.x
+.. [2] Vulović, M., Ravelli, R. B. G., van Vliet, L. J., Koster, A. J.,
+   Lazić, I., Lücken, U., Rullgård, H., Öktem, O., & Rieger, B. (2013). Image
+   formation modeling in cryo-electron microscopy. *Journal of Structural
+   Biology*, 183(1), 19–32. https://doi.org/10.1016/j.jsb.2013.05.008
+.. [3] Yonekura, K., Braunfeld, M. B., Maki-Yonekura, S., & Agard, D. A.
+   (2006). Electron energy filtering significantly improves amplitude
+   contrast of frozen-hydrated protein at 300 kV. *Journal of Structural
+   Biology*, 156(3), 524–536. https://doi.org/10.1016/j.jsb.2006.07.016
+"""
+
+#: Protein by atom fraction and density, the composition
+#: :data:`INELASTIC_MFP_PROTEIN_A` is derived for (Vulović et al., 2013).
+_PROTEIN_ATOM_FRACTIONS = {1: 0.492, 6: 0.313, 7: 0.094, 8: 0.101}
+_PROTEIN_DENSITY_G_CM3 = 1.35
+_ATOMIC_MASS = {1: 1.008, 6: 12.011, 7: 14.007, 8: 15.999}
+
+#: Water geometry for the intramolecular interference terms, Angstrom.
+_OH_BOND_A = 0.9572
+_HH_DISTANCE_A = 1.5139
+
+__all__ = [
+    "INELASTIC_MFP_ICE_A",
+    "INELASTIC_MFP_ICE_BY_KV",
+    "INELASTIC_MFP_PROTEIN_A",
+    "absorption_potential",
+    "aperture_lowpass",
+    "aperture_mfp_ice",
+    "aperture_mfp_protein",
+    "apply_amplitude_contrast",
+    "ice_inelastic_mfp",
+    "inelastic_absorption_potential",
+]
+
+
+def absorption_potential(mfp_A: float, voltage_kv: float) -> float:
+    r"""
+    The absorption potential that reproduces an inelastic mean free path.
+
+    Vulović et al. (2013) Eq. (3),
+
+    .. math::
+        V_{ab} = \frac{1}{2 \sigma \Lambda_{in}}
+
+    with :math:`\sigma` the interaction parameter. A complex potential
+    :math:`V + i V_{ab}` transmits amplitude :math:`e^{-\sigma V_{ab} t}`, so
+    intensity follows Beer-Lambert with exactly this mean free path. At 300 kV
+    and :data:`INELASTIC_MFP_ICE_A` this is 0.194 V.
+
+    Parameters
+    ----------
+    mfp_A : float
+        Inelastic mean free path in Angstrom. Must be positive.
+    voltage_kv : float
+        Accelerating voltage in kV.
+
+    Returns
+    -------
+    float
+        Absorption potential in volts.
+
+    Raises
+    ------
+    ValueError
+        If `mfp_A` is not positive.
+
+    References
+    ----------
+    .. [1] Vulović, M., Ravelli, R. B. G., van Vliet, L. J., Koster, A. J.,
+       Lazić, I., Lücken, U., Rullgård, H., Öktem, O., & Rieger, B. (2013). Image
+       formation modeling in cryo-electron microscopy. *Journal of Structural
+       Biology*, 183(1), 19–32. https://doi.org/10.1016/j.jsb.2013.05.008
+    """
+    if mfp_A <= 0.0:
+        raise ValueError(f"mfp_A={mfp_A} must be positive")
+    return 1.0 / (2.0 * interaction_parameter(voltage_kv) * mfp_A)
+
+
+def _beyond_aperture_integral(f2: torch.Tensor, k: torch.Tensor, k_min: float) -> float:
+    """Integral of |f(k)|^2 2 pi k dk over k > k_min, in A^0 (f in A, k in 1/A)."""
+    keep = k > k_min
+    return float(torch.trapezoid(f2[keep] * 2 * torch.pi * k[keep], k[keep]))
+
+
+def _aperture_k(aperture_mrad: float, voltage_kv: float) -> float:
+    if aperture_mrad <= 0.0:
+        raise ValueError(f"aperture_mrad={aperture_mrad} must be positive")
+    return aperture_mrad * 1e-3 / energy_to_wavelength(voltage_kv)
+
+
+def _kirkland_f(atomic_number: int, k: torch.Tensor) -> torch.Tensor:
+    return (
+        kirkland_atomic_potential_3d_fourier(atomic_number, k.float())
+        .double()
+        .reshape(-1)
+    )
+
+
+# Kirkland's fits are accurate to 12 1/A, and the tail beyond still carries
+# 0.5% of the 12 mrad cross section for water at 300 kV, so the grid runs on
+# to 40 1/A, where the fits' Rutherford-like k^-2 decay is what the physics
+# does too; the remainder past 40 is under 0.05%.
+_K_GRID = torch.linspace(1e-4, 40.0, 400_001, dtype=torch.float64)
+
+
+def _cross_section_prefactor(voltage_kv: float) -> float:
+    # sigma turns V*A into radians; 2 pi a0 e (47.8776 V*A^2) turns f (A)
+    # into the Fourier-space potential (V*A^3), as `PotentialBuilder` does.
+    c1 = 2.0 * math.pi * bohr_radius() * electron_charge_volt_angstrom()
+    return (interaction_parameter(voltage_kv) * c1) ** 2
+
+
+def aperture_mfp_ice(aperture_mrad: float, voltage_kv: float) -> float:
+    r"""
+    Mean free path in ice for elastic scattering outside the objective aperture.
+
+    Electrons scattered elastically beyond the aperture semi-angle are
+    removed from the image as surely as inelastic ones removed by an energy
+    filter. A multislice grid cannot carry that loss: at 1 A/px its Nyquist
+    frequency (0.5 1/A) sits inside a typical aperture (12 mrad is 0.61 1/A
+    at 300 kV), and finer grids still damp it -- 400 A of ice sends 2.8% of
+    the beam beyond 12 mrad by this cross section, against 0.49% on a
+    0.5 A grid and 1.9% on a 0.125 A one. This supplies it as an absorption
+    rate instead, the cross section integrated over the scattering the grid
+    cannot hold:
+
+    .. math::
+        \frac{1}{\Lambda_{ap}} = n\,(\sigma\,c_1)^2
+            \int_{k_{ap}}^{\infty} \overline{|f_{\rm H_2O}(k)|^2}\,2\pi k\,dk
+
+    with :math:`c_1 = 2\pi a_0 e = 47.8776` V A^2, :math:`k_{ap}` the aperture's spatial
+    frequency, and the orientation-averaged molecular form factor including
+    the O-H and H-H interference terms. Atoms are summed incoherently
+    between molecules, which amorphous ice's structure factor permits beyond
+    its first peak (0.3 1/A). :math:`n` is the number density of water
+    molecules at ``ice.density_of_amorphous_ice`` (0.94 g/cm^3), the density
+    the icemakers and the bundled ice library are built at.
+
+    The factors are Kirkland's, per element, whatever `scattering_factors`
+    the specimen is rendered with, and deliberately so. Beyond an aperture
+    the scattering is off the atomic core, where the per-element fits agree:
+    Lobato moves this mean free path by 0.2% at 12 mrad, 0.04% at 20. Shtyrov
+    cannot supply it at all -- its bonded-species fits are tabulated only to
+    0.62 1/A, so the whole integral would be extrapolation from the fit's
+    prior, and they need a bond topology a bulk composition does not have.
+    Nor does it clash with a Shtyrov-rendered specimen: that potential
+    governs what reaches the image, inside the aperture, and this term only
+    what never does.
+
+    Parameters
+    ----------
+    aperture_mrad : float
+        Objective aperture semi-angle in milliradians.
+    voltage_kv : float
+        Accelerating voltage in kV.
+
+    Returns
+    -------
+    float
+        Mean free path in Angstrom. At 300 kV and 12 mrad, ~14,200 A.
+
+    References
+    ----------
+    .. [1] Kirkland, E. J. (2010). *Advanced computing in electron microscopy*
+       (2nd ed.). Springer. https://doi.org/10.1007/978-1-4419-6533-2
+    """
+    # Imported here rather than at module level: `specter.ice` imports
+    # `specter.potential` while it initialises, so a module-level import
+    # would be circular.
+    from ..ice._helpers import ndensity_of_amorphous_ice
+
+    k_ap = _aperture_k(aperture_mrad, voltage_kv)
+    k = _K_GRID
+    f_o, f_h = _kirkland_f(8, k), _kirkland_f(1, k)
+    x_oh, x_hh = 2 * torch.pi * k * _OH_BOND_A, 2 * torch.pi * k * _HH_DISTANCE_A
+    f2 = (
+        f_o**2
+        + 2 * f_h**2
+        + 4 * f_o * f_h * torch.sin(x_oh) / x_oh
+        + 2 * f_h**2 * torch.sin(x_hh) / x_hh
+    )
+    n = ndensity_of_amorphous_ice
+    rate = (
+        n
+        * _cross_section_prefactor(voltage_kv)
+        * _beyond_aperture_integral(f2, k, k_ap)
+    )
+    return 1.0 / rate
+
+
+def aperture_mfp_protein(aperture_mrad: float, voltage_kv: float) -> float:
+    r"""
+    Mean free path in protein for elastic scattering outside the objective aperture.
+
+    :func:`aperture_mfp_ice`'s cross section for protein's composition (H
+    0.492, C 0.313, N 0.094, O 0.101 by atom fraction at 1.35 g/cm^3, the
+    composition :data:`INELASTIC_MFP_PROTEIN_A` is derived for), summed over
+    atoms incoherently. Bonded neighbours 1-1.5 A apart interfere near the
+    aperture, which this neglects; beyond 0.6 1/A their cross terms
+    oscillate about zero.
+
+    Parameters
+    ----------
+    aperture_mrad : float
+        Objective aperture semi-angle in milliradians.
+    voltage_kv : float
+        Accelerating voltage in kV.
+
+    Returns
+    -------
+    float
+        Mean free path in Angstrom. At 300 kV and 12 mrad, ~10,400 A.
+
+    References
+    ----------
+    .. [1] Kirkland, E. J. (2010). *Advanced computing in electron microscopy*
+       (2nd ed.). Springer. https://doi.org/10.1007/978-1-4419-6533-2
+    .. [2] Vulović, M., Ravelli, R. B. G., van Vliet, L. J., Koster, A. J.,
+       Lazić, I., Lücken, U., Rullgård, H., Öktem, O., & Rieger, B. (2013). Image
+       formation modeling in cryo-electron microscopy. *Journal of Structural
+       Biology*, 183(1), 19–32. https://doi.org/10.1016/j.jsb.2013.05.008
+    """
+    k_ap = _aperture_k(aperture_mrad, voltage_kv)
+    k = _K_GRID
+    f2 = sum(
+        frac * _kirkland_f(z, k) ** 2 for z, frac in _PROTEIN_ATOM_FRACTIONS.items()
+    )
+    mean_mass = sum(
+        frac * _ATOMIC_MASS[z] for z, frac in _PROTEIN_ATOM_FRACTIONS.items()
+    )
+    n = _PROTEIN_DENSITY_G_CM3 / (mean_mass * 1.66054)
+    rate = (
+        n
+        * _cross_section_prefactor(voltage_kv)
+        * _beyond_aperture_integral(f2, k, k_ap)
+    )
+    return 1.0 / rate
+
+
+def aperture_lowpass(
+    v: torch.Tensor,
+    pixel_size: float,
+    aperture_mrad: float,
+    voltage_kv: float,
+    max_slices_per_chunk: int = 64,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Remove a potential's transverse detail beyond the objective aperture.
+
+    The companion to :func:`aperture_mfp_ice`: once scattering beyond the
+    aperture is charged as an absorption rate, the part of it the grid does
+    carry must not also be propagated, or it is counted twice. Filtering each
+    z-slice in (ky, kx) removes it at first order; the transmission function's
+    own harmonics regenerate some at second order, which is negligible for a
+    weak specimen. Nothing beyond the aperture reaches an image, so no visible
+    frequency is touched. A no-op when the aperture lies outside the grid's
+    Nyquist frequency, the usual case at 1 A/px.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Real potential in the beam frame, shape ``(..., Z, Y, X)``.
+    pixel_size : float
+        Pixel size in Angstrom.
+    aperture_mrad : float
+        Objective aperture semi-angle in milliradians.
+    voltage_kv : float
+        Accelerating voltage in kV.
+    max_slices_per_chunk : int, optional
+        Z-slices transformed at once, bounding the complex working set.
+        Default 64.
+    out : torch.Tensor, optional
+        Where to write the result, which may be `v` itself: each chunk is
+        transformed before it is written back, so filtering in place is
+        safe and saves a whole canvas. Default None allocates one.
+
+    Returns
+    -------
+    torch.Tensor
+        The filtered potential, same shape and dtype as `v`. Returned as the
+        input object when the filter would do nothing.
+    """
+    k_ap = _aperture_k(aperture_mrad, voltage_kv)
+    if k_ap >= 0.5 / pixel_size:
+        return v
+    ny, nx = v.shape[-2], v.shape[-1]
+    ky = torch.fft.fftfreq(ny, d=pixel_size, device=v.device)
+    kx = torch.fft.rfftfreq(nx, d=pixel_size, device=v.device)
+    mask = (ky[:, None] ** 2 + kx[None, :] ** 2) <= k_ap**2
+    if out is None:
+        out = torch.empty_like(v)
+    for z0 in range(0, v.shape[-3], max_slices_per_chunk):
+        z1 = min(z0 + max_slices_per_chunk, v.shape[-3])
+        chunk = torch.fft.rfft2(v[..., z0:z1, :, :]) * mask
+        out[..., z0:z1, :, :] = torch.fft.irfft2(chunk, s=(ny, nx))
+    return out
+
+
+def aperture_lowpass_isotropic(
+    v: torch.Tensor,
+    pixel_size: float,
+    aperture_mrad: float,
+    voltage_kv: float,
+) -> torch.Tensor:
+    r"""
+    Remove a potential's 3D detail beyond the objective aperture, in any frame.
+
+    The rotation-invariant counterpart of :func:`aperture_lowpass`, for a
+    volume imaged along more than one beam direction. :func:`aperture_lowpass`
+    removes transverse frequencies :math:`|\mathbf{k}_\perp| > k_{ap}` of each
+    beam-frame slice, a cylinder in 3D frequency space whose axis is the beam.
+    That cylinder rotates with the beam, so it cannot be applied once to a
+    volume that is later tilted. This filter removes
+    :math:`|\mathbf{k}| > k_{ap}` instead, a sphere, which commutes with every
+    rotation.
+
+    The two agree where the image is formed. At first order the exit wave at
+    transverse frequency :math:`\mathbf{q}` is the potential on the Ewald
+    sphere, at :math:`k_z = \lambda q^2/2`, and there
+    :math:`|\mathbf{k}| = q\sqrt{1 + (\lambda q/2)^2}`, which exceeds
+    :math:`q` by :math:`\theta^2/8` relative at scattering angle
+    :math:`\theta = \lambda q`: 1.8e-5 at the edge of a 12 mrad aperture.
+    Both filters therefore keep the same scattering inside the aperture and
+    remove the same scattering outside it. They differ only off the Ewald
+    sphere, at large :math:`k_z` and small :math:`q`, which contributes to
+    no scattered beam at first order.
+
+    A no-op under the same criterion as :func:`aperture_lowpass`: when the
+    aperture lies outside the grid's Nyquist frequency.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Real potential, shape ``(..., Z, Y, X)``, in any frame.
+    pixel_size : float
+        Voxel size in Angstrom.
+    aperture_mrad : float
+        Objective aperture semi-angle in milliradians.
+    voltage_kv : float
+        Accelerating voltage in kV.
+
+    Returns
+    -------
+    torch.Tensor
+        The filtered potential, same shape and dtype as `v`. Returned as the
+        input object when the filter would do nothing.
+
+    Notes
+    -----
+    The transform is taken over the whole volume at once, so its working set
+    is about twice the volume. It is reached only at voxel sizes below
+    ``0.5 / k_ap`` (0.82 A at 12 mrad and 300 kV), which few tomograms use.
+    """
+    k_ap = _aperture_k(aperture_mrad, voltage_kv)
+    if k_ap >= 0.5 / pixel_size:
+        return v
+    nz, ny, nx = v.shape[-3], v.shape[-2], v.shape[-1]
+    kz = torch.fft.fftfreq(nz, d=pixel_size, device=v.device)
+    ky = torch.fft.fftfreq(ny, d=pixel_size, device=v.device)
+    kx = torch.fft.rfftfreq(nx, d=pixel_size, device=v.device)
+    mask = (
+        kz[:, None, None] ** 2 + ky[None, :, None] ** 2 + kx[None, None, :] ** 2
+    ) <= k_ap**2
+    spectrum = torch.fft.rfftn(v, dim=(-3, -2, -1)) * mask
+    return torch.fft.irfftn(spectrum, s=(nz, ny, nx), dim=(-3, -2, -1)).to(v.dtype)
+
+
+#: Voxels the occupancy blur is allowed to touch in one call. The blur is
+#: separable, and its first pass reshapes to ``(-1, 1, X)`` and pads, so its
+#: working set is a few multiples of the input. Whole-volume evaluation asked
+#: for 26 GiB on a batch of four 512-pixel boxes with 1642 slices of ice and
+#: brought a `specter match particles` run down; slabbing bounds it instead.
+_OCCUPANCY_MAX_VOXELS_PER_SLAB = 2**26
+
+
+def _occupancy_chunked(
+    v: torch.Tensor,
+    voxel_size: float,
+    full_potential: float | torch.Tensor,
+    max_voxels_per_slab: int,
+) -> torch.Tensor:
+    """
+    :func:`potential_occupancy`, evaluated a z-slab at a time.
+
+    Each slab is widened by :func:`occupancy_blur_halo_voxels` and the margin
+    discarded (:func:`potential_occupancy_slabs`), without which every slab boundary becomes an edge the blur
+    sees. Identical to the whole-volume result wherever the halo fits, which
+    is what ``tests/test_inelastic_absorption.py`` pins.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Real potential, shape ``(..., Z, Y, X)``.
+    voxel_size : float
+        Voxel size in Angstrom.
+    full_potential : float
+        Potential of a fully occupied voxel, V.
+    max_voxels_per_slab : int
+        Upper bound on the voxels handed to the blur at once.
+
+    Returns
+    -------
+    torch.Tensor
+        Occupancy in [0, 1], same shape as `v`.
+    """
+    nz = v.shape[-3]
+    per_slice = v.numel() // nz
+    slab = max(1, max_voxels_per_slab // max(1, per_slice))
+    if slab >= nz:
+        return potential_occupancy(v, voxel_size, full_potential=full_potential)
+
+    out = torch.empty_like(v)
+    for z0, z1, occ in potential_occupancy_slabs(
+        v, voxel_size, slab, full_potential=full_potential
+    ):
+        out[..., z0:z1, :, :] = occ
+        del occ
+    return out
+
+
+def inelastic_absorption_potential(
+    v: torch.Tensor,
+    voxel_size: float,
+    voltage_kv: float,
+    mfp_solvent_A: float = INELASTIC_MFP_ICE_A,
+    mfp_specimen_A: float | None = None,
+    full_potential: float | torch.Tensor = FULL_OCCUPANCY_POTENTIAL_V,
+    max_voxels_per_slab: int = _OCCUPANCY_MAX_VOXELS_PER_SLAB,
+) -> torch.Tensor:
+    r"""
+    Absorption potential from measured mean free paths, per material.
+
+    Vulović et al. (2013) Eq. (3) with the material fraction read off the
+    potential:
+
+    .. math::
+        V_{ab}(\mathbf{r}) = \frac{o(\mathbf{r})}{2\sigma\Lambda_{spec}}
+                           + \frac{1 - o(\mathbf{r})}{2\sigma\Lambda_{solv}}
+
+    where :math:`o` is :func:`potential_occupancy`, the same coarse-grained
+    material-fraction field :func:`~specter.ice.blend_ice_into_volume` uses to
+    decide where water goes. Using it here rather than a segmentation is what
+    makes this work on a specimen with no labels.
+
+    Absorption is a property of the *material*, not of the local potential.
+    That is the whole difference from :func:`apply_amplitude_contrast`, which
+    ties it to every atomic cusp: measured on amorphous ice, the two put the
+    same total attenuation in but differ by 23x in how much absorption
+    contrast they inject into the 30-3 A band.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Real scattering potential in volts, shape ``(..., Z, Y, X)``. Only the
+        specimen belongs here; the solvent term is applied where the specimen
+        is not.
+    voxel_size : float
+        Voxel size in Angstrom. Physical, since the occupancy coarse-graining
+        length is.
+    voltage_kv : float
+        Accelerating voltage in kV.
+    mfp_solvent_A : float, optional
+        Inelastic mean free path of the embedding medium in Angstrom. Default
+        :data:`INELASTIC_MFP_ICE_A`, measured for amorphous ice at 300 kV --
+        so a run at another voltage must pass its own.
+    mfp_specimen_A : float or None, optional
+        Inelastic mean free path of the specimen material in Angstrom.
+        Default None uses `mfp_solvent_A`, which makes the field uniform: the
+        specimen then absorbs exactly like the solvent it displaces and
+        carries no absorption *contrast* at all, only the bulk attenuation.
+        Pass :data:`INELASTIC_MFP_PROTEIN_A` for protein, noting the
+        uncertainty documented there.
+    full_potential : float, optional
+        Potential of a fully occupied voxel, V. Default
+        :data:`FULL_OCCUPANCY_POTENTIAL_V`.
+    max_voxels_per_slab : int, optional
+        Bound on the voxels the occupancy blur touches at once. The blur is
+        evaluated a z-slab at a time past this, each slab widened by
+        `occupancy_blur_halo_voxels` and the margin discarded, so the result
+        is unchanged. Default 2**26; whole-volume evaluation asked for 26 GiB
+        on a batch of four 512-pixel boxes with 1642 slices of ice.
+
+    Returns
+    -------
+    torch.Tensor
+        Absorption potential in volts, same shape and dtype as `v`. Combine
+        with `v` via ``torch.complex(v, v_ab)``, or pass the two fields to
+        :class:`~specter.scattering.Scattering` with
+        ``absorption_potential=v_ab``. Multislice assembles the latter in
+        bounded slice chunks. Explicit absorption bypasses ``alpha``.
+
+    Notes
+    -----
+    The occupancy result is privately owned and reused for the absorption
+    field, avoiding two full-volume arithmetic temporaries. Passing separate
+    fields to multislice also avoids a whole complex copy. Occupancy,
+    attenuation, precision and the order of arithmetic are unchanged.
+
+    The field is an isotropic pointwise function of the potential, so it
+    rotates with the specimen exactly as the elastic potential does and can be
+    built in the molecule frame. That is *not* true of a model carrying the
+    plasmon's transverse point spread function, which is defined by the beam
+    direction and must be applied after the pose rotation.
+
+    References
+    ----------
+    .. [1] Vulović, M., Ravelli, R. B. G., van Vliet, L. J., Koster, A. J.,
+       Lazić, I., Lücken, U., Rullgård, H., Öktem, O., & Rieger, B. (2013). Image
+       formation modeling in cryo-electron microscopy. *Journal of Structural
+       Biology*, 183(1), 19–32. https://doi.org/10.1016/j.jsb.2013.05.008
+
+    Examples
+    --------
+    >>> import torch
+    >>> from specter.potential import inelastic_absorption_potential
+    >>> v = torch.zeros(4, 8, 8)  # pure solvent
+    >>> v_ab = inelastic_absorption_potential(v, 1.0, 300.0)
+    >>> round(float(v_ab.mean()), 4)
+    0.194
+    """
+    v_solvent = absorption_potential(mfp_solvent_A, voltage_kv)
+    if mfp_specimen_A is None:
+        # No occupancy needed: the field is uniform, so the blur is skipped
+        # entirely rather than computed and then ignored.
+        return torch.full_like(v, v_solvent)
+    v_specimen = absorption_potential(mfp_specimen_A, voltage_kv)
+    occupancy = _occupancy_chunked(v, voxel_size, full_potential, max_voxels_per_slab)
+    return occupancy.mul_(v_specimen - v_solvent).add_(v_solvent)
+
+
+def apply_amplitude_contrast(v: torch.Tensor, alpha: float = 0.1) -> torch.Tensor:
+    r"""
+    Make a real potential complex, using the amplitude-contrast ratio.
+
+    The empirical model the field fits per dataset: one scalar
+    :math:`\alpha`, uniform over the whole specimen, rotating the potential
+    into the complex plane so that a fraction of the wave is absorbed rather
+    than phase-shifted.
+
+    .. math::
+        V \to V\left(\sqrt{1 - \alpha^2} + i\alpha\right)
+
+    ``alpha`` is the quantity every format carries:
+    ``rlnAmplitudeContrast`` in RELION, ``ctf/amp_contrast`` in CryoSPARC,
+    ``amplitude_contrast`` in torch-ctf, conventionally 0.07-0.10.
+    :func:`inelastic_absorption_potential` is the sibling that separates the
+    routes instead, and is preferred wherever a mean free path is known.
+
+    **``alpha`` is not a measurement of absorption, and 0.07-0.10 is not
+    measured for the data it is used with.** The 0.07 is a fit to unfiltered
+    images of frozen-hydrated specimens [1]_, carried over by convention; CTF
+    estimation takes amplitude contrast as an *input*
+    (it sits beside voltage and Cs in ctffind's parameter list) and never fits
+    it; real metadata carries one value for a whole dataset next to Cs while
+    defocus varies per particle; and the fitting objective is nearly flat in
+    it -- on a simulated micrograph built with ``alpha = 0.10``, ctffind still
+    scores best at a supplied 0.00, the score varying by 2-4% over
+    ``0 <= alpha <= 0.2``. In the CTF, ``alpha`` is a phase rotation of the
+    ring pattern by ``arctan(alpha)``, 5.7 degrees at 0.1.
+
+    Read as absorption it is also not physically available: 0.1 removes 51% of
+    the beam through 1200 A of ice, where inelastic scattering accounts for
+    26% and inelastic plus *all* elastic scattering caps at 39%. Measured on
+    EMPIAR-11377, ``alpha = 0.1`` corresponds to an attenuation length of
+    166 nm against ice's measured 395 nm.
+
+    Parameters
+    ----------
+    v : torch.Tensor
+        Scattering potential. A complex `v` already carries its absorption and
+        is returned unchanged, since rotating it again in the complex plane is
+        meaningless; the guard matters because
+        :class:`~specter.scattering.IterativeScattering` calls this
+        unconditionally.
+    alpha : float, optional
+        Amplitude contrast ratio. Default 0.1.
+
+    Returns
+    -------
+    torch.Tensor
+        Complex potential, real part scaled by ``sqrt(1 - alpha**2)`` and
+        imaginary part by ``alpha``. Returned unchanged when ``alpha`` is
+        zero, which keeps a purely phase-contrast run exactly real, and when
+        `v` is already complex.
+
+    References
+    ----------
+    .. [1] Toyoshima, C., & Unwin, N. (1988). Contrast transfer for
+       frozen-hydrated specimens: Determination from pairs of defocused
+       images. *Ultramicroscopy*, 25(4), 279–291.
+       https://doi.org/10.1016/0304-3991(88)90003-4
+    """
+    if alpha == 0.0 or v.is_complex():
+        return v
+    return v * ((1 - alpha**2) ** 0.5 + 1j * alpha)

@@ -1,5 +1,10 @@
+"""
+`Job`: a numbered, tracked run directory with its `job.json` record.
+"""
+
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -36,7 +41,7 @@ def base_directory(path: str | Path) -> None:
     >>> import specter.jobs as jobs
     >>> jobs.base_directory("/scratch/user/cryo-runs")
     >>> with jobs.Job("ghostbuster", "apoferritin") as job:
-    ...     print(job.dir)   # /scratch/user/cryo-runs/apoferritin/J001
+    ...     print(job.dir)   # /scratch/user/cryo-runs/apoferritin/ghostbuster/J001
     """
     global _SESSION_BASE_DIR
     _SESSION_BASE_DIR = Path(path)
@@ -79,10 +84,17 @@ def _get_specter_version() -> str:
 
 
 def _next_job_id(project_dir: Path) -> str:
-    existing = sorted(project_dir.glob("J[0-9][0-9][0-9]"))
+    """Next free J0NN, scanned across every job-type subfolder under
+    project_dir -- so numbering is one continuous sequence per project
+    (J001 a reconstruction, J002 a particle stack, J003 another
+    reconstruction, ...) rather than restarting at J001 per job type.
+    ``max`` by parsed integer, not lexicographic sort: job-type folder names
+    sort alphabetically, which does not track job-id order.
+    """
+    existing = list(project_dir.glob("*/J[0-9][0-9][0-9]"))
     if not existing:
         return "J001"
-    last = int(existing[-1].name[1:])
+    last = max(int(p.name[1:]) for p in existing)
     if last >= 999:
         raise RuntimeError("Job ID overflow: project has 999 jobs. Use a new project.")
     return f"J{last + 1:03d}"
@@ -98,6 +110,13 @@ def _serialize_value(v: Any) -> Any:
         import torch
 
         if isinstance(v, torch.Tensor):
+            # A 0-dim tensor is a scalar hyperparameter (e.g. defocus_offset),
+            # so record the value. Summarising it as shape/dtype would say
+            # `{"shape": [], "dtype": "float32"}` and throw the number away --
+            # the one thing a reader of job.json wants. Anything larger keeps
+            # the summary, so a 256^3 volume never lands in job.json as a list.
+            if v.ndim == 0:
+                return v.item()
             return {
                 "__type__": "Tensor",
                 "shape": list(v.shape),
@@ -107,6 +126,10 @@ def _serialize_value(v: Any) -> Any:
         pass
     if isinstance(v, dict):
         return {k: _serialize_value(val) for k, val in v.items()}
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        # A settings group (specter.settings): record its fields, so job.json
+        # reads like the flat config the group was built from.
+        return _serialize_value(dataclasses.asdict(v))
     return {"__type__": type(v).__name__, "repr": str(v)[:200]}
 
 
@@ -115,12 +138,29 @@ class Job:
     Context manager that creates a unique output folder for a SPECTER job and
     records a parameter snapshot alongside the outputs.
 
+    The folder is ``base_dir/project/job_type/J0NN`` -- project comes right
+    after ``base_dir`` (not job_type) because users group their own work by
+    project first, and job_type second: everything for "apoferritin" should
+    sit together, with reconstructions/particle-stacks/etc. as subfolders
+    within it, not the reverse. Job numbering (``J001``, ``J002``, ...) is
+    one continuous sequence per project, shared across every job_type in it
+    -- see :func:`_next_job_id`.
+
+    ``project=None`` drops the project segment entirely, giving
+    ``base_dir/job_type/J0NN`` -- the implicit default project (e.g. "the
+    directory you're standing in", for callers that resolve ``base_dir``
+    that way), rather than a job belonging to no project at all. A named
+    ``project`` is for splitting one ``base_dir`` into several, e.g. one
+    shared scratch directory used across unrelated structures.
+
     Parameters
     ----------
     job_type : str
-        Free-form label, e.g. ``"ghostbuster"``, ``"tilt-series"``.
-    project : str
-        Groups related jobs under a shared folder.
+        Names the subfolder a job's output lands in, e.g. ``"ghostbuster"``,
+        ``"tilt-series"``. Also recorded in ``job.json`` as ``"type"``.
+    project : str, optional
+        Groups related jobs under a shared folder. ``None`` skips the
+        project segment (see above).
     base_dir : str or Path, optional
         Root directory for all job folders. If not given, falls back to
         the session default set via :func:`base_directory`, then the
@@ -131,7 +171,7 @@ class Job:
     def __init__(
         self,
         job_type: str,
-        project: str,
+        project: str | None,
         base_dir: str | Path | None = None,
         job_id: str | None = None,
     ) -> None:
@@ -154,13 +194,31 @@ class Job:
             )
         return self._dir
 
+    @property
+    def params(self) -> dict[str, Any]:
+        """
+        The parameters recorded so far -- everything ``job.json``'s ``params``
+        key currently holds, including whatever a resumed job already had on
+        disk before this process started.
+
+        A shallow copy: mutating the returned dict does not change what
+        `log` merges from next. Read this before calling `log` with a key
+        that should be merged rather than replaced -- `log`'s own merge is a
+        plain `dict.update`, so passing ``{"results": new}`` always replaces
+        the whole `"results"` value, never merges into it.
+        """
+        return dict(self._params)
+
     def __enter__(self) -> Job:
-        project_dir = self._base_dir / self._project
-        project_dir.mkdir(parents=True, exist_ok=True)
+        project_dir = (
+            self._base_dir if self._project is None else self._base_dir / self._project
+        )
+        job_type_dir = project_dir / self._job_type
+        job_type_dir.mkdir(parents=True, exist_ok=True)
 
         if self._resume_job_id is not None:
             self._job_id = self._resume_job_id
-            self._dir = project_dir / self._job_id
+            self._dir = job_type_dir / self._job_id
             job_json = self._dir / "job.json"
             if job_json.exists():
                 existing = json.loads(job_json.read_text())
@@ -174,8 +232,11 @@ class Job:
                 self._dir.mkdir(parents=True, exist_ok=True)
                 self._created_at = datetime.now(timezone.utc).isoformat()
         else:
+            # Scans project_dir (every job_type subfolder within it), not
+            # job_type_dir -- numbering is shared across job types in a
+            # project, not restarted per job type.
             self._job_id = _next_job_id(project_dir)
-            self._dir = project_dir / self._job_id
+            self._dir = job_type_dir / self._job_id
             self._dir.mkdir()
             self._created_at = datetime.now(timezone.utc).isoformat()
 
@@ -222,14 +283,19 @@ class Job:
         Merge additional key-value pairs into the recorded parameters.
 
         Use for pre-processing values computed outside the class constructor,
-        e.g. dataset paths, number of particles, dose scaling factors.
+        e.g. dataset paths, number of particles, dose scaling factors, or a
+        trained model's own results (e.g. ``Reconstructor.results_summary()``).
 
         Parameters
         ----------
         params : dict
-            JSON-serializable key-value pairs to record.
+            Key-value pairs to record. Need not be JSON-serializable already --
+            run through the same recursive conversion `create` applies to
+            constructor arguments (tensors become a shape/dtype summary,
+            anything else unrecognised becomes ``repr()``), so a caller does
+            not have to pre-serialize values itself.
         """
-        self._params.update(params)
+        self._params.update(_serialize_value(params))
         self._write_json("running")
 
     def create(self, cls: type, *args: Any, **kwargs: Any) -> Any:
@@ -244,7 +310,11 @@ class Job:
 
         In resume mode (``job_id`` was passed at construction), the incoming params
         (after exclusion) are validated against the stored params. A ``ValueError``
-        is raised if they differ, preventing accidental halfset mismatches.
+        is raised if they differ, preventing accidental halfset mismatches. Only
+        keys this call's own introspection produces are checked -- other keys
+        already in ``params`` (e.g. from an earlier :meth:`log` call) are left
+        alone, since they were never something this constructor could agree or
+        disagree with in the first place.
 
         Parameters
         ----------
@@ -277,9 +347,13 @@ class Job:
         }
 
         if self._is_resume:
+            # Only keys `serialized` actually has -- not the union with
+            # self._params, which may hold unrelated keys from an earlier
+            # log() call that this constructor's introspection never
+            # produces and so could never agree with.
             mismatches = {
                 k: (self._params.get(k), serialized.get(k))
-                for k in set(self._params) | set(serialized)
+                for k in serialized
                 if self._params.get(k) != serialized.get(k)
             }
             if mismatches:

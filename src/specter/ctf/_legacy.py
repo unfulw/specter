@@ -1,13 +1,13 @@
-"""Compatibility bridge from specter's legacy, Angstrom-based ctf_params
-dict convention (``aberrations.Aberration``, ``BaseImager._ctf_batch()``)
+"""Compatibility bridge from specter's legacy, Å-based ctf_params
+dict convention (``aberrations.Aberration``, ``imaging.CTF.params``)
 to the new torch-ctf-backed :class:`~specter.ctf.CTFParameters`.
 
-This exists so ``BaseImager`` (and anything else holding a legacy
+This exists so ``ExitWave.apply_ctf`` (and anything else holding a legacy
 ``ctf_params`` dict) can opt into the torch-ctf backend without every call
 site needing to change: :class:`LegacyAberrationAdapter` has the exact same
 call signature as ``aberrations.Aberration`` (``forward(exitwave,
-ctf_params_dict)``), so ``self.aberration = LegacyAberrationAdapter(...)``
-is the only change needed anywhere.
+ctf_params_dict)``), so the two are interchangeable wherever one is built
+(``imaging._engines.aberration_engine``).
 
 ``lpp_params`` (laser phase plate) is deliberately *not* a ``ctf_params``
 dict key, unlike every other term here: it's always a single shared
@@ -18,7 +18,7 @@ natural match for its own separate section in a TOML config, rather than
 being nested inside the per-particle CTF parameter dict.
 
 Every unit conversion and Zernike-coefficient mapping here (dfu/dfv
-Angstrom -> defocus/astigmatism micrometers, cs Angstrom -> mm, phaseshift
+Å -> defocus/astigmatism micrometers, cs Å -> mm, phaseshift
 radians -> degrees, trefoil1/trefoil2 -> Z33c/Z33s, tiltx/tilty ->
 Z31c/Z31s) is exactly what's verified term-by-term against
 ``aberrations.Aberration`` in tests/test_ctf_transfer.py, including
@@ -27,8 +27,8 @@ introduced here, this module only wires that already-validated conversion
 into the legacy dict-based calling convention.
 
 TODO (unit convention): the ``ctf_params`` dict handled here mirrors
-CryoSPARC's own parameterization (dfu/dfv/cs in Angstrom, tiltx/tilty/
-phaseshift in radians, trefoil in Angstrom^3) -- it is not torch-ctf's
+CryoSPARC's own parameterization (dfu/dfv/cs in Å, tiltx/tilty/
+phaseshift in radians, trefoil in Å³) -- it is not torch-ctf's
 native convention (defocus in um, Cs in mm, angles in degrees,
 dimensionless Zernike coefficients normalized by the grid's rho_max, see
 ``_units.zernike_rho_max``). Someone coming from RELION, or who already
@@ -52,6 +52,43 @@ from ..constants import energy_to_wavelength
 from ._parameters import CTFParameters
 from ._transfer import TransferFunction
 from ._units import zernike_rho_max
+from specter.options import AberrationModel
+
+
+#: Keys `aberrations.Aberration` accepts that this adapter has no mapping for.
+#: Checked rather than ignored: a CryoSPARC `.cs` file carries tetrafoil terms
+#: (see `io/_cryosparc.py`), so dropping one silently yields a plausible image
+#: at the wrong transfer function -- a reconstruction still converges, just to
+#: the wrong answer. Raising instead makes the gap a fact a caller can act on,
+#: and gives the migration off `"legacy"` a mechanical definition of done: this
+#: set is empty when the backend is complete.
+#:
+#: Tested against `Aberration._CTF_PARAM_NAMES` in
+#: `tests/test_ctf_legacy_adapter.py`, so a term added there without a mapping
+#: here surfaces as a failing test rather than as silence.
+#: Keys this adapter does map. Declared rather than inferred so that
+#: ``_SUPPORTED_CTF_PARAMS | _UNSUPPORTED_CTF_PARAMS`` can be asserted equal to
+#: `aberrations.Aberration`'s own term list: a term added there then belongs to
+#: exactly one of these two sets, and forgetting to classify it fails a test
+#: instead of being quietly ignored at runtime.
+_SUPPORTED_CTF_PARAMS = frozenset(
+    {
+        "dfu",
+        "dfv",
+        "dfang",
+        "cs",
+        "phaseshift",
+        "tiltx",
+        "tilty",
+        "trefoil1",
+        "trefoil2",
+        "dose",
+    }
+)
+
+_UNSUPPORTED_CTF_PARAMS = frozenset(
+    {"tetrafoil1", "tetrafoil2", "tetrafoil3", "tetrafoil4"}
+)
 
 
 def ctf_params_dict_to_parameters(
@@ -61,8 +98,8 @@ def ctf_params_dict_to_parameters(
     voltage: float,
     lpp_params: dict[str, float] | None = None,
 ) -> CTFParameters:
-    """Convert a legacy Angstrom/radian-based ``ctf_params`` dict (the
-    ``aberrations.Aberration`` / ``BaseImager._ctf_batch()`` convention)
+    """Convert a legacy Å/radian-based ``ctf_params`` dict (the
+    ``aberrations.Aberration`` / ``imaging.CTF.params`` convention)
     into a :class:`CTFParameters`.
 
     Parameters
@@ -70,7 +107,7 @@ def ctf_params_dict_to_parameters(
     ctf_params : dict[str, Any]
         Any subset of ``{"dfu", "dfv", "dfang", "cs", "phaseshift",
         "tiltx", "tilty", "trefoil1", "trefoil2", "dose"}``, matching
-        exactly what ``BaseImager._ctf_batch()`` produces (and what
+        exactly what ``imaging.CTF.params`` holds (and what
         ``aberrations.Aberration.transfer_function()`` accepts). Every key
         is optional -- an absent key means "no effect", the same as
         ``aberrations.Aberration``'s own ``ctf_params.get(key, self.zero)``
@@ -80,7 +117,7 @@ def ctf_params_dict_to_parameters(
         one, since in practice it's always the same constant value across
         every particle anyway).
     pixel_size : float
-        Pixel size in Angstrom.
+        Pixel size in Å.
     image_shape : tuple[int, int]
         Shape of the 2D image the CTF is being computed for -- needed for
         the trefoil/beam-tilt Zernike-coefficient rescale (see
@@ -105,6 +142,20 @@ def ctf_params_dict_to_parameters(
     -------
     CTFParameters
     """
+    unsupported = sorted(
+        name
+        for name in _UNSUPPORTED_CTF_PARAMS
+        if name in ctf_params and _nonzero(ctf_params[name])
+    )
+    if unsupported:
+        raise NotImplementedError(
+            f"aberration_backend='torch_ctf' cannot express {', '.join(unsupported)}: "
+            "LegacyAberrationAdapter has no mapping for these terms. Use "
+            "aberration_backend='legacy' (the default), whose Aberration "
+            "implements them, or set them to zero. A zero-valued term is "
+            "accepted, since it has no effect either way."
+        )
+
     dfu = ctf_params.get("dfu")
     dfv = ctf_params.get("dfv", dfu)
     dfang = ctf_params.get("dfang", 0.0)
@@ -140,6 +191,15 @@ def ctf_params_dict_to_parameters(
         odd_zernike["Z31s"] = -prefactor * torch.as_tensor(tilty)
 
     dose = ctf_params.get("dose")
+    if _nonzero(ctf_params.get("pre_exposure", 0.0)):
+        # CTFParameters carries a single dose; a tilt's pre-exposure has no
+        # field to land in, and dropping it would silently under-damage
+        # every tilt but the first. Refuse, matching the tetrafoil policy.
+        raise NotImplementedError(
+            "aberration_backend='torch_ctf' has no pre_exposure field: the "
+            "dose envelope of a tilt series is only available with the "
+            "'legacy' backend."
+        )
 
     return CTFParameters(
         defocus=defocus_um,
@@ -179,6 +239,14 @@ class LegacyAberrationAdapter(nn.Module):
 
     Parameters
     ----------
+    specimen_absorption : bool, optional
+        Forwarded to :class:`TransferFunction` unchanged -- see its own
+        docstring. Default True, matching ``aberrations.Aberration``'s
+        default; a caller building this class directly for
+        ``aberration_model="linear"`` (e.g. matching
+        ``scattering_model="ctf"``) needs to pass False explicitly, the
+        same way ``imaging._engines.aberration_engine`` does for the
+        ``"legacy"`` backend.
     lpp_params : dict[str, float], optional
         Laser-phase-plate config, in ``CTFParameters``-native units. A
         construction-time argument, like ``bfactor``/``convergence_angle``/
@@ -186,6 +254,15 @@ class LegacyAberrationAdapter(nn.Module):
         a single shared laser-instrument config, never per-particle. If
         set, overrides ``ctf_params["phaseshift"]`` on every call (see
         :func:`ctf_params_dict_to_parameters`).
+
+    References
+    ----------
+    .. [1] torch-ctf (v0.5.2): CTF functions for cryo-EM in torch. teamtomo.
+       https://github.com/teamtomo/torch-ctf
+    .. [2] Schwartz, O., Axelrod, J. J., Campbell, S. L., Turnbaugh, C., Glaeser,
+       R. M., & Müller, H. (2019). Laser phase plate for transmission electron
+       microscopy. *Nature Methods*, 16(10), 1016–1020.
+       https://doi.org/10.1038/s41592-019-0552-2
     """
 
     def __init__(
@@ -193,7 +270,8 @@ class LegacyAberrationAdapter(nn.Module):
         n_pixels: int,
         pixel_size: float,
         voltage: float,
-        aberration_model: str = "holography",
+        aberration_model: AberrationModel = "nonlinear",
+        specimen_absorption: bool = True,
         bfactor: float | torch.Tensor | None = None,
         convergence_angle: float | None = None,
         cc: float | None = None,
@@ -201,6 +279,7 @@ class LegacyAberrationAdapter(nn.Module):
         deltaV_V: float = 0.06e-6,
         deltaI_I: float = 0.01e-6,
         dose_envelope: bool = False,
+        dose_weighted: bool = True,
         lpp_params: dict[str, float] | None = None,
     ) -> None:
         super().__init__()
@@ -212,6 +291,7 @@ class LegacyAberrationAdapter(nn.Module):
             n_pixels,
             pixel_size,
             aberration_model=aberration_model,
+            specimen_absorption=specimen_absorption,
             bfactor=bfactor,
             convergence_angle=convergence_angle,
             cc=cc,
@@ -219,6 +299,7 @@ class LegacyAberrationAdapter(nn.Module):
             deltaV_V=deltaV_V,
             deltaI_I=deltaI_I,
             dose_envelope=dose_envelope,
+            dose_weighted=dose_weighted,
         )
 
     def forward(

@@ -1,7 +1,14 @@
+"""
+Terminal output shared across the package: the rich console, progress bars,
+status spinners, section headers and timed phases.
+"""
+
 from __future__ import annotations
 
+import sys
 import threading
 import time
+import warnings
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, TypeVar
 
@@ -11,19 +18,12 @@ from tqdm.auto import tqdm
 
 T = TypeVar("T")
 
-# Independent Console instance from pipelines/_common.py's own `_console`
-# (this module sits below `pipelines/` in the dependency graph, so it
-# can't import that one) -- rich.console.Console is safe to instantiate
-# more than once; both write to the same stdout/terminal regardless.
-_section_console = Console()
+#: The one rich console for specter's CLI output; `pipelines/` prints to it too.
+console = Console()
 
 
-def _format_elapsed(seconds: float) -> str:
-    """Format an elapsed-time duration as e.g. "1h 2m 3s", dropping empty
-    leading units. Independent copy of pipelines/_common.py's own helper
-    of the same name (this module sits below `pipelines/` in the
-    dependency graph, and it's a two-line function -- not worth an import
-    the wrong way just to avoid duplicating it)."""
+def format_elapsed(seconds: float) -> str:
+    """Format an elapsed-time duration as e.g. "1h 2m 3s", dropping empty leading units."""
     h, rem = divmod(int(seconds), 3600)
     m, s = divmod(rem, 60)
     if h > 0:
@@ -194,7 +194,9 @@ def status(description: str, disable: bool = False) -> Iterator[None]:
 
 
 @contextmanager
-def phase(description: str, disable: bool = False) -> Iterator[None]:
+def phase(
+    description: str, disable: bool = False, header: bool = True
+) -> Iterator[None]:
     """
     Context manager that prints a titled section-header rule for a named
     pipeline phase (e.g. "generating membranes", "fetching PDB
@@ -202,10 +204,9 @@ def phase(description: str, disable: bool = False) -> Iterator[None]:
     -- "{description}: {elapsed}" -- via ``tqdm.write`` (safe to
     interleave with any other active ``track``/``status``/``TqdmProgress``
     bars without corrupting their display, unlike a plain ``print``) when
-    it exits. Same visual convention as `pipelines._common._section`
-    (a full-width titled rule), so CLI output reads consistently across
-    `specter simulate`/`specter build` regardless of which layer is
-    driving a given phase.
+    it exits. The header is `section`'s full-width titled rule, so CLI
+    output reads consistently across `specter simulate`/`specter build`
+    regardless of which layer is driving a given phase.
 
     Meant to wrap a whole pipeline phase that itself contains one or more
     transient ``status``/``TqdmProgress`` bars for live per-item feedback
@@ -221,11 +222,14 @@ def phase(description: str, disable: bool = False) -> Iterator[None]:
     disable : bool, optional
         If True, no output is shown (the block still runs and is still
         timed internally, just not printed).
+    header : bool, optional
+        Print the section-header rule on entry. ``False`` prints only the
+        completion summary, for a sub-phase inside a headed one.
     """
     if disable:
         yield
         return
-    start = phase_start(description)
+    start = phase_start(description, disable=not header)
     try:
         yield
     finally:
@@ -255,10 +259,13 @@ def phase_start(description: str, disable: bool = False) -> float:
         -- pass this straight through to `phase_done`.
     """
     if not disable:
-        _section_console.print(
-            Rule(f"[bold yellow]{description}[/bold yellow]", style="yellow")
-        )
+        section(description)
     return time.perf_counter()
+
+
+def section(title: str) -> None:
+    """Print a full-width titled rule as a section separator."""
+    console.print(Rule(f"[bold yellow]{title}[/bold yellow]", style="yellow"))
 
 
 def phase_done(description: str, start: float, disable: bool = False) -> None:
@@ -283,7 +290,70 @@ def phase_done(description: str, start: float, disable: bool = False) -> None:
     if disable:
         return
     elapsed = time.perf_counter() - start
-    tqdm.write(f"{description}: {_format_elapsed(elapsed)}")
+    tqdm.write(f"{description}: {format_elapsed(elapsed)}")
+
+
+@contextmanager
+def tqdm_warnings(show_location: bool = True) -> Iterator[None]:
+    """
+    Route `warnings.warn` output through `tqdm.write` for the duration of
+    the block.
+
+    Python writes a warning straight to `sys.stderr`, which is also where
+    the bars in this module draw. A warning raised while a bar is live
+    therefore lands mid-line, leaving output like
+    ``Generating membrane instances: 0%| | 0/3 [00:00<?, ?it/s]/path/to/
+    generator.py:764: UserWarning: ...`` -- the bar and the warning both
+    unreadable. `tqdm.write` takes tqdm's lock, clears every live bar,
+    writes, and redraws them, so the warning gets its own line and the
+    bars survive.
+
+    Parameters
+    ----------
+    show_location : bool, optional
+        Include the ``file:lineno`` prefix and the echoed source line, as
+        Python's own formatter does. Default True. Pass False for a
+        command-line front end, where the location is noise: these
+        warnings are raised for the user, not for whoever is debugging
+        specter, and the stack frame they name is a fixed internal call
+        site (every warning out of `TomogramSpecimenGenerator.generate`
+        reports the one `volume = gen.generate()` line) that tells the
+        reader nothing about their own input.
+
+    Notes
+    -----
+    Only the OUTPUT path is replaced. Filtering is untouched, so
+    `warnings.simplefilter`/`-W` and Python's once-per-location dedup all
+    behave exactly as they otherwise would.
+    """
+    original = warnings.showwarning
+
+    def _showwarning(
+        message: Warning | str,
+        category: type[Warning],
+        filename: str,
+        lineno: int,
+        file: Any = None,
+        line: str | None = None,
+    ) -> None:
+        # `file` is set when a caller explicitly redirects one warning
+        # somewhere else; honour that rather than hijacking it.
+        if file is not None:
+            original(message, category, filename, lineno, file, line)
+            return
+        if show_location:
+            text = warnings.formatwarning(
+                message, category, filename, lineno, line
+            ).rstrip()
+        else:
+            text = f"{category.__name__}: {message}"
+        tqdm.write(text, file=sys.stderr)
+
+    warnings.showwarning = _showwarning
+    try:
+        yield
+    finally:
+        warnings.showwarning = original
 
 
 class TqdmProgress:
@@ -336,7 +406,7 @@ class TqdmProgress:
         advance: float = 0,
         description: str | None = None,
         **kwargs: Any,
-    ):
+    ) -> None:
         if task_id in self.tasks:
             pbar, _ = self.tasks[task_id]
             if description:
@@ -344,5 +414,5 @@ class TqdmProgress:
             if advance:
                 pbar.update(advance)
 
-    def reset(self):
+    def reset(self) -> None:
         self.__exit__(None, None, None)

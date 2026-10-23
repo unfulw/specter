@@ -6,8 +6,8 @@ Every conversion used here (dfu/dfv -> defocus/astigmatism, cs -> mm,
 phaseshift -> degrees, trefoil1/trefoil2 -> Z33c/Z33s, tiltx/tilty ->
 Z31c/Z31s) is already verified formula-by-formula against
 aberrations.Aberration in test_ctf_transfer.py -- these tests check the
-*bridge* (dict handling, optional keys, dose/bfactor plumbing, real
-multi-particle .cs data end to end through the exact dict-based call
+*bridge* (dict handling, optional keys, dose/bfactor plumbing, synthetic
+multi-particle data end to end through the exact dict-based call
 signature aberrations.Aberration.forward() uses), not the underlying
 physics again.
 """
@@ -61,11 +61,11 @@ def test_full_ctf_params_dict_matches_old_aberration():
         "trefoil2": torch.tensor([0.2650] * 5),
     }
 
-    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography")
+    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="nonlinear")
     old_out = old(exitwave, ctf_params)
 
     adapter = LegacyAberrationAdapter(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography"
+        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="nonlinear"
     )
     new_out = adapter(exitwave, ctf_params)
 
@@ -73,20 +73,49 @@ def test_full_ctf_params_dict_matches_old_aberration():
     assert torch.allclose(old_out, new_out, atol=1e-4)
 
 
-def test_minimal_ctf_params_dict_matches_old_aberration():
-    """Just dfu + cs -- matches how generate_tilt_series.py's minimal path
+@pytest.mark.parametrize(
+    "seed,constructor_kwargs,extra_ctf_params",
+    [
+        (1, {}, {}),
+        (4, {"bfactor": 150.0}, {}),
+        (5, {"dose_envelope": True}, {"dose": torch.tensor([40.0, 45.0])}),
+        (6, {"convergence_angle": 1.0, "cc": 1.4e7}, {}),
+    ],
+    ids=["minimal", "bfactor", "dose_envelope", "convergence_angle_and_cc"],
+)
+def test_minimal_ctf_params_dict_with_envelopes_matches_old_aberration(
+    seed, constructor_kwargs, extra_ctf_params
+):
+    """Just dfu + cs -- matches how run_tilt_series's minimal path
     constructs ctf_params (no astigmatism/beam-tilt/trefoil/phase-plate
-    terms at all)."""
-    exitwave = _exitwave(2, seed=1)
+    terms at all) -- alone and with each envelope switched on.
+
+    bfactor is a LegacyAberrationAdapter *construction-time* argument
+    (matching TransferFunction), not read per-call from the dict -- in
+    practice ctf_params["bfactor"] is always the same constant value
+    across every particle anyway (ExitWave.apply_ctf expands a scalar
+    bfactor to all n particles identically), so this is a no-op difference."""
+    exitwave = _exitwave(2, seed=seed)
     ctf_params = {
         "dfu": torch.tensor([15000.0, 16000.0]),
         "cs": torch.tensor([2.7e7, 2.7e7]),
+        **extra_ctf_params,
     }
 
-    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography")
+    old = Aberration(
+        N_PIXELS,
+        PIXEL_SIZE,
+        VOLTAGE,
+        aberration_model="nonlinear",
+        **constructor_kwargs,
+    )
     old_out = old(exitwave, ctf_params)
     adapter = LegacyAberrationAdapter(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography"
+        N_PIXELS,
+        PIXEL_SIZE,
+        VOLTAGE,
+        aberration_model="nonlinear",
+        **constructor_kwargs,
     )
     new_out = adapter(exitwave, ctf_params)
 
@@ -94,13 +123,13 @@ def test_minimal_ctf_params_dict_matches_old_aberration():
 
 
 def test_empty_ctf_params_dict_matches_old_aberration():
-    """No CTF terms at all -- matches BaseImager's ctf_params=None path
-    (chi stays identically 0)."""
+    """No CTF terms at all -- an empty ctf_params dict (chi stays
+    identically 0)."""
     exitwave = _exitwave(2, seed=2)
-    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography")
+    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="nonlinear")
     old_out = old(exitwave, {})
     adapter = LegacyAberrationAdapter(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography"
+        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="nonlinear"
     )
     new_out = adapter(exitwave, {})
 
@@ -114,135 +143,17 @@ def test_ctf_model_matches_old_aberration():
         "cs": torch.tensor([2.7e7, 2.7e7]),
     }
 
-    old = Aberration(N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="ctf", alpha=0.0)
+    old = Aberration(
+        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="linear", alpha=0.0
+    )
     old_out = old(exitwave, ctf_params)
     adapter = LegacyAberrationAdapter(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="ctf"
+        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="linear"
     )
     new_out = adapter(exitwave, ctf_params)
 
     assert not old_out.is_complex()
     assert not new_out.is_complex()
-    assert torch.allclose(old_out, new_out, atol=1e-4)
-
-
-def test_bfactor_matches_old_aberration():
-    """bfactor is a LegacyAberrationAdapter *construction-time* argument
-    (matching TransferFunction), not read per-call from the dict -- in
-    practice ctf_params["bfactor"] is always the same constant value
-    across every particle anyway (BaseImager expands a scalar bfactor to
-    all n particles identically), so this is a no-op difference."""
-    exitwave = _exitwave(2, seed=4)
-    ctf_params = {
-        "dfu": torch.tensor([15000.0, 16000.0]),
-        "cs": torch.tensor([2.7e7, 2.7e7]),
-    }
-
-    old = Aberration(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography", bfactor=150.0
-    )
-    old_out = old(exitwave, ctf_params)
-    adapter = LegacyAberrationAdapter(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography", bfactor=150.0
-    )
-    new_out = adapter(exitwave, ctf_params)
-
-    assert torch.allclose(old_out, new_out, atol=1e-4)
-
-
-def test_dose_envelope_matches_old_aberration():
-    exitwave = _exitwave(2, seed=5)
-    ctf_params = {
-        "dfu": torch.tensor([15000.0, 16000.0]),
-        "cs": torch.tensor([2.7e7, 2.7e7]),
-        "dose": torch.tensor([40.0, 45.0]),
-    }
-
-    old = Aberration(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography", dose_envelope=True
-    )
-    old_out = old(exitwave, ctf_params)
-    adapter = LegacyAberrationAdapter(
-        N_PIXELS, PIXEL_SIZE, VOLTAGE, aberration_model="holography", dose_envelope=True
-    )
-    new_out = adapter(exitwave, ctf_params)
-
-    assert torch.allclose(old_out, new_out, atol=1e-4)
-
-
-def test_convergence_angle_and_cc_envelopes_match_old_aberration():
-    exitwave = _exitwave(2, seed=6)
-    ctf_params = {
-        "dfu": torch.tensor([15000.0, 16000.0]),
-        "cs": torch.tensor([2.7e7, 2.7e7]),
-    }
-
-    old = Aberration(
-        N_PIXELS,
-        PIXEL_SIZE,
-        VOLTAGE,
-        aberration_model="holography",
-        convergence_angle=1.0,
-        cc=1.4e7,
-    )
-    old_out = old(exitwave, ctf_params)
-    adapter = LegacyAberrationAdapter(
-        N_PIXELS,
-        PIXEL_SIZE,
-        VOLTAGE,
-        aberration_model="holography",
-        convergence_angle=1.0,
-        cc=1.4e7,
-    )
-    new_out = adapter(exitwave, ctf_params)
-
-    assert torch.allclose(old_out, new_out, atol=1e-4)
-
-
-@pytest.mark.skipif(
-    not __import__("os").path.exists(
-        "/scratch/loh/joel/empiar-10202/CS-aav2/J247/J247_passthrough_particles.cs"
-    ),
-    reason="real .cs file not available",
-)
-def test_real_csfile_particles_match_old_aberration_end_to_end():
-    """First 20 real particles from the same .cs file used throughout this
-    migration, through the exact dict-based call signature
-    aberrations.Aberration.forward() uses -- the same validation bar as
-    everywhere else in this migration, applied to the compatibility
-    bridge specifically."""
-    from specter.io import extract_parameters_from_csfile
-
-    CS_PATH = (
-        "/scratch/loh/joel/empiar-10202/CS-aav2/J247/J247_passthrough_particles.cs"
-    )
-    (
-        voltage_kv,
-        pixel_size,
-        alpha,
-        rotations,
-        translations_A,
-        ctf_params,
-        scale,
-        anisomag,
-        indices,
-        split,
-    ) = extract_parameters_from_csfile(CS_PATH, return_class="all", n_particles=20)
-
-    n_pixels = 128
-    voltage = float(voltage_kv)
-    px = float(pixel_size)
-    exitwave = _exitwave(20, seed=7, n_pixels=n_pixels)
-
-    old = Aberration(n_pixels, px, voltage, aberration_model="holography")
-    old_out = old(exitwave, ctf_params)
-
-    adapter = LegacyAberrationAdapter(
-        n_pixels, px, voltage, aberration_model="holography"
-    )
-    new_out = adapter(exitwave, ctf_params)
-
-    assert old_out.shape == new_out.shape == (20, n_pixels, n_pixels)
     assert torch.allclose(old_out, new_out, atol=1e-4)
 
 
@@ -261,7 +172,7 @@ def test_lpp_params_matches_direct_ctfparameters_construction():
         N_PIXELS,
         PIXEL_SIZE,
         VOLTAGE,
-        aberration_model="holography",
+        aberration_model="nonlinear",
         lpp_params=_LPP_KWARGS,
     )
     bridged_out = adapter(exitwave, ctf_params)
@@ -269,7 +180,7 @@ def test_lpp_params_matches_direct_ctfparameters_construction():
     params = CTFParameters(
         defocus=15000.0 / 1e4, spherical_aberration=2.7e7 / 1e7, lpp_params=_LPP_KWARGS
     )
-    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="holography")
+    tf = TransferFunction(N_PIXELS, PIXEL_SIZE, aberration_model="nonlinear")
     direct_out = tf(exitwave, params)
 
     assert torch.allclose(bridged_out, direct_out, atol=1e-6)
@@ -291,10 +202,53 @@ def test_lpp_params_overrides_stale_nonzero_phaseshift():
         N_PIXELS,
         PIXEL_SIZE,
         VOLTAGE,
-        aberration_model="holography",
+        aberration_model="nonlinear",
         lpp_params=_LPP_KWARGS,
     )
     out_without_phaseshift = adapter(exitwave, base_ctf_params)
     out_with_stale_phaseshift = adapter(exitwave, ctf_params_with_stale_phaseshift)
 
     assert torch.allclose(out_without_phaseshift, out_with_stale_phaseshift, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Unsupported-parameter contract
+#
+# `torch_ctf` is an incomplete second implementation, kept for a migration off
+# `"legacy"` rather than offered as a choice. What it cannot express it must
+# refuse: a CryoSPARC .cs file carries tetrafoil, and ignoring it would give a
+# plausible image at the wrong transfer function.
+# ---------------------------------------------------------------------------
+
+
+def test_every_aberration_term_is_classified_by_the_adapter() -> None:
+    """A term added to Aberration must be mapped here or declared unsupported."""
+    from specter.aberrations._aberration import _CTF_PARAM_NAMES
+    from specter.ctf._legacy import _SUPPORTED_CTF_PARAMS, _UNSUPPORTED_CTF_PARAMS
+
+    assert not (_SUPPORTED_CTF_PARAMS & _UNSUPPORTED_CTF_PARAMS)
+    assert _SUPPORTED_CTF_PARAMS | _UNSUPPORTED_CTF_PARAMS == set(_CTF_PARAM_NAMES), (
+        "a ctf_params term is neither mapped nor declared unsupported, so "
+        "torch_ctf would silently ignore it"
+    )
+
+
+def test_unsupported_terms_raise_only_when_nonzero() -> None:
+    """A zero-valued term has no effect either way, so it is accepted."""
+    from specter.ctf._legacy import (
+        _UNSUPPORTED_CTF_PARAMS,
+        ctf_params_dict_to_parameters,
+    )
+
+    base = {
+        "dfu": torch.tensor([10000.0]),
+        "dfv": torch.tensor([10000.0]),
+        "dfang": torch.tensor([0.0]),
+        "cs": torch.tensor([2.7e7]),
+    }
+    kwargs = dict(pixel_size=1.0, image_shape=(32, 32), voltage=300.0)
+
+    for name in sorted(_UNSUPPORTED_CTF_PARAMS):
+        ctf_params_dict_to_parameters({**base, name: torch.tensor([0.0])}, **kwargs)
+        with pytest.raises(NotImplementedError, match=name):
+            ctf_params_dict_to_parameters({**base, name: torch.tensor([1e6])}, **kwargs)

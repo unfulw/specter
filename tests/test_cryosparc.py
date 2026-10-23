@@ -2,35 +2,12 @@ import numpy as np
 import pytest
 import torch
 
+from specter.constants import energy_to_wavelength
 from specter.io import _cryosparc, extract_parameters_from_csfile
+from conftest import fake_cryosparc_dataset
 
 
-class _FakeDataset(dict):
-    @classmethod
-    def load(cls, csfile_path: str) -> "_FakeDataset":
-        n = 6
-        dtype = np.float32
-        rng = np.random.default_rng(0)
-        return cls(
-            {
-                "alignments3D/shift": rng.normal(size=(n, 2)).astype(dtype),
-                "alignments3D/psize_A": np.full(n, 1.5, dtype=dtype),
-                "ctf/cs_mm": np.full(n, 2.7, dtype=dtype),
-                "ctf/df_angle_rad": rng.normal(size=n).astype(dtype),
-                "ctf/df1_A": (rng.normal(size=n) + 10000).astype(dtype),
-                "ctf/df2_A": (rng.normal(size=n) + 10000).astype(dtype),
-                "ctf/amp_contrast": np.full(n, 0.1, dtype=dtype),
-                "ctf/accel_kv": np.full(n, 300.0, dtype=dtype),
-                "alignments3D/pose": rng.normal(size=(n, 3)).astype(dtype),
-                "alignments3D/split": np.array([0, 1, 0, 1, 0, 1]),
-                "ctf/tilt_A": np.zeros((n, 2), dtype=dtype),
-                "ctf/phase_shift_rad": np.zeros(n, dtype=dtype),
-                "ctf/shift_A": np.zeros((n, 2), dtype=dtype),
-                "ctf/trefoil_A": np.zeros((n, 2), dtype=dtype),
-                "alignments3D/alpha": np.ones(n, dtype=dtype),
-                "ctf/anisomag": np.zeros((n, 4), dtype=dtype),
-            }
-        )
+_FakeDataset = fake_cryosparc_dataset(6)
 
 
 @pytest.fixture(autouse=True)
@@ -38,53 +15,350 @@ def _patch_dataset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_cryosparc, "Dataset", _FakeDataset)
 
 
-def test_extract_parameters_all_particles() -> None:
+@pytest.mark.parametrize(
+    ("halfset", "n_particles", "expected_indices", "expected_labels"),
+    [
+        ("all", None, [0, 1, 2, 3, 4, 5], [0, 1, 0, 1, 0, 1]),
+        ("B", None, [1, 3, 5], None),
+        # n_particles truncates after the class filter, not before it.
+        ("B", 2, [1, 3], None),
+        ("all", 4, [0, 1, 2, 3], [0, 1, 0, 1]),
+    ],
+    ids=["all", "by_class", "n_particles_after_class_filter", "n_particles_all"],
+)
+def test_extract_parameters_selects_particles(
+    halfset: str,
+    n_particles: int | None,
+    expected_indices: list[int],
+    expected_labels: list[int] | None,
+) -> None:
+    kwargs = {} if n_particles is None else {"n_particles": n_particles}
     (
         voltage_kv,
         pixel_size,
         alpha,
         rotations,
-        translations_A,
+        translations_angstrom,
         ctf_params,
         scale,
         anisomag,
         indices,
         halfset_labels,
-    ) = extract_parameters_from_csfile("fake.cs", return_class="all")
+    ) = extract_parameters_from_csfile("fake.cs", halfset=halfset, **kwargs)
 
-    assert rotations.shape == (6, 4)
-    assert translations_A.shape == (6, 2)
-    assert ctf_params["cs"].shape == (6,)
-    assert torch.equal(indices, torch.arange(6))
-    assert torch.equal(halfset_labels, torch.tensor([0, 1, 0, 1, 0, 1]))
+    n = len(expected_indices)
+    assert rotations.shape == (n, 4)
+    assert translations_angstrom.shape == (n, 2)
+    assert ctf_params["cs"].shape == (n,)
+    assert torch.equal(indices, torch.tensor(expected_indices))
+    if expected_labels is None:
+        assert halfset_labels is None
+    else:
+        assert torch.equal(halfset_labels, torch.tensor(expected_labels))
 
 
-def test_extract_parameters_by_class() -> None:
-    (_, _, _, rotations, _, ctf_params, _, _, indices, halfset_labels) = (
-        extract_parameters_from_csfile("fake.cs", return_class="1")
+class _TrefoilTetrafoilDataset(_FakeDataset):
+    """Same fixture as _FakeDataset, but with non-zero trefoil_angstrom/tetra_A so
+    the CryoSPARC -> specter unit conversion can be checked numerically."""
+
+    @classmethod
+    def load(cls, csfile_path: str) -> "_FakeDataset":
+        ds = super().load(csfile_path)
+        n = 6
+        dtype = np.float32
+        ds["ctf/trefoil_A"] = np.tile(np.array([500.0, -300.0], dtype=dtype), (n, 1))
+        ds["ctf/tetra_A"] = np.tile(
+            np.array([100.0, -200.0, 50.0, -75.0], dtype=dtype), (n, 1)
+        )
+        return ds
+
+
+def test_trefoil_scaling_matches_cryosparc_formula(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chi_trefoil = (2*pi/3) * wavelength^2 * trefoil_angstrom -- derived from
+    CryoSPARC's own newctf.py (params_to_coeffs_odd/gen_basis_odd), not the
+    old hardcoded /1000 scale factor."""
+    monkeypatch.setattr(_cryosparc, "Dataset", _TrefoilTetrafoilDataset)
+    (_, _, _, _, _, ctf_params, _, _, _, _) = extract_parameters_from_csfile(
+        "fake.cs", halfset="all"
     )
 
-    assert rotations.shape == (3, 4)
-    assert ctf_params["cs"].shape == (3,)
-    assert torch.equal(indices, torch.tensor([1, 3, 5]))
-    assert halfset_labels is None
+    wavelength = energy_to_wavelength(torch.tensor(300.0))
+    expected1 = (2 * torch.pi / 3) * wavelength**2 * 500.0
+    expected2 = (2 * torch.pi / 3) * wavelength**2 * -300.0
 
-
-def test_extract_parameters_n_particles_truncates_after_class_filter() -> None:
-    (_, _, _, rotations, _, ctf_params, _, _, indices, _) = (
-        extract_parameters_from_csfile("fake.cs", return_class="1", n_particles=2)
+    assert torch.allclose(
+        ctf_params["trefoil1"], torch.full((6,), expected1.item()), atol=1e-6
+    )
+    assert torch.allclose(
+        ctf_params["trefoil2"], torch.full((6,), expected2.item()), atol=1e-6
     )
 
-    assert rotations.shape == (2, 4)
-    assert ctf_params["cs"].shape == (2,)
-    assert torch.equal(indices, torch.tensor([1, 3]))
 
-
-def test_extract_parameters_n_particles_all() -> None:
-    (_, _, _, rotations, _, _, _, _, indices, halfset_labels) = (
-        extract_parameters_from_csfile("fake.cs", return_class="all", n_particles=4)
+def test_tetrafoil_extraction_matches_cryosparc_formula(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """chi_tetrafoil coefficients derived from CryoSPARC's own newctf.py
+    (params_to_coeffs_even/gen_basis_even): tetra_angstrom[0]/[1] are the n=4 m=+-2
+    secondary-astigmatism terms (prefactor 2*pi*wavelength^3, sign-flipped
+    on index 0), tetra_angstrom[2]/[3] are the true n=4 m=+-4 tetrafoil terms
+    (prefactor pi/2*wavelength^3, sign-flipped on index 3)."""
+    monkeypatch.setattr(_cryosparc, "Dataset", _TrefoilTetrafoilDataset)
+    (_, _, _, _, _, ctf_params, _, _, _, _) = extract_parameters_from_csfile(
+        "fake.cs", halfset="all"
     )
 
-    assert rotations.shape == (4, 4)
-    assert torch.equal(indices, torch.arange(4))
-    assert torch.equal(halfset_labels, torch.tensor([0, 1, 0, 1]))
+    wavelength = energy_to_wavelength(torch.tensor(300.0))
+    tetra_angstrom = torch.tensor([100.0, -200.0, 50.0, -75.0])
+    expected1 = -2 * torch.pi * wavelength**3 * tetra_angstrom[0]
+    expected2 = 2 * torch.pi * wavelength**3 * tetra_angstrom[1]
+    expected3 = (torch.pi / 2) * wavelength**3 * tetra_angstrom[2]
+    expected4 = -(torch.pi / 2) * wavelength**3 * tetra_angstrom[3]
+
+    assert torch.allclose(
+        ctf_params["tetrafoil1"], torch.full((6,), expected1.item()), atol=1e-6
+    )
+    assert torch.allclose(
+        ctf_params["tetrafoil2"], torch.full((6,), expected2.item()), atol=1e-6
+    )
+    assert torch.allclose(
+        ctf_params["tetrafoil3"], torch.full((6,), expected3.item()), atol=1e-6
+    )
+    assert torch.allclose(
+        ctf_params["tetrafoil4"], torch.full((6,), expected4.item()), atol=1e-6
+    )
+
+
+# ---------------------------------------------------------------------------
+# blob/path + blob/idx: how a .cs row addresses its image
+# ---------------------------------------------------------------------------
+
+
+def _stub_datasets(tables: dict[str, dict]) -> type:
+    """A `Dataset` stand-in serving one table per file name."""
+
+    class _Stub(dict):
+        @classmethod
+        def load(cls, csfile_path: str) -> "_Stub":
+            from pathlib import Path
+
+            return cls(tables[Path(csfile_path).name])
+
+    return _Stub
+
+
+def test_particle_stack_references_reads_blob_columns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A .cs row is addressed by blob/idx, which is not its row number: a
+    restack job writes its stack in the order it read its inputs."""
+    rotated = np.array([2, 3, 0, 1], dtype=np.int64)
+    monkeypatch.setattr(
+        _cryosparc,
+        "Dataset",
+        _stub_datasets(
+            {
+                "restacked.cs": {
+                    "uid": np.arange(4, dtype=np.uint64),
+                    "blob/path": np.array(["J1/restack/batch_0.mrc"] * 4),
+                    "blob/idx": rotated,
+                }
+            }
+        ),
+    )
+    (tmp_path / "restacked.cs").touch()
+
+    paths, indices = _cryosparc.particle_stack_references(tmp_path / "restacked.cs")
+
+    assert np.array_equal(indices, rotated)
+    assert set(paths) == {"J1/restack/batch_0.mrc"}
+
+
+def test_particle_stack_references_takes_blobs_from_a_sibling_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A restack job splits one particle group across two files: the poses go
+    to *_passthrough_particles.cs and the images to restacked_particles.cs. The
+    sibling is matched on uid, not on row order."""
+    uid = np.array([10, 11, 12, 13], dtype=np.uint64)
+    monkeypatch.setattr(
+        _cryosparc,
+        "Dataset",
+        _stub_datasets(
+            {
+                "J_passthrough_particles.cs": {"uid": uid},
+                # same particles, reversed rows, so position cannot stand in for uid
+                "restacked_particles.cs": {
+                    "uid": uid[::-1].copy(),
+                    "blob/path": np.array(["J/restack/batch_0.mrc"] * 4),
+                    "blob/idx": np.array([70, 71, 72, 73], dtype=np.int64),
+                },
+            }
+        ),
+    )
+    for name in ("J_passthrough_particles.cs", "restacked_particles.cs"):
+        (tmp_path / name).touch()
+
+    _, indices = _cryosparc.particle_stack_references(
+        tmp_path / "J_passthrough_particles.cs"
+    )
+
+    # uid 10 is the sibling's last row (blob/idx 73), uid 13 its first (70)
+    assert np.array_equal(indices, np.array([73, 72, 71, 70]))
+
+
+def test_particle_stack_references_ignores_an_unrelated_sibling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A .cs file for different particles sharing the directory is not paired in;
+    silently borrowing its blob/idx would mispair every pose."""
+    monkeypatch.setattr(
+        _cryosparc,
+        "Dataset",
+        _stub_datasets(
+            {
+                "poses.cs": {"uid": np.array([10, 11, 12, 13], dtype=np.uint64)},
+                "other_particles.cs": {
+                    "uid": np.array([90, 91, 92, 93], dtype=np.uint64),
+                    "blob/path": np.array(["J/other.mrc"] * 4),
+                    "blob/idx": np.arange(4, dtype=np.int64),
+                },
+            }
+        ),
+    )
+    for name in ("poses.cs", "other_particles.cs"):
+        (tmp_path / name).touch()
+
+    assert _cryosparc.particle_stack_references(tmp_path / "poses.cs") is None
+
+
+class _BinnedRefinementDataset(_FakeDataset):
+    """
+    A binned refinement's passthrough: the images are at ``blob/psize_A`` while
+    the alignment was done on a grid twice as coarse.
+
+    This is what EMPIAR-11377's J205 looks like, and taking the alignment value
+    as the rendering pixel size puts a field of view twice too wide into the
+    same box.
+    """
+
+    @classmethod
+    def load(cls, csfile_path: str) -> "_FakeDataset":
+        d = super().load(csfile_path)
+        d["blob/psize_A"] = np.full_like(np.asarray(d["alignments3D/psize_A"]), 0.75)
+        d["alignments3D/psize_A"] = np.full_like(
+            np.asarray(d["alignments3D/psize_A"]), 1.5
+        )
+        return d
+
+
+def test_pixel_size_comes_from_the_images_not_the_alignment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A binned refinement must render at the images' pixel size."""
+    monkeypatch.setattr(_cryosparc, "Dataset", _BinnedRefinementDataset)
+    _, pixel_size, *_ = extract_parameters_from_csfile("fake.cs", halfset="all")
+    assert float(pixel_size) == pytest.approx(0.75)
+
+
+def test_shifts_still_use_the_alignment_pixel_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    `alignments3D/shift` is in pixels of the grid the ALIGNMENT ran on, so it
+    must be scaled by that grid's pixel size even when the images are finer.
+    Converting it with the image pixel size would halve every shift here.
+    """
+    monkeypatch.setattr(_cryosparc, "Dataset", _BinnedRefinementDataset)
+    _, _, _, _, translations, *_ = extract_parameters_from_csfile(
+        "fake.cs", halfset="all"
+    )
+    shifts_px = np.asarray(
+        _BinnedRefinementDataset.load("fake.cs")["alignments3D/shift"]
+    )
+    assert np.allclose(translations.numpy(), shifts_px * 1.5, atol=1e-5)
+
+
+def test_absent_blob_psize_falls_back_and_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A passthrough with no blob columns cannot say what its images are sampled
+    at -- which is exactly what a binned refinement emits -- so the alignment
+    value is used and the fallback is announced rather than silent.
+    """
+    monkeypatch.setattr(_cryosparc, "Dataset", _FakeDataset)
+    with pytest.warns(UserWarning, match="no blob/psize_A"):
+        _, pixel_size, *_ = extract_parameters_from_csfile("fake.cs", halfset="all")
+    assert float(pixel_size) == pytest.approx(1.5)
+
+
+class _MixedVoltageDataset(_FakeDataset):
+    """A set whose voltage varies by 20% around a mean that equals its first entry."""
+
+    @classmethod
+    def load(cls, csfile_path: str) -> "_FakeDataset":
+        d = super().load(csfile_path)
+        kv = np.full_like(np.asarray(d["ctf/accel_kv"]), 300.0)
+        kv[1::3] = 360.0
+        kv[2::3] = 240.0
+        d["ctf/accel_kv"] = kv
+        return d
+
+
+def test_non_uniform_voltage_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    [300, 360, 240, ...] has its mean equal to its first entry, which the
+    old ``allclose(x[0], x.mean())`` test accepted; every entry is compared
+    now, and the refusal names the column and its range.
+    """
+    monkeypatch.setattr(_cryosparc, "Dataset", _MixedVoltageDataset)
+    with pytest.raises(ValueError, match=r"ctf/accel_kv.*240.*360"):
+        extract_parameters_from_csfile("fake.cs", halfset="all")
+
+
+# ---------------------------------------------------------------------------
+# blob/sign: which way round a stack stores its particles
+# ---------------------------------------------------------------------------
+
+
+def test_particle_data_signs_reads_blob_sign_from_a_sibling_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The data sign lives with the blob columns, so a passthrough file takes
+    it from the sibling holding its particles, reordered on uid."""
+    uid = np.array([10, 11, 12, 13], dtype=np.uint64)
+    monkeypatch.setattr(
+        _cryosparc,
+        "Dataset",
+        _stub_datasets(
+            {
+                "J_passthrough_particles.cs": {"uid": uid},
+                "restacked_particles.cs": {
+                    "uid": uid[::-1].copy(),
+                    "blob/path": np.array(["J/restack/batch_0.mrc"] * 4),
+                    "blob/idx": np.arange(4, dtype=np.int64),
+                    "blob/sign": np.array([1.0, 1.0, -1.0, -1.0], dtype=np.float32),
+                },
+            }
+        ),
+    )
+    for name in ("J_passthrough_particles.cs", "restacked_particles.cs"):
+        (tmp_path / name).touch()
+
+    signs = _cryosparc.particle_data_signs(tmp_path / "J_passthrough_particles.cs")
+
+    assert np.array_equal(signs, np.array([-1.0, -1.0, 1.0, 1.0]))
+
+
+def test_particle_data_signs_is_none_when_nothing_records_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        _cryosparc,
+        "Dataset",
+        _stub_datasets({"particles.cs": {"uid": np.arange(4, dtype=np.uint64)}}),
+    )
+    (tmp_path / "particles.cs").touch()
+    assert _cryosparc.particle_data_signs(tmp_path / "particles.cs") is None

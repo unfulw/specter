@@ -1,15 +1,20 @@
+"""
+`RandomIcemaker`: fast, low-fidelity amorphous ice from uniformly random
+water positions, for quick tests.
+"""
+
 from __future__ import annotations
 
-from typing import Optional
 
 import lightning as L
 import torch
 
 from ..arrays import soft_voxelize_coordinates
 from ..fft import fftconvolve
-from ._energy import MLBOP
+from ._energy import mlbop_energy_summary
 from ._helpers import ndensity_of_amorphous_ice
-from ._kernels import build_atomic_potential_kernel
+from ._kernels import build_water_kernel
+from specter.options import IceModel, ScatteringFactors
 
 
 class RandomIcemaker(L.LightningModule):
@@ -17,7 +22,7 @@ class RandomIcemaker(L.LightningModule):
     Creates ice through random molecule placement.
 
     Calculates the number of ice molecules based on amorphous ice density,
-    randomly places them as continuous Angstrom coordinates, soft-voxelizes
+    randomly places them as continuous Å coordinates, soft-voxelizes
     onto the grid, then convolves with a scattering kernel.
 
     Two-stage pipeline (mirrors :class:`GradientSKIcemaker`):
@@ -31,26 +36,31 @@ class RandomIcemaker(L.LightningModule):
     Parameters
     ----------
     dx : float
-        Pixel size in angstroms.
+        Pixel size in Å.
     n : int
         Number of pixels in xy-axis. Assumes a square field-of-view.
     nz : int, optional
         Number of pixels along z. If None, defaults to ``n``.
     parameterization : str, optional
-        Atomic potential parameterization for the ice kernel: ``'kirkland'``,
-        ``'lobato'``, or ``'shtyrov'``. Default ``'kirkland'``.
+        Atomic scattering-factor parameterization for the ice kernel:
+        ``'kirkland'``, ``'lobato'``, or ``'shtyrov'``. Default
+        ``'kirkland'``: Shtyrov fits bonded species of BIOMOLECULES over
+        0.011-0.62 1/A, so bulk ice is out of its domain and its k=0 limit
+        (which is what a mean inner potential is) extrapolates below the
+        fitted range. Kirkland, Lobato and Peng are per-element and valid at
+        k=0, and agree with each other there; see `build_water_kernel`.
     progressbars : bool, optional
         Whether to show progress bars. Default is True.
     """
 
-    method: str = "random"
+    method: IceModel = "random"
 
     def __init__(
         self,
         dx: float,
         n: int,
         nz: int | None = None,
-        parameterization: str = "kirkland",
+        parameterization: ScatteringFactors = "kirkland",
         progressbars: bool = True,
     ):
         super().__init__()
@@ -66,16 +76,17 @@ class RandomIcemaker(L.LightningModule):
 
         self.dv = dx**3
         self.nv = n**2 * self.nz
-        self.total_vol = self.nv * self.dv
-        self.n_ice_molecules = int(ndensity_of_amorphous_ice * self.total_vol)
+        self.total_volume = self.nv * self.dv
+        self.n_ice_molecules = int(ndensity_of_amorphous_ice * self.total_volume)
         self.register_buffer(
             "ice_kernel",
-            build_atomic_potential_kernel(self.dx, self.parameterization),
+            build_water_kernel(self.dx, self.parameterization),
+            persistent=False,
         )
 
         self.progressbars = progressbars
-        self.positions: Optional[torch.Tensor] = None
-        self.current_icedeltas: Optional[torch.Tensor] = None
+        self.positions: torch.Tensor | None = None
+        self.current_icedeltas: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Coordinate generation
@@ -86,7 +97,7 @@ class RandomIcemaker(L.LightningModule):
         Draw molecule positions uniformly at random.
 
         Positions are stored in ``self.positions`` as a float tensor of shape
-        ``(n_ice_molecules, 3)`` with columns ``(x, y, z)`` in Angstroms,
+        ``(n_ice_molecules, 3)`` with columns ``(x, y, z)`` in Å,
         centered at the origin: ``x ∈ [-box_x/2, box_x/2]``, etc.
         """
         pos = torch.rand(self.n_ice_molecules, 3)
@@ -156,7 +167,7 @@ class RandomIcemaker(L.LightningModule):
         Generate ice potential volumes.
 
         Runs :meth:`generate_ice_deltas` then convolves each volume with the
-        Kirkland oxygen potential kernel. ``self.positions`` holds the last
+        whole-water-molecule kernel (`build_water_kernel`). ``self.positions`` holds the last
         batch's coordinates; ``self.current_icedeltas`` holds the pre-convolution
         grids.
 
@@ -211,7 +222,4 @@ class RandomIcemaker(L.LightningModule):
         """
         assert self.positions is not None, "No positions — call init_random() first"
         box = (self.box_x, self.box_y, self.box_z)
-        model = MLBOP(device=self.positions.device)
-        with torch.no_grad():
-            result = model.compute_energy(self.positions, box_size=box, pbc=pbc)
-        return {k: v.item() for k, v in result.items()}
+        return mlbop_energy_summary(self.positions, box, pbc)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess as proc
 import sys
 from pathlib import Path
@@ -12,17 +13,7 @@ import torch
 
 from specter.jobs._job import Job, _resolve_base_dir
 from specter.jobs._database import JobDatabase
-
-
-def test_job_creates_folder(tmp_path: Path) -> None:
-    with Job("ghostbuster", project="test-project", base_dir=tmp_path) as job:
-        assert job.dir.exists()
-        assert job.dir.is_dir()
-
-
-def test_job_dir_name_is_j001(tmp_path: Path) -> None:
-    with Job("ghostbuster", project="test-project", base_dir=tmp_path) as job:
-        assert job.dir.name == "J001"
+from specter.jobs._cli import _short_params
 
 
 def test_job_id_sequence(tmp_path: Path) -> None:
@@ -46,8 +37,43 @@ def test_job_ids_scoped_per_project(tmp_path: Path) -> None:
     assert job_b.dir.name == "J001"
 
 
-def test_resolve_base_dir_from_arg(tmp_path: Path) -> None:
-    assert _resolve_base_dir(tmp_path) == tmp_path
+def test_job_dir_places_project_before_job_type(tmp_path: Path) -> None:
+    """base_dir/project/job_type/J0NN -- project first, so a project's whole
+    output can eventually live in one place regardless of which pipeline
+    produced each job."""
+    with Job("reconstructions", project="apoferritin", base_dir=tmp_path) as job:
+        assert job.dir == tmp_path / "apoferritin" / "reconstructions" / "J001"
+
+
+@pytest.mark.parametrize("project", ["p", None], ids=["project", "no_project"])
+def test_job_id_shared_across_job_types_in_one_project(
+    tmp_path: Path, project: str | None
+) -> None:
+    """Numbering is one continuous sequence per project, not restarted per
+    job_type -- so two different pipelines sharing a project don't both
+    independently claim J001. The same shared-numbering guarantee holds with
+    project=None too."""
+    with Job("particles", project=project, base_dir=tmp_path) as job1:
+        pass
+    with Job("reconstructions", project=project, base_dir=tmp_path) as job2:
+        pass
+    with Job("particles", project=project, base_dir=tmp_path) as job3:
+        pass
+    assert job1.dir.name == "J001"
+    assert job2.dir.name == "J002"
+    assert job3.dir.name == "J003"
+    assert job2.dir.parent.name == "reconstructions"
+    assert job3.dir.parent.name == "particles"
+
+
+def test_job_project_none_drops_project_segment(tmp_path: Path) -> None:
+    """project=None isn't "untracked" -- it's base_dir/job_type/J0NN, the
+    implicit default project for whatever base_dir resolves to, skipping
+    just the project-name segment."""
+    with Job("reconstructions", project=None, base_dir=tmp_path) as job:
+        assert job.dir == tmp_path / "reconstructions" / "J001"
+    data = json.loads((job.dir / "job.json").read_text())
+    assert data["project"] is None
 
 
 def test_resolve_base_dir_from_env(
@@ -155,38 +181,23 @@ class _NoRunDir:
         self.x = x
 
 
-def test_job_create_returns_instance(tmp_path: Path) -> None:
+def test_job_create_captures_args_and_injects_run_dir(tmp_path: Path) -> None:
+    """Explicit arguments and unpassed defaults are both logged; run_dir is
+    injected into the instance but kept out of the logged params."""
     with Job("dummy", project="p", base_dir=tmp_path) as job:
-        obj = job.create(_DummyClass, "hello")
-    assert isinstance(obj, _DummyClass)
-
-
-def test_job_create_captures_explicit_args(tmp_path: Path) -> None:
-    with Job("dummy", project="p", base_dir=tmp_path) as job:
-        job.create(_DummyClass, "hello", value=3.14)
+        explicit = job.create(_DummyClass, "hello", value=3.14)
     data = json.loads((job.dir / "job.json").read_text())
     assert data["params"]["name"] == "hello"
     assert data["params"]["value"] == 3.14
+    assert explicit.run_dir == job.dir
+    assert "run_dir" not in data["params"]
 
-
-def test_job_create_captures_defaults(tmp_path: Path) -> None:
     with Job("dummy", project="p", base_dir=tmp_path) as job:
-        job.create(_DummyClass, "hello")
+        obj = job.create(_DummyClass, "hello")
     data = json.loads((job.dir / "job.json").read_text())
     assert data["params"]["flag"] is False
     assert data["params"]["value"] == 1.0
-
-
-def test_job_create_injects_run_dir(tmp_path: Path) -> None:
-    with Job("dummy", project="p", base_dir=tmp_path) as job:
-        obj = job.create(_DummyClass, "hello")
     assert obj.run_dir == job.dir
-
-
-def test_job_create_run_dir_not_in_params(tmp_path: Path) -> None:
-    with Job("dummy", project="p", base_dir=tmp_path) as job:
-        job.create(_DummyClass, "hello")
-    data = json.loads((job.dir / "job.json").read_text())
     assert "run_dir" not in data["params"]
 
 
@@ -204,9 +215,9 @@ def test_job_create_tensor_summary(tmp_path: Path) -> None:
             self.volume = volume
             self.lr = lr
 
-    vol = torch.zeros(32, 32, 32)
+    volume = torch.zeros(32, 32, 32)
     with Job("dummy", project="p", base_dir=tmp_path) as job:
-        job.create(_WithTensor, vol)
+        job.create(_WithTensor, volume)
     data = json.loads((job.dir / "job.json").read_text())
     assert data["params"]["volume"] == {
         "__type__": "Tensor",
@@ -215,30 +226,9 @@ def test_job_create_tensor_summary(tmp_path: Path) -> None:
     }
 
 
-def test_job_create_dict_of_tensors(tmp_path: Path) -> None:
-    class _WithCtf:
-        def __init__(self, ctf_params: dict) -> None:  # type: ignore[type-arg]
-            self.ctf_params = ctf_params
-
-    ctf = {"dfu": torch.ones(10), "dfv": torch.ones(10)}
-    with Job("dummy", project="p", base_dir=tmp_path) as job:
-        job.create(_WithCtf, ctf)
-    data = json.loads((job.dir / "job.json").read_text())
-    assert data["params"]["ctf_params"]["dfu"]["__type__"] == "Tensor"
-    assert data["params"]["ctf_params"]["dfu"]["shape"] == [10]
-
-
 # ---------------------------------------------------------------------------
 # Task 4: job.log() and job.save()
 # ---------------------------------------------------------------------------
-
-
-def test_job_log_stores_params(tmp_path: Path) -> None:
-    with Job("ghostbuster", project="p", base_dir=tmp_path) as job:
-        job.log({"n_particles": 100, "dataset": "empiar-12391"})
-    data = json.loads((job.dir / "job.json").read_text())
-    assert data["params"]["n_particles"] == 100
-    assert data["params"]["dataset"] == "empiar-12391"
 
 
 def test_job_log_merges(tmp_path: Path) -> None:
@@ -291,7 +281,7 @@ def test_job_save_figure(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_job(tmp_path: Path, project: str, job_type: str, params: dict) -> None:  # type: ignore[type-arg]
+def _make_job(tmp_path: Path, project: str | None, job_type: str, params: dict) -> None:  # type: ignore[type-arg]
     with Job(job_type, project=project, base_dir=tmp_path) as job:
         job.log(params)
 
@@ -327,6 +317,15 @@ def test_database_get_missing_raises(tmp_path: Path) -> None:
         db.get("proj-a", "J999")
 
 
+def test_database_get_no_project(tmp_path: Path) -> None:
+    with Job("ghostbuster", project=None, base_dir=tmp_path) as job:
+        job.log({"lr": 0.1})
+    db = JobDatabase(base_dir=tmp_path)
+    entry = db.get(None, job.dir.name)
+    assert entry["project"] is None
+    assert entry["params"]["lr"] == 0.1
+
+
 def test_database_diff_changed_keys(tmp_path: Path) -> None:
     _make_job(tmp_path, "proj-a", "ghostbuster", {"lr": 0.1, "symmetry": "I1"})
     _make_job(tmp_path, "proj-a", "ghostbuster", {"lr": 0.05, "symmetry": "I1"})
@@ -350,6 +349,27 @@ def test_database_diff_missing_key(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("params", "keys", "expected"),
+    [
+        ({"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}, None, "a=1  b=2  c=3  d=4"),
+        # A result logged after training (e.g. e=5, added last) is still
+        # shown when explicitly asked for, even though it'd be cut by the
+        # default first-4 behaviour.
+        ({"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}, ["e", "a"], "e=5  a=1"),
+        ({"a": 1}, ["a", "missing"], "a=1  missing=-"),
+    ],
+    ids=["default_first_four", "keys_override_order", "missing_key_dash"],
+)
+def test_short_params(
+    params: dict[str, int], keys: list[str] | None, expected: str
+) -> None:
+    if keys is None:
+        assert _short_params(params) == expected
+    else:
+        assert _short_params(params, keys=keys) == expected
+
+
 def test_cli_list_smoke(tmp_path: Path) -> None:
     _make_job(tmp_path, "my-project", "ghostbuster", {"lr": 0.1, "symmetry": "I1"})
     result = proc.run(
@@ -366,19 +386,51 @@ def test_cli_list_smoke(tmp_path: Path) -> None:
     )
     assert result.returncode == 0
     assert "my-project" in result.stdout
+
+
+def test_cli_list_show_smoke(tmp_path: Path) -> None:
+    """--show picks specific columns, e.g. a result field the default
+    first-4 cut would otherwise miss."""
+    _make_job(
+        tmp_path,
+        "my-project",
+        "ghostbuster",
+        {"a": 1, "b": 2, "c": 3, "d": 4, "resolution_gold_standard": "3.2 A"},
+    )
+    result = proc.run(
+        [
+            sys.executable,
+            "-m",
+            "specter.jobs._cli",
+            "list",
+            "--show",
+            "resolution_gold_standard",
+            "--base-dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        env={**os.environ, "COLUMNS": "300"},  # wide enough that nothing wraps
+    )
+    assert result.returncode == 0
+    assert "resolution_gold_standard" in result.stdout
+    assert "3.2 A" in result.stdout
     assert "J001" in result.stdout
 
 
-def test_cli_show_smoke(tmp_path: Path) -> None:
-    _make_job(tmp_path, "my-project", "ghostbuster", {"lr": 0.1})
+@pytest.mark.parametrize("project", ["my-project", None], ids=["project", "no_project"])
+def test_cli_show_smoke(tmp_path: Path, project: str | None) -> None:
+    """--project is omittable, for a job created without one."""
+    _make_job(tmp_path, project, "ghostbuster", {"lr": 0.1})
+    project_args = ["--project", project] if project is not None else []
     result = proc.run(
         [
             sys.executable,
             "-m",
             "specter.jobs._cli",
             "show",
-            "my-project",
             "J001",
+            *project_args,
             "--base-dir",
             str(tmp_path),
         ],
@@ -398,9 +450,10 @@ def test_cli_diff_smoke(tmp_path: Path) -> None:
             "-m",
             "specter.jobs._cli",
             "diff",
-            "my-project",
             "J001",
             "J002",
+            "--project",
+            "my-project",
             "--base-dir",
             str(tmp_path),
         ],
@@ -414,14 +467,6 @@ def test_cli_diff_smoke(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Task 7: Job resume via job_id
 # ---------------------------------------------------------------------------
-
-
-def test_job_resume_opens_existing_folder(tmp_path: Path) -> None:
-    with Job("ghostbuster", project="p", base_dir=tmp_path) as job:
-        first_dir = job.dir
-
-    with Job("ghostbuster", project="p", base_dir=tmp_path, job_id="J001") as job:
-        assert job.dir == first_dir
 
 
 def test_job_resume_does_not_allocate_new_id(tmp_path: Path) -> None:
@@ -443,15 +488,17 @@ def test_job_explicit_id_creates_when_missing(tmp_path: Path) -> None:
     with Job("ghostbuster", project="p", base_dir=tmp_path, job_id="J099") as job:
         assert job.dir.name == "J099"
         assert (job.dir / "job.json").exists()
-    data = json.loads((tmp_path / "p" / "J099" / "job.json").read_text())
+    data = json.loads(
+        (tmp_path / "p" / "ghostbuster" / "J099" / "job.json").read_text()
+    )
     assert data["status"] == "complete"
 
 
 def test_job_explicit_id_creates_when_dir_preexists_empty(tmp_path: Path) -> None:
     # Mirrors a shell script pre-creating the job folder with `mkdir -p` before
     # job.json exists.
-    (tmp_path / "p").mkdir(parents=True)
-    (tmp_path / "p" / "J001").mkdir()
+    (tmp_path / "p" / "ghostbuster").mkdir(parents=True)
+    (tmp_path / "p" / "ghostbuster" / "J001").mkdir()
     with Job("ghostbuster", project="p", base_dir=tmp_path, job_id="J001") as job:
         assert job.dir.name == "J001"
         assert (job.dir / "job.json").exists()
@@ -512,3 +559,112 @@ def test_job_resume_excluded_param_difference_not_checked(tmp_path: Path) -> Non
     # Different secret — should not raise because secret is excluded
     with Job("dummy", project="p", base_dir=tmp_path, job_id="J001") as job:
         job.create(_ExcludeClass, "hello", secret="password2")
+
+
+def test_job_resume_create_ignores_extra_logged_keys(tmp_path: Path) -> None:
+    """A key added via log() that create()'s introspection never produces
+    (e.g. an orchestration field the constructor doesn't take) must not read
+    as a permanent mismatch on every future create() -- it was never
+    something this constructor's params could agree or disagree with."""
+    with Job("dummy", project="p", base_dir=tmp_path) as job:
+        job.log({"device": "cpu"})
+        job.create(_DummyClass, "hello", value=3.14)
+
+    # device isn't a _DummyClass constructor arg, so create()'s own
+    # introspection never sees it -- resuming must not raise over it.
+    with Job("dummy", project="p", base_dir=tmp_path, job_id="J001") as job:
+        job.create(_DummyClass, "hello", value=3.14)
+    data = json.loads((job.dir / "job.json").read_text())
+    assert data["params"]["device"] == "cpu"
+
+
+def test_pipelines_do_not_leak_the_session_base_dir(tmp_path, monkeypatch):
+    """Running a tracked pipeline must not set the process-global base dir.
+
+    `jobs.base_directory()` is the notebook-facing session setter. Pipelines
+    used to call it to hand their root a few frames down and never restored
+    it, so afterwards every bare `Job()` in the same interpreter -- a second
+    pipeline, a notebook cell, the next test -- silently inherited that run's
+    root instead of $SPECTER_JOBS_DIR. They pass `base_dir=` explicitly now.
+    """
+    import specter.jobs as jobs
+    import specter.jobs._job as _job_module
+    from specter.pipelines._common import _tracked_output_dir
+
+    monkeypatch.setattr(_job_module, "_SESSION_BASE_DIR", None)
+
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class _Config:
+        project: str = "leak-check"
+        job_id: str | None = None
+        output_dir: str = str(tmp_path)
+        output_dir: str = str(tmp_path / "unused")
+
+    with _tracked_output_dir(_Config(), "particles") as run_dir:
+        assert Path(run_dir).exists()
+
+    assert _job_module._SESSION_BASE_DIR is None, (
+        "a pipeline set the session base dir and left it set"
+    )
+    # and the job really did land under the root it was given
+    assert str(tmp_path) in run_dir
+    assert jobs.base_directory is not None  # still exported for notebook use
+
+
+def test_serialize_value_keeps_scalar_tensor_values() -> None:
+    """A 0-dim tensor is a scalar hyperparameter; record the number.
+
+    Summarising it as shape/dtype would write `{"shape": [], "dtype":
+    "float32"}` into job.json and discard the one thing a reader wants.
+    """
+    import torch
+
+    from specter.jobs._job import _serialize_value
+
+    assert _serialize_value(torch.tensor(0.5)) == 0.5
+    assert _serialize_value(torch.tensor(3)) == 3
+    # Anything with a shape keeps the summary, so a volume never lands in
+    # job.json as a nested list.
+    assert _serialize_value(torch.zeros(256, 256)) == {
+        "__type__": "Tensor",
+        "shape": [256, 256],
+        "dtype": "float32",
+    }
+
+
+def test_serialize_value_leaves_no_tensors_anywhere() -> None:
+    """The invariant the gold-standard worker's queue depends on.
+
+    `Reconstructor.results_summary()` can hold a tensor (defocus_offset),
+    and torch reduces a tensor for IPC by passing a file descriptor the
+    sending process must outlive. The worker exits right after put(), so a
+    surviving tensor makes the orchestrator's get() race the worker's exit
+    and intermittently raise ConnectionResetError. Nothing tensor-shaped may
+    come out of this function.
+    """
+    import torch
+
+    from specter.jobs._job import _serialize_value
+
+    payload = _serialize_value(
+        {
+            "defocus_offset": torch.tensor(0.0),
+            "metrics": {"loss": [torch.tensor(1.0), 2.0]},
+            "resolutions": [{"masked": torch.tensor(8.5)}],
+            "nested": ([torch.zeros(3)], {"deep": torch.tensor(1)}),
+        }
+    )
+
+    def _tensors(obj):
+        if isinstance(obj, torch.Tensor):
+            return [obj]
+        if isinstance(obj, dict):
+            return [t for v in obj.values() for t in _tensors(v)]
+        if isinstance(obj, (list, tuple)):
+            return [t for v in obj for t in _tensors(v)]
+        return []
+
+    assert _tensors(payload) == []
+    json.dumps(payload)  # must not raise

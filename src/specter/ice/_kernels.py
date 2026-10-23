@@ -1,34 +1,217 @@
 """
 Shared, stateless physics-kernel construction for ice generation.
 
-These functions used to be duplicated (with minor variations) across the
-individual icemaker classes — see the individual docstrings below for what
-each one replaces. Keeping them here as pure functions means every algorithm
-class builds these kernels the same way, by construction, instead of by
-convention.
+Pure functions, so every icemaker class builds these kernels the same way
+by construction rather than by convention. The atomic potential kernel
+itself, :func:`specter.potential.build_atomic_potential_kernel`, is the
+single implementation shared by the icemakers, the gold-bead generator and
+:class:`specter.potential.PotentialBuilder`, and is re-exported here.
 """
 
 from __future__ import annotations
 
-import os
-from importlib import resources
+import math
 
 import torch
 from torchinterp1d import interp1d
 
-from .. import potential
 from ..arrays import (
-    radial_grid_3d,
     radial_profile_3d,
     soft_voxelize_coordinates,
 )
-from ..atom import (
-    kirkland_atomic_potential_3d,
-    load_shtyrov_species_parameters,
-    lobato_atomic_potential_3d,
-    shtyrov_atomic_potential_3d_by_species,
-)
 from ..fft import fft3
+from ..ice_data import bundled_ice_data
+from ..potential import build_atomic_potential_kernel
+from specter.options import KernelParameterization
+
+__all__ = ["build_atomic_potential_kernel", "build_water_kernel"]
+
+# Geometry of a water molecule, used to place its hydrogens' scattering
+# density. Only the O-H distance matters here: the icemakers orient every
+# molecule at random, so the HOH angle drops out of the orientation average
+# (both hydrogens sit on the same sphere regardless of it).
+WATER_OH_DISTANCE = 0.9572  # A
+
+
+def _smear_onto_shell(kernel: torch.Tensor, dx: float, radius: float) -> torch.Tensor:
+    """
+    Spread `kernel` uniformly over a spherical shell of `radius`.
+
+    The k-space form factor of a uniform spherical shell is
+    ``sinc(2*pi*k*radius)``, so the smear is a single multiply in Fourier
+    space. It moves density outward without creating or destroying any: the
+    k=0 component (and hence the volume integral) is untouched.
+    """
+    n = kernel.shape[0]
+    f = torch.fft.fftfreq(n, d=dx)
+    kz, ky, kx = torch.meshgrid(f, f, f, indexing="ij")
+    x = 2.0 * math.pi * torch.sqrt(kz**2 + ky**2 + kx**2) * radius
+    # sinc(0) = 1; torch.sinc takes x/pi, so spell the limit out directly.
+    shell = torch.where(x.abs() < 1e-8, torch.ones_like(x), torch.sin(x) / x)
+    spectrum = torch.fft.fftn(torch.fft.ifftshift(kernel))
+    return torch.fft.fftshift(torch.fft.ifftn(spectrum * shell).real)
+
+
+def build_water_kernel(
+    dx: float, parameterization: KernelParameterization = "kirkland"
+) -> torch.Tensor:
+    """
+    Potential kernel for one whole water molecule, as a single site.
+
+    The icemakers are coarse-grained: they place one position per water
+    molecule, not three atoms, so the kernel convolved with those positions
+    has to carry the whole molecule. Rendering only the oxygen -- what
+    specter did before -- drops the two hydrogens entirely, and for
+    ELECTRON scattering that is not a small omission. Hydrogen's scattering
+    factor is disproportionately large at low k (Mott-Bethe [6], [7]: f_e
+    goes as (Z - f_x)/k^2, so a diffuse one-electron atom is far from
+    negligible),
+    and two of them make up 43% of a water molecule at k=0 under shtyrov
+    (35% under kirkland), still ~24% at 1.5 A.
+
+    THE LITERATURE DISAGREES WITH ITSELF about ice's mean inner potential,
+    over a range of roughly 30%, and it splits into two branches:
+
+    ===============  ======  ======  ==========================================
+    MIP              branch  source  basis
+    ===============  ======  ======  ==========================================
+    4.5301 V         upper   [2]     LDA ice, isolated-atom superposition
+    4.5276 V         upper   [3]     (O + 2H) / molecular volume, 0.93 g/cm^3
+    4.21 +/- 0.18 V  --      [1]     liquid water 4.48 +/- 0.19 V, x0.94
+    3.6 V            lower   [4]     "bulk vitreous ice"
+    3.5 +/- 1.2 V    lower   [5]     measured on vitrified ice
+    ===============  ======  ======  ==========================================
+
+    The upper branch is this kernel's own construction -- one oxygen plus
+    two hydrogens, over the molecular volume in ice -- arrived at
+    independently by [2] and [3], and [3] argues explicitly that it is the
+    appropriate one for LDA ice. [3] evaluates it at 0.93 g/cm^3; at the
+    0.94 g/cm^3 of the bundled ice library (``density_of_amorphous_ice``) the
+    same construction gives 4.58 V. Against that, the mean potential of
+    rendered library ice (ten 128 A crops at each of 0.5, 1.0 and 1.5 A
+    voxels; the range is over voxel size):
+
+    ===========================  ===========  ============
+    model                        MIP          vs. 4.58 V
+    ===========================  ===========  ============
+    oxygen only, shtyrov O(HH)   2.04-2.08 V  -55%
+    oxygen only, kirkland        2.96-2.99 V  -35%
+    this kernel, shtyrov         3.63-3.67 V  -21% to -20%
+    this kernel, kirkland        4.55-4.58 V  -0.6% to 0.0%
+    ===========================  ===========  ============
+
+    The continuum integral of the same factors at 0.94 g/cm^3 is 4.59 V
+    under kirkland and 3.63 V under shtyrov; the sampled kernels hold
+    0.992-0.998 and 1.000-1.012 of it, which is the whole spread over voxel
+    size.
+
+    Do NOT read the +8-9% against [1]'s density-scaled 4.21 V as an error to
+    tune away. An isolated-atom superposition cannot represent bonding and
+    is expected to sit above a measurement; [5] is the only direct
+    measurement on vitrified ice (per [1], which also notes it may carry
+    systematic error from charging, thermal expansion and
+    recrystallization), and at +/-34% it is far too imprecise to have
+    caught the missing hydrogens this kernel exists to restore.
+
+    One attribution caveat: the 4.5301 V credited to [2] is as reported by
+    [3]. It could not be found in [2]'s own main text, which states its
+    potentials come from the isolated atom superposition approximation with
+    the solvent taken from the known water number density -- the same
+    calculation, so [3] appears to have evaluated [2]'s method rather than
+    quoted a printed figure.
+
+    `parameterization` defaults to ``'kirkland'`` rather than to
+    `PotentialBuilder`'s ``'shtyrov'``: Shtyrov fits bonded species of
+    BIOMOLECULES, over a tabulated range of 0.011-0.62 1/A. Bulk ice is
+    outside that domain, and a mean inner potential is a k=0 quantity, so
+    evaluating it extrapolates the fit below its own data -- visibly so for
+    ``H(C)``, whose tabulated values are negative below ~0.2 1/A. Kirkland,
+    Lobato and Peng are per-element, valid at k=0, and agree there.
+
+    The hydrogens are placed on a **spherical shell** at
+    `WATER_OH_DISTANCE` (0.9572 A, the gas-phase bond length [8]), not at
+    the oxygen's own position. Both choices give
+    the identical MIP, since a volume integral does not care where density
+    sits, but they differ at every nonzero frequency: molecules are randomly
+    oriented, so a hydrogen's contribution decoheres as
+    ``sinc(2*pi*k*d)``, and collapsing it to r=0 pins that factor at 1
+    forever. Rendering apoferritin in ice at 1 A/px, the collapsed version
+    carries ~1.9x the ice power past 5 A all the way to Nyquist, where the
+    shell correctly returns to unity -- spurious high-frequency ice texture
+    in the band the CTF transfers best. The correction is a single Fourier
+    multiply, so there is no reason to take the cheaper approximation.
+
+    Hydrogen resolves through the ordinary fallback rather than a special
+    case: the bundled Shtyrov tables have ``O(HH)`` but no ``H(O)`` (only
+    ``H(C)``/``H(N)``), so passing no species yields per-element Peng for
+    the hydrogens while Kirkland/Lobato use their own H entry.
+
+    Parameters
+    ----------
+    dx : float
+        Voxel size in Angstrom.
+    parameterization : str, optional
+        Atomic scattering-factor parameterization for the oxygen. Default
+        ``'kirkland'``; ``'shtyrov'`` types the oxygen as the water species
+        ``O(HH)``.
+
+    Returns
+    -------
+    torch.Tensor
+        Potential kernel for one water molecule, same shape and grid as
+        :func:`specter.potential.build_atomic_potential_kernel` returns.
+
+    References
+    ----------
+    .. [1] Yesibolati, M. N., Laganà, S., Sun, H., Beleggia, M., Kathmann,
+       S. M., Kasama, T., & Mølhave, K. (2020). Mean inner potential of
+       liquid water. *Physical Review Letters*, 124(6), 065502.
+       https://doi.org/10.1103/PhysRevLett.124.065502
+       Table I of this paper compiles the theoretical and experimental
+       water/ice values, density-corrected to a common 1 g/cm^3.
+    .. [2] Vulović, M., Ravelli, R. B. G., van Vliet, L. J., Koster, A. J.,
+       Lazić, I., Lücken, U., Rullgård, H., Öktem, O., & Rieger, B. (2013).
+       Image formation modeling in cryo-electron microscopy. *Journal of
+       Structural Biology*, 183(1), 19–32.
+       https://doi.org/10.1016/j.jsb.2013.05.008
+    .. [3] Okamoto, H. (2022). Resilient quantum electron microscopy.
+       *Physical Review A*, 106(2), 022605.
+       https://doi.org/10.1103/PhysRevA.106.022605 (arXiv:2001.05603).
+       Appendix: "The mean inner potential of ice is computed to be
+       4.5276 V ... the inner potential of the water molecule,
+       consisting of 2 hydrogen atoms and one oxygen atom, divided by
+       its molecular volume in ice."
+    .. [4] Shang, Z., & Sigworth, F. J. (2012). Hydration-layer models for
+       cryo-EM image simulation. *Journal of Structural Biology*, 180(1),
+       10–16. https://doi.org/10.1016/j.jsb.2012.04.021
+    .. [5] Harscher, A., & Lichte, H. (1998). Inelastic mean free path and
+       mean inner potential of carbon foil and vitrified ice measured with
+       electron holography. In H. A. Calderón Benavides & M. J. Yacamán
+       (Eds.), *Electron Microscopy 1998: Proceedings of the 14th
+       International Congress on Electron Microscopy (ICEM-14), Cancún*
+       (pp. 553–554). Institute of Physics Publishing.
+    .. [6] Mott, N. F. (1930). The scattering of electrons by atoms.
+       *Proceedings of the Royal Society of London. Series A*, 127(806),
+       658–665. https://doi.org/10.1098/rspa.1930.0082
+    .. [7] Bethe, H. (1930). Zur Theorie des Durchgangs schneller
+       Korpuskularstrahlen durch Materie. *Annalen der Physik*, 397(3),
+       325–400. https://doi.org/10.1002/andp.19303970303
+    .. [8] Benedict, W. S., Gailar, N., & Plyler, E. K. (1956).
+       Rotation-vibration spectra of deuterated water vapor. *The Journal
+       of Chemical Physics*, 24(6), 1139–1165.
+       https://doi.org/10.1063/1.1742731
+    """
+    oxygen = build_atomic_potential_kernel(
+        dx,
+        parameterization,
+        atomic_number=8,
+        shtyrov_species="O(HH)" if parameterization == "shtyrov" else None,
+    )
+    hydrogen = build_atomic_potential_kernel(
+        dx, parameterization, atomic_number=1, shtyrov_species=None
+    )
+    return oxygen + 2.0 * _smear_onto_shell(hydrogen, dx, WATER_OH_DISTANCE)
+
 
 # Grid the bundled (and any custom) mdsim radial-average target files are
 # computed on. Not user-configurable: it describes the fixed grid a target
@@ -37,7 +220,12 @@ MDSIM_DX = 0.25
 MDSIM_N = 400
 
 # Real extent of the LDA-80K MD simulation's periodic cell (see the dump
-# file's own BOX BOUNDS header): ~127.12 A per side. A native target can
+# file's own BOX BOUNDS header): ~127.12 A per side, holding 64,000
+# molecules, so the frame is at 0.932 g/cm^3, slightly below the 0.94 g/cm^3
+# the icemakers fill their boxes to (`density_of_amorphous_ice`). The target
+# is normalised per molecule (|F(k)| / sqrt(N)), so an icemaker takes its
+# structure factor from the frame and its molecule count from
+# `density_of_amorphous_ice`. A native target can
 # only be computed directly up to this size before requiring the box-size
 # extrapolation handled by interpolate_target_kernel's own interp1d call
 # (safe -- box size only changes k-sampling density of the same underlying
@@ -59,7 +247,8 @@ def load_mdsim_f_radial_avg(
         Path to a precomputed radial-average |F(k)| target ``.pt`` file, in the
         same format as the bundled default (a 1D tensor indexed by k-bin on the
         fixed ``MDSIM_N`` x ``MDSIM_N`` x ``MDSIM_N``, ``MDSIM_DX`` grid). If
-        None, uses the bundled ``ice-data/mdsim_f_radial_avg_400x400x400_0.25A.pt``.
+        None, uses the bundled
+        ``specter/ice_data/mdsim_f_radial_avg_400x400x400_0.25A.pt``.
 
     Returns
     -------
@@ -69,10 +258,8 @@ def load_mdsim_f_radial_avg(
         Radial-average |F(k)| (stores sqrt(S(k))).
     """
     if saved_data_path is None:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        root_dir = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
-        saved_data_path = os.path.join(
-            root_dir, "ice-data", "mdsim_f_radial_avg_400x400x400_0.25A.pt"
+        saved_data_path = str(
+            bundled_ice_data("mdsim_f_radial_avg_400x400x400_0.25A.pt")
         )
     mdsim_f_radial_avg = torch.load(saved_data_path, weights_only=True)
     mdsim_dk = 1 / MDSIM_N / MDSIM_DX
@@ -126,7 +313,7 @@ def compute_native_target(
     reference_coords_path : str, optional
         Path to a pre-extracted single-frame coordinate tensor (shape
         ``(N, 3)``, centered, full simulation box). Defaults to the bundled
-        ``ice-data/lda_80k_frame799_full_coords.pt`` (frame 799 of the
+        ``specter/ice_data/lda_80k_frame799_full_coords.pt`` (frame 799 of the
         LDA-80K trajectory -- single-frame vs. 790-frame-averaged targets
         were validated to give statistically indistinguishable downstream
         training results, so a single frame is used for speed).
@@ -141,11 +328,7 @@ def compute_native_target(
     """
     nz = n if nz is None else nz
     if reference_coords_path is None:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        root_dir = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
-        reference_coords_path = os.path.join(
-            root_dir, "ice-data", "lda_80k_frame799_full_coords.pt"
-        )
+        reference_coords_path = str(bundled_ice_data("lda_80k_frame799_full_coords.pt"))
 
     if reference_coords_path not in _REFERENCE_COORDS_CACHE:
         _REFERENCE_COORDS_CACHE[reference_coords_path] = torch.load(
@@ -278,60 +461,3 @@ def interpolate_target_kernel(
     kernel = interp.reshape(nz, n, n) * (n_ice_molecules**0.5)
     kernel[nz // 2, n // 2, n // 2] = n_ice_molecules
     return kernel
-
-
-def build_atomic_potential_kernel(
-    dx: float,
-    parameterization: str = "kirkland",
-    atomic_number: int = 8,
-    shtyrov_species: str = "O(HH)",
-) -> torch.Tensor:
-    """
-    Build the real-space atomic potential kernel for a single atom/bonded
-    species. Defaults to a water molecule (oxygen), the ice use case this
-    was originally written for.
-
-    Parameters
-    ----------
-    dx : float
-        Voxel size in Å.
-    parameterization : str, optional
-        ``'kirkland'`` (default), ``'lobato'``, or ``'shtyrov'``.
-    atomic_number : int, optional
-        Atomic number, used by the ``'kirkland'``/``'lobato'`` branches.
-        Default 8 (oxygen).
-    shtyrov_species : str, optional
-        Bonded species key into ``params_cat.json``, used only by the
-        ``'shtyrov'`` branch (shtyrov parameterizes bonded species, not bare
-        atomic numbers). Default ``"O(HH)"`` (water oxygen).
-
-    Returns
-    -------
-    torch.Tensor
-        Potential kernel volume, downsampled to the target grid.
-    """
-    ssn, ssdx, ssf = potential.compute_supersampling_parameters(dx)
-    # set original convention to torch to avoid singularity at origin.
-    sR = radial_grid_3d(ssn, ssdx, convention="torch")
-
-    # for binning super-sampled grids to main volume grid.
-    avgpool3d = torch.nn.AvgPool3d(ssf, stride=ssf)
-
-    if parameterization == "kirkland":
-        pot = kirkland_atomic_potential_3d(atomic_number, sR)
-    elif parameterization == "lobato":
-        pot = lobato_atomic_potential_3d(atomic_number, sR)
-    elif parameterization == "shtyrov":
-        species_path = resources.files("specter.atom_data").joinpath("params_cat.json")
-        with resources.as_file(species_path) as fpath:
-            species_params = load_shtyrov_species_parameters(str(fpath))
-        pot = shtyrov_atomic_potential_3d_by_species(
-            shtyrov_species, sR, species_params
-        )
-    else:
-        raise ValueError(
-            f"Unknown parameterization '{parameterization}'. "
-            "Choose 'kirkland', 'lobato', or 'shtyrov'."
-        )
-
-    return avgpool3d(pot[None, None]).squeeze()

@@ -41,27 +41,59 @@ from typing import TYPE_CHECKING, Literal, TypeVar
 
 import torch
 
+
 if TYPE_CHECKING:
     from ..pdb import PDB
 
 K = TypeVar("K", bound=Hashable)
 V = TypeVar("V")
 
-# Below this many unique PDB sources, build_pdb_cache_concurrently falls
-# back to serial regardless of max_workers -- process-pool startup (spawn
-# re-imports specter's whole dependency chain, torch/lightning included, in
-# every worker) has a large ~13-15s FIXED cost, independent of how much
-# actual parsing work there is. Measured directly (dev/bench_pdb_loading_
-# overhead.py, max_workers=4): serial-vs-parallel speedup was 0.11x at N=2,
-# 0.29x at N=5, 0.54x at N=10 -- all net LOSSES -- crossing over to 1.12x at
-# N=20 and climbing to ~2.0x by N=100+. This threshold sits a margin above
-# that N=20 crossover (which was only a modest, possibly noise-level win)
-# rather than exactly at it.
-_MIN_SOURCES_FOR_PROCESS_POOL = 25
+# build_pdb_cache_concurrently falls back to serial when the process pool is
+# not predicted to pay for itself. Spawn re-imports specter's whole dependency
+# chain, torch/lightning included, in every worker, and that startup is a fixed
+# cost the parsing has to earn back.
+#
+# A threshold on the NUMBER of unique sources is the wrong criterion: the cost
+# being amortized is total parse WORK, and that varies ~40x across the
+# structures a single tomogram config loads (2REC, 1,818 atoms, 0.67s; 6N4V,
+# 236,760 atoms, 26s). A count threshold fails in both directions -- it pools
+# 25 tiny structures that are faster serial, and runs 24 large ones serially
+# at a measured 2.8x loss.
+#
+# Parse cost tracks the structure file's size on disk closely enough to decide
+# on (27 structures spanning 0.26-25.6 MB: r = 0.974), and that size is one
+# os.stat away, known before any parsing.
+_PDB_PARSE_FIXED_S = 0.45
+_PDB_PARSE_S_PER_MB = 0.65
+
+# Measured spawn cost of the pool itself, as the residual between each pool run
+# and its own perfect-scheduling floor, max(longest task, total work / workers)
+# -- 6-8s across N = 2..24. Taking the top of that range keeps the estimate
+# conservative, i.e. biased toward staying serial.
+_POOL_SPAWN_OVERHEAD_S = 8.0
+
+# Used when a source isn't cached yet and its size is therefore unknown. Those
+# are network downloads, which overlap across processes regardless of parse
+# cost, so guessing high is the safe direction.
+_UNKNOWN_SOURCE_MB = 5.0
+
+# What a source costs when its PARSE is cached (`pdb._parsed_cache_path`):
+# loading the arrays back, 0.04-0.09 s for a 220k-atom assembly, taken
+# generously. The size-based estimate above predates that cache and still
+# predicts seconds per structure for it, which made the shipped tomogram
+# config spawn a pool for 26 sources that load in ~3 s serially -- the
+# pool's start-up was the entire 12-14 s of the phase.
+_PARSED_CACHE_LOAD_S = 0.15
+
+# The pool has to win by this much before it is worth taking, rather than merely
+# breaking even. The estimator is good enough to rank and to size (r = 0.974)
+# but individual structures land within about a factor of three of it, so a
+# predicted saving of a second or two is noise -- and the downside of guessing
+# wrong is the whole spawn cost, while the upside is that same second.
+_POOL_REQUIRED_MARGIN = 0.75
 
 # Measured sweet spot for build_templates_concurrently's THREAD pool
-# specifically (dev/sweep_render_configs.py, full production-scale sweep,
-# see [[project_render_workers_sweep_results]]): workers=8 was the fastest
+# specifically (full production-scale sweep): workers=8 was the fastest
 # of {1,4,8,16,32,64} at N=161 species, and device choice (single-GPU,
 # multi-GPU, CPU-only) barely mattered at that worker count (all within
 # 2.5% of each other) -- so this is a single hardware-agnostic number, not
@@ -226,7 +258,103 @@ def build_templates_concurrently(
         return results
 
 
-def _fetch_one_pdb(args: tuple[str, str]) -> "PDB":
+def _estimated_parse_seconds(
+    pdb_source: str,
+    pdb_cache_dir: str,
+    compute_atom_species: bool = False,
+    readd_hydrogens: bool | str = "auto",
+    monomer_library_path: str | None = None,
+) -> float:
+    """
+    Predict how long `PDB(pdb_source)` will take.
+
+    From the file's size on disk when it will actually be parsed, or
+    `_PARSED_CACHE_LOAD_S` when the parse is already cached for these flags
+    (see `pdb._parsed_cache_path`; the flags are part of its key, which is
+    why they are taken here).
+
+    Used for two decisions, neither of which needs better than order-of-
+    magnitude accuracy: whether a process pool will pay for its spawn cost at
+    all, and which sources to submit to it first.
+
+    Parameters
+    ----------
+    pdb_source : str
+        A 4-character accession code or a path to a structure file.
+    pdb_cache_dir : str
+        Where downloaded structures are cached, checked for an accession code.
+    compute_atom_species, readd_hydrogens, monomer_library_path
+        The parse flags `PDB` will be given; they select the parsed-cache entry.
+
+    Returns
+    -------
+    float
+        Estimated seconds. Falls back to `_UNKNOWN_SOURCE_MB`'s worth for a
+        source that isn't on disk yet (an un-fetched accession code), since its
+        real cost is a network download whose size can't be known first.
+    """
+    import os
+
+    from ..pdb import _parsed_cache_path, _resolve_monomer_library_path
+
+    candidates = [pdb_source]
+    if pdb_cache_dir:
+        candidates += [
+            os.path.join(pdb_cache_dir, f"{pdb_source}-assembly{n}.cif")
+            for n in range(1, 4)
+        ]
+        candidates += [
+            os.path.join(pdb_cache_dir, f"{pdb_source}{ext}")
+            for ext in (".cif", ".pdb")
+        ]
+    megabytes = _UNKNOWN_SOURCE_MB
+    for path in candidates:
+        try:
+            if os.path.isfile(path):
+                try:
+                    resolved = _resolve_monomer_library_path(monomer_library_path)
+                except Exception:
+                    resolved = None
+                parsed = _parsed_cache_path(
+                    pdb_cache_dir, path, compute_atom_species, readd_hydrogens, resolved
+                )
+                if parsed is not None and os.path.isfile(parsed):
+                    return _PARSED_CACHE_LOAD_S
+                megabytes = os.path.getsize(path) / 1e6
+                break
+        except OSError:
+            continue
+    return _PDB_PARSE_FIXED_S + _PDB_PARSE_S_PER_MB * megabytes
+
+
+def _process_pool_is_worth_it(estimates: list[float], max_workers: int) -> bool:
+    """
+    Decide whether spawning a process pool beats parsing these sources serially.
+
+    Compares the serial total against the pool's best case -- perfect
+    scheduling, so the longest single task or an even split across workers,
+    whichever binds -- plus the pool's own measured spawn cost. Both sides use
+    the same estimator, so a systematic bias in it largely cancels.
+
+    Parameters
+    ----------
+    estimates : list of float
+        Per-source estimated parse seconds, from `_estimated_parse_seconds`.
+    max_workers : int
+        Worker count the pool would be given.
+
+    Returns
+    -------
+    bool
+    """
+    if not estimates or max_workers <= 1:
+        return False
+    serial = sum(estimates)
+    pooled = max(max(estimates), serial / max_workers) + _POOL_SPAWN_OVERHEAD_S
+    return pooled < _POOL_REQUIRED_MARGIN * serial
+
+
+def _fetch_one_pdb(args: tuple[str, str, bool, bool | str, str | None]) -> "PDB":
     """
     Worker target for `build_pdb_cache_concurrently` -- a plain top-level
     function, not a closure/lambda, because `ProcessPoolExecutor` pickles
@@ -236,10 +364,29 @@ def _fetch_one_pdb(args: tuple[str, str]) -> "PDB":
     drags in) on every caller of the thread-based helpers above, most of
     which never touch PDB fetching at all.
     """
-    from ..pdb import PDB
+    from ..pdb import PDB, suppress_monomer_library_warning
 
-    pdb_source, pdb_cache_dir = args
-    return PDB(pdb_source, savefolder=pdb_cache_dir, verbose=False)
+    # The parent already reported a missing monomer library once, on every
+    # worker's behalf (see build_pdb_cache_concurrently). Each spawned worker
+    # starts with fresh module state, so without this the same
+    # environment-level fact is reported once per worker.
+    suppress_monomer_library_warning()
+
+    (
+        pdb_source,
+        pdb_cache_dir,
+        compute_atom_species,
+        readd_hydrogens,
+        monomer_library_path,
+    ) = args
+    return PDB(
+        pdb_source,
+        pdb_cache_dir=pdb_cache_dir,
+        verbose=False,
+        compute_atom_species=compute_atom_species,
+        readd_hydrogens=readd_hydrogens,
+        monomer_library_path=monomer_library_path,
+    )
 
 
 def build_pdb_cache_concurrently(
@@ -247,6 +394,9 @@ def build_pdb_cache_concurrently(
     pdb_cache_dir: str,
     max_workers: int,
     on_result: Callable[[str], None] | None = None,
+    compute_atom_species: bool = False,
+    readd_hydrogens: bool | str = "auto",
+    monomer_library_path: str | None = None,
 ) -> dict[str, "PDB"]:
     """
     Fetch/parse multiple PDB sources concurrently across OS PROCESSES (not
@@ -259,9 +409,12 @@ def build_pdb_cache_concurrently(
         `pdb_source` values (PDB IDs or local file paths) to load. Duplicates
         are only fetched once (first occurrence order preserved in the
         returned dict's construction, though dict key order isn't itself
-        load-bearing for callers).
+        load-bearing for callers). Deduplication is by
+        `pdb.canonical_pdb_source`, not by raw string, so two spellings of
+        one accession code (``1fa2`` and ``1FA2``) are fetched, parsed and
+        typed once between them.
     pdb_cache_dir : str
-        Passed through to every `PDB(...)` call as `savefolder`.
+        Passed through to every `PDB(...)` call as `pdb_cache_dir`.
     max_workers : int
         Number of PDB sources fetched/parsed concurrently. ``<= 1``, or
         fewer than `_MIN_SOURCES_FOR_PROCESS_POOL` unique sources, skips
@@ -271,16 +424,24 @@ def build_pdb_cache_concurrently(
         without enough work to amortize it (see that constant's own
         comment for the numbers).
     on_result : callable, optional
-        ``on_result(pdb_source)``, called once per unique source as soon
-        as its `PDB` is available -- in COMPLETION order when the process
-        pool runs (via `as_completed`, not submission order), in
-        `unique_sources` order when serial. Meant for a caller-side
-        progress tick; exceptions from it propagate immediately.
+        ``on_result(pdb_source)``, called once per unique INPUT source as
+        soon as its `PDB` is available -- in COMPLETION order when the
+        process pool runs (via `as_completed`, not submission order), in
+        `unique_sources` order when serial. Aliases of one structure each
+        get their own call, back to back, so a caller ticking a bar sized
+        by its own source count still reaches the total. Meant for a
+        caller-side progress tick; exceptions from it propagate
+        immediately.
 
     Returns
     -------
     dict[str, PDB]
-        `pdb_source -> PDB`, one entry per unique input source.
+        `pdb_source -> PDB`, one entry per unique input source, keyed by
+        the spelling the caller passed in (callers look up by
+        `spec.pdb_source` verbatim). Aliases of one structure map to the
+        SAME `PDB` object, so downstream caches keyed on object identity
+        -- the tomogram generator's `_mask_cache`, for instance -- collapse
+        them too.
 
     Notes
     -----
@@ -297,26 +458,88 @@ def build_pdb_cache_concurrently(
     every worker process too (a standard Python multiprocessing pitfall,
     not specific to this function).
     """
-    unique_sources = list(dict.fromkeys(pdb_sources))
-    if max_workers <= 1 or len(unique_sources) < _MIN_SOURCES_FOR_PROCESS_POOL:
+    from ..pdb import canonical_pdb_source
+
+    # One unit of work per STRUCTURE, not per spelling. `aliases` maps each
+    # canonical source to the raw spellings that named it, so the results
+    # can be fanned back out below under the keys the caller will look up.
+    aliases: dict[str, dict[str, None]] = {}
+    for source in pdb_sources:
+        aliases.setdefault(canonical_pdb_source(source), {})[source] = None
+    unique_sources = list(aliases)
+
+    def _fan_out(results: dict[str, "PDB"], canonical: str, pdb: "PDB") -> None:
+        for alias in aliases[canonical]:
+            results[alias] = pdb
+            if on_result is not None:
+                on_result(alias)
+
+    estimates = [
+        _estimated_parse_seconds(
+            source,
+            pdb_cache_dir,
+            compute_atom_species,
+            readd_hydrogens,
+            monomer_library_path,
+        )
+        for source in unique_sources
+    ]
+    if not _process_pool_is_worth_it(estimates, max_workers):
         from ..pdb import PDB
 
-        results = {}
+        results: dict[str, "PDB"] = {}
         for source in unique_sources:
-            results[source] = PDB(source, savefolder=pdb_cache_dir, verbose=False)
-            if on_result is not None:
-                on_result(source)
+            _fan_out(
+                results,
+                source,
+                PDB(
+                    source,
+                    pdb_cache_dir=pdb_cache_dir,
+                    verbose=False,
+                    compute_atom_species=compute_atom_species,
+                    readd_hydrogens=readd_hydrogens,
+                    monomer_library_path=monomer_library_path,
+                ),
+            )
         return results
+
+    # Submit the most expensive structures FIRST (longest-processing-time
+    # first). Callers hand these in sorted alphabetically, which on the default
+    # tomogram config puts the two priciest -- 6N4V and 6QZP, 26s and 18s of a
+    # 90s serial total -- at positions 21 and 22 of 24. Starting the longest
+    # task last makes the makespan (total / workers) + longest instead of
+    # max(total / workers, longest): measured 35.6s -> 31.5s against a 26s floor
+    # set by 6N4V alone.
+    submission_order = [
+        source
+        for _, source in sorted(
+            zip(estimates, unique_sources), key=lambda pair: -pair[0]
+        )
+    ]
+    if compute_atom_species:
+        # Report it here, once, rather than letting each worker discover it:
+        # the workers are silenced (see _fetch_one_pdb) precisely so this is
+        # the only place it can come from.
+        from ..pdb import _warn_missing_monomer_library, _resolve_monomer_library_path
+
+        if _resolve_monomer_library_path(monomer_library_path) is None:
+            _warn_missing_monomer_library()
     ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
         futures = {
-            pool.submit(_fetch_one_pdb, (source, pdb_cache_dir)): source
-            for source in unique_sources
+            pool.submit(
+                _fetch_one_pdb,
+                (
+                    source,
+                    pdb_cache_dir,
+                    compute_atom_species,
+                    readd_hydrogens,
+                    monomer_library_path,
+                ),
+            ): source
+            for source in submission_order
         }
         results = {}
         for fut in as_completed(futures):
-            source = futures[fut]
-            results[source] = fut.result()
-            if on_result is not None:
-                on_result(source)
+            _fan_out(results, futures[fut], fut.result())
         return results

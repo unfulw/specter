@@ -5,16 +5,16 @@ combination of: one or more organic membranes, filament species (e.g.
 F-actin), gold fiducial beads, a carbon support film, and densely packed
 protein species (region-gated to cytosol/lumen when a membrane is present).
 It writes a `.mrc` density volume plus
-copick-style `.ndjson` ground-truth picks and, by default, segmentation
-label volumes. The `.mrc` is directly usable as `specter simulate
-tiltseries`'s `--volume_path` — this is the specimen-building half of the
+copick-style (Ermel et al. 2026) `.ndjson` ground-truth picks and, by
+default, segmentation label volumes. The `.mrc` is directly usable as `specter simulate
+tiltseries`'s `--volume_path`. This is the specimen-building half of the
 cryo-ET pipeline; see [Generate a tilt series](tilt-series.md) for the
 imaging half.
 
 ## Basic usage
 
-Every run loads a TOML config first, then applies any flags given on the
-command line as overrides:
+Every run loads a TOML config first, then applies whatever flags you pass
+on the command line as overrides:
 
 ```bash
 specter build tomogram --config configs/tomogram.toml
@@ -23,188 +23,414 @@ specter build tomogram --config configs/tomogram.toml
 ```bash
 specter build tomogram \
     --config configs/tomogram.toml \
-    --v_size 5.0 \
+    --voxel_size 5.0 \
     --device cuda:0 \
-    --output_dir ./output/
+    --output_dir tomograms
 ```
 
-`configs/tomogram.toml` is the canonical starting point — copy it and edit
+`configs/tomogram.toml` is the canonical starting point. Copy it and edit
 for your own runs. It demonstrates every feature at once (composited
-membranes, filaments, exact-count targets, ratio-based filler); run
-`specter build tomogram --help` for the full field-by-field reference.
+membranes, filaments, exact-count targets, ratio-based filler); the
+[command reference](../api/cli/build.md#specter-build-tomogram) documents every
+field.
+
+The second command, with a fixed seed, builds the volume below:
+
+```bash
+--8<-- "docs-includes/cli-guides/build_tomogram-command.txt"
+```
+
+```{ .text .output }
+--8<-- "docs-includes/cli-guides/build_tomogram-run.txt"
+```
+
+![A slab through the built volume, a zoomed region, and a side view.](../assets/images/cli-guides/build_tomogram-volume.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+A 40 Å slab through z = 65 of the 300 slices, the slice that cuts the most
+bilayer, low-pass filtered to 20 Å (top left); the boxed 2000 Å region (top
+right); and a 400 Å slab along the dashed line seen from the side, with z
+running down (bottom). Bilayers are dark rings, the gold beads dark discs,
+and the filaments straight rods, with the protein fill packed around them.
+In the side view the two bilayers on the dashed line run into the slab's
+top face.
+///
 
 ## What you'll usually tune
 
-- **Box size** — `target_shape` (Z, Y, X voxels) and `v_size` (Å/voxel).
-- **Protein species** — `[[targets]]` (exact `n_copies` each, always
+- **Box size**: `target_shape` (Z, Y, X voxels) and `voxel_size` (Å/voxel).
+- **Protein species**: `[[targets]]` (exact `n_copies` each, always
   exported to picks) and `[[filler]]`/`filler_from_pei2016`/
   `filler_from_cryoetsim` (packed around targets up to
-  `filler_occupancy_fraction`, excluded from picks by default). See
+  `filler_occupancy_fraction`, also exported to picks by default). See
   [Placement order & regions](#placement-order-regions) below.
-- **Membranes** — `[[membrane]]` entries: `shape_backend`
+- **Membranes**: `[[membrane]]` entries: `shape_backend`
   (`spherical_harmonics` or `swept_spline`), size ranges
-  (`sh_axes_range_a`/`swept_total_length_range_a`/etc., omit for realistic
-  auto-sizing), and `n_instances` for multiple independently-placed copies
+  (`sh_axes_range`/`swept_total_length_range`/etc., omit for realistic
+  auto-sizing), and `n_copies` for multiple independently-placed copies
   of one template.
-- **Filaments** — `actin` (quick built-in F-actin preset) or hand-written
-  `[[filaments]]` entries for other species (e.g. microtubules).
-- **Gold fiducial beads** — `[[beads]]` entries (`radius`, `count`), one per
-  bead radius population. Placed avoiding the membrane shell and already-
-  placed filaments; not region-gated to cytosol/lumen.
-- **Carbon support film** — at most one `[[grid]]` table
-  (`hole_radius`/`edge_fraction`/`edge_side`/etc.). Painted into the volume
-  before anything else is placed.
+- **Filaments**: `actin` (quick built-in F-actin preset) or hand-written
+  `[[filaments]]` entries for other single-strand species.
+- **Microtubules**: `[[microtubules]]` entries: real 13-protofilament tubes
+  with a lumen and an A-lattice seam (`n_protofilaments`, `n_copies`,
+  `length`, `bend_radius`). These aren't filaments: a `[[filaments]]` entry
+  with a tubulin dimer gives a single protofilament, not a full tube.
+- **Gold fiducial beads**: `[[beads]]` entries (`radius`, `n_copies`), one per
+  population; `radius` takes a single number or a `[low, high]` pair drawn per
+  bead. The top-level `bead_roughness` (default `0.12`) sets how irregular each
+  bead's boundary is, as an RMS fraction of its radius; it also takes a single
+  number or a `[low, high]` pair drawn per bead, and `0.0` gives clean spheres. Beads avoid the membrane shell and already-placed
+  filaments/microtubules, but aren't
+  region-gated to cytosol/lumen. All beads go into one `gold-bead` pick
+  file regardless of size.
+- **Carbon support film**: at most one `[[carbon_film]]` table
+  (`hole_radius`/`edge_fraction`/`edge_side`/etc.), painted into the volume
+  before anything else.
 
-Everything else — picks/segmentation toggles, compute/scaling knobs, output
-naming — lives under its own panel in `specter build tomogram --help`.
+Everything else (picks/segmentation toggles, compute/scaling knobs, output
+naming) lives under its own panel in the
+[command reference](../api/cli/build.md#specter-build-tomogram).
 
 ## Placement order & regions
 
-Generation always proceeds carbon film → membranes → filaments → gold
-fiducial beads → protein fill; each stage avoids the placements of the ones
-before it (the carbon film is the one exception — placement is not carbon-
-aware, matching the CryoTomoSim algorithm this feature was ported from; see
-`MembraneTomogramGenerator`'s own docstring). Within the protein-fill stage,
-species are placed in two priority tiers, independently per region:
+Every run places components in this order: carbon film → membranes →
+filaments → gold fiducial beads → protein fill. Each stage avoids what
+came before it, except the carbon film: its placement isn't carbon-aware
+(see `TomogramSpecimenGenerator`'s own docstring). Within the
+protein-fill stage, species land in two priority tiers, independently
+per region:
 
-1. **`[[targets]]`** — placed first, each at an exact `n_copies` instance
+1. **`[[targets]]`**: placed first, each at an exact `n_copies` instance
    count. This is the annotated ground truth, always exported to picks.
-2. **`[[filler]]`** (plus `filler_from_pei2016`/`filler_from_cryoetsim`) —
-   placed second, packed around the already-placed targets until
-   `filler_occupancy_fraction` (a bare-sphere volume fraction, per region)
-   is reached or the packing jams — whichever comes first, so this rarely
-   needs hand-tuning. Excluded from picks by default (`write_picks` still
-   controls this; see the CLI help for the exact rule).
+2. **`[[filler]]`** (plus `filler_from_pei2016`/`filler_from_cryoetsim`):
+   placed second, packed around the already-placed targets until it
+   reaches `filler_occupancy_fraction` (a fraction of real footprint
+   volume, per region) or the packing jams, whichever comes first, so you rarely need
+   to hand-tune it. Filler is exported to picks by default, alongside the
+   targets. A species declared both as a target and as filler, in the same
+   location, writes its filler instances to a separate `-filler`-suffixed
+   pick file, so the target file holds only the exact-count instances.
+   `write_picks = false` turns off pick export entirely.
 
 `location = "cytosol"` (default) or `"lumen"` on a `targets`/`filler` entry
-only matters when a `[[membrane]]` is present — without one, the whole box
+only matters when a `[[membrane]]` is present. Without one, the whole box
 is "cytosol." `filler_from_pei2016`/`filler_from_cryoetsim` pull from
 bundled reference tables (Pei et al. 2016 generic crowding, and the
-CryoETSim dataset table respectively) instead of hand-listing PDB codes;
-both are additive and can be combined with each other and with hand-written
-`[[filler]]` entries.
+CryoETSim dataset table of Stojanovska et al. 2025 respectively; see
+[Regions & protein packing](../concepts/cryoet-specimen/packing.md#filler-reference-tables)
+for both) instead of hand-listing PDB codes; both are additive
+and can be combined with each other and with hand-written `[[filler]]`
+entries.
+
+A `"lumen"` entry needs an organelle that actually encloses one. Membrane
+sizes are constrained by the thinnest box axis, not the widest: an
+organelle wider than the slab is cut open where it meets the z walls, and
+an open shape has no interior for the region classifier to find. A
+`[[membrane]]` population sized against the field of view rather than
+against `target_shape[0] * voxel_size` therefore leaves the lumen region
+empty or near-empty, and every species declared for it is dropped with a
+warning naming the region's free voxel count. Keeping the widest
+organelle to roughly two thirds of the slab thickness makes an enclosed
+interior the normal outcome. It is not a guarantee: placement remains
+random and clipping remains permitted, so an occasional draw still
+encloses little or nothing. Omitting the size ranges does not solve this
+on its own, since the automatic cap measures the widest axis whenever
+`clip_axes` permits clipping on all three, clipping being a legitimate
+outcome for a lamella. Set `seed` when a run has to reproduce a specimen
+whose lumen you have already checked.
+
+## Scattering factors & hydrogens
+
+Two fields choose the atomic scattering factors, split by material:
+
+- **`scattering_factors`** (default `shtyrov`) applies to biomolecules:
+  targets, filler, filaments, microtubules and transmembrane proteins.
+  Shtyrov factors are fitted per bonded species (Shtyrov et al. 2026), so
+  they need each structure's bond topology. A `[[membrane]]` table that names its own
+  `parameterization` overrides this field for that population.
+- **`bulk_scattering_factors`** (default `kirkland`; Kirkland 2010) applies
+  to the carbon film and the gold fiducial beads. Shtyrov factors are fitted for
+  biomolecules over a limited spatial-frequency range, and bulk materials
+  lie outside that domain.
+
+Under `shtyrov`, many bonded species name a hydrogen neighbour, so atom
+typing depends on hydrogens being present. A hydrogen-free deposition types
+completely only when a Monomer Library is available, through
+`monomer_library_path` or the `$CLIBD_MON` environment variable; without one,
+roughly 44% of a hydrogen-free protein falls back to per-element Peng
+factors (Peng et al. 1996). `readd_hydrogens` controls what the library does: `"auto"`
+(default) keeps hydrogens a file already carries and adds them only to a
+structure that has none, `true` always re-adds them from ideal geometry, and
+`false` adds no hydrogen density while still using the library for typing.
+See [Installation](../installation.md#monomer-library-for-shtyrov-scattering-factors)
+for obtaining the library.
 
 ## Compute & scaling flags
 
-For anything past a small smoke-test box, rendering dozens of species and
-packing hundreds of filler instances can be slow or OOM — which is why
+Rendering dozens of species and packing hundreds of filler instances can
+be slow or run out of memory past a small smoke-test box, so
 `configs/tomogram.toml` already sets `render_workers = "auto"`,
-`accumulator_device = "auto"`, and `chunk_size = 64`. Most runs can just
-keep those `"auto"` defaults rather than hand-tuning:
+`accumulator_device = "auto"`, and `render_chunk_size = 64`. Keep those
+`"auto"` defaults for most runs rather than hand-tuning them:
 
-- **`render_workers`** — how many PDB species render/fetch concurrently.
+- **`device`**: `cpu | cuda | cuda:0 | 0,1,2`. A comma-separated
+  list of GPU indices pools those GPUs for
+  concurrent per-species rendering instead of a single device; the first
+  entry becomes the primary device for everything else (packing itself
+  always runs on CPU regardless).
+- **`render_workers`**: how many PDB species render/fetch concurrently.
   `"auto"` picks `min(n_species, 8)`, the measured sweet spot from a
-  production-scale sweep (TOML/Python config only — the `--render_workers`
-  CLI flag stays integer-only).
-- **`render_devices`** — an optional device pool (e.g. `["cuda:0",
-  "cuda:1"]`) to round-robin those concurrent species across on a
-  multi-GPU machine; `"auto"` uses every visible GPU.
-- **`accumulator_device`** — device for the shared canvas tensors,
+  production-scale sweep (TOML/Python config only; the `--render_workers`
+  CLI flag stays integer-only). The sweep found device choice barely
+  matters at this worker count.
+- **`accumulator_device`**: device for the shared canvas tensors,
   decoupled from `device` (which stays the compute device regardless).
   `"auto"` estimates the canvas' memory footprint and falls back to CPU
-  RAM if it wouldn't fit half of `device`'s free VRAM — useful once a
-  large field of view at fine `v_size` needs tens of GB.
-- **`chunk_size`** — instances rotated per GPU batch for a single species.
+  RAM if it wouldn't fit half of `device`'s free VRAM, useful once a
+  large field of view at fine `voxel_size` needs tens of GB.
+- **`render_chunk_size`**: instances rotated per GPU batch for a single species.
   Only matters once a filler species' instance count reaches the hundreds
-  (a single unchunked batch has been measured at 8+ GB); leave unset for
+  (a single unchunked batch can reach 8+ GB); leave unset for
   small runs.
 
-If you do need to reason about these directly, `configs/tomogram.toml`'s
-comments walk through the concrete OOM numbers that motivated each default.
+The CLI releases each membrane's dense geometry field after generating its
+density and transmembrane proteins. Python callers can retain those fields
+for inspection: `TomogramSpecimenGenerator` defaults to
+`retain_membrane_fields=True`. The [full shipped-config comparison](../assets/tomogram-memory/report.md)
+includes GPU memory measurements, output checks and Fourier figures.
 
 ## Benchmarks: resolution vs. time and memory
 
-To give a concrete feel for how `v_size` trades off against runtime and
-memory, a specimen was built at `configs/tomogram.toml`'s own
+To see how `voxel_size` trades off against runtime and memory, this
+benchmark builds a specimen at `configs/tomogram.toml`'s own
 **production-scale field of view** (1500 × 6000 × 6000 Å) at three voxel
 sizes, so only the voxel grid resolution changes between runs, not the
 physical amount of specimen content. The specimen itself: one
 `spherical_harmonics` membrane, target species `1bxn` × 20, and
 `filler_from_pei2016` (20 species sharing a 0.5 occupancy-fraction budget,
-same filler approach as the canonical config) — a single hand-picked
-filler species was tried first and rejected, since at this box size it
+same filler approach as the canonical config). A single hand-picked
+filler species came first, then got rejected: at this box size it
 packed ~109,000 instances of that one small species to hit occupancy,
-both unrepresentative of real configs and, at v_size=2, dominated by
+unrepresentative of real configs and, at voxel_size=2, dominated by
 per-instance rendering cost:
 
-![Same field of view rendered at v_size = 10, 5, and 2 Å/voxel — a sum Z projection of each output volume, showing the same membrane and densely crowded protein layout at increasing voxel resolution.](../assets/images/tomogram-benchmark-projections.png){ width="900" style="display:block;margin:1.2em auto;" }
+![Same field of view rendered at voxel_size = 10, 5, and 2 Å/voxel: a sum Z projection of each output volume, showing the same membrane and densely crowded protein layout at increasing voxel resolution.](../assets/images/tomogram-benchmark-projections.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+Same field of view rendered at voxel_size = 10, 5, and 2 Å/voxel: a sum Z projection of each output volume, showing the same membrane and densely crowded protein layout at increasing voxel resolution.
+///
 
-| `v_size` (Å/voxel) | Shape (Z, Y, X voxels) | Wall time | GPU peak (allocated) | RAM peak |
+| `voxel_size` (Å/voxel) | Shape (Z, Y, X voxels) | Wall time | GPU peak | RAM peak |
 |---|---|---|---|---|
-| 10 | 150 × 600 × 600 | 118 s | 3.40 GB | 12.81 GB |
-| 5  | 300 × 1200 × 1200 | 94 s | 9.94 GB | 6.13 GB |
-| 2  | 750 × 3000 × 3000 (~6.75B voxels) | 344 s (5m 44s) | 6.51 GB | 154.04 GB |
+| 10 | 150 × 600 × 600 | 33 s | 2.73 GB | 10.21 GB |
+| 5  | 300 × 1200 × 1200 | 31 s | 9.97 GB | 5.83 GB |
+| 2  | 750 × 3000 × 3000 (~6.75B voxels) | 303 s (5m 03s) | 9.29 GB | 143.28 GB |
 
-The numbers don't move in a clean monotonic line at 10→5 Å — wall time and
-RAM both bounce around within roughly a factor of 2, since at this scale
-species fetch/render/packing overhead (fixed per-run, not per-voxel)
-dominates over the canvas itself. What's unambiguous is the step change at
-2 Å: wall time roughly triples versus 5 Å, and RAM jumps to **154 GB**.
+10 Å and 5 Å come out level with each other, because at that scale a run is
+dominated by per-run species fetch/render/packing overhead rather than by
+the canvas. The step change at 2 Å is unambiguous: wall time is 10× the
+5 Å figure, and RAM jumps to **143 GB**.
 That RAM spike is `accumulator_device="auto"` doing exactly what [Compute &
-scaling flags](#compute-scaling-flags) above says it does — at ~6.75
+scaling flags](#compute-scaling-flags) above says it does: at ~6.75
 billion voxels the density volume alone is ~27 GB, comfortably past half
 of this GPU's free VRAM, so the shared canvas tensors get pushed to system
-RAM instead of failing with a CUDA OOM. That's also why **GPU peak
-actually drops** from 5 Å (9.94 GB) to 2 Å (6.51 GB): the single biggest
+RAM instead of failing with a CUDA OOM. That's also why **GPU peak barely
+grows** from 5 Å to 2 Å despite a 15× bigger canvas: the single biggest
 consumer (the canvas) has moved off the GPU entirely, leaving only
-per-instance rendering buffers behind. Take the exact numbers with a grain
-of salt — one run on one machine, not a statistically averaged sweep — but
-the *shape* (noisy at coarse resolution, a sharp RAM/time step once the
+per-instance rendering buffers and the membrane distance transform behind.
+
+Where the 2 Å run's time goes is worth knowing before optimizing against
+it. The membrane phase is 13 s, and the cytosol species phase, which packs
+and renders 22,910 instances, is 2m 35s: 5 s to pack the targets, 13 s to
+pack the filler, and 1m 16s to render it. Writing the finished 27 GB volume
+is the remaining ~2m. All 21 structures load in **0 s**, because the parsed
+structures are already cached on disk; a cold cache adds the download and a
+one-time parse (see [Structure cache](cache.md)).
+
+That balance is recent. Handing a volume to `mrcfile.set_data` makes it
+fill the MRC header's `rms` field with a `numpy` variance over every
+voxel, which allocates a full-size temporary to do it -- profiled at 262 s
+and half the run's wall clock, against ~31 s for writing the bytes.
+Accumulating the header statistics slab-wise instead removed both the pass
+and the temporary. Interleaved back-to-back runs put the difference at
+1063 s against 345 s, and the timing became repeatable in the process: the
+two runs without the whole-volume variance agree to 2 s, while the two
+with it differ by 188 s, since the cost of a 27 GB temporary depends on
+what else is resident at the time.
+Take the exact numbers with a grain
+of salt (one run on one machine, not a statistically averaged sweep), but
+the *shape* (flat at coarse resolution, a sharp RAM/time step once the
 canvas stops fitting in VRAM) is the useful, likely-to-generalize part.
 
-**Hardware**: single NVIDIA L40 (46 GB VRAM, `device="cuda:3"`,
-`accumulator_device="auto"`, `render_workers="auto"`, `chunk_size=64`), on
-a host with an AMD EPYC 7763 64-Core Processor (128 threads) and 503 GB
-system RAM. Wall time is the `run_build_tomogram()` call only (a one-time
-CUDA context init immediately before it is excluded, since it's a constant
-~1-2s regardless of resolution); GPU peak is
-`torch.cuda.max_memory_allocated()`; RAM peak is `/usr/bin/time -v`'s
+Colliding real molecular footprints is cheap at this scale. At 5 Å the
+packer places 19,249 filler instances to 37.7% occupancy in 6 s, and
+rendering them takes 7 s, of a 31 s run. Rendering is dominated by
+per-species template construction and barely moves with instance count.
+
+That is not the obvious outcome, because at realistic density RSA rejects
+~99.8% of attempts, and a rejection that tests a candidate's entire
+footprint against the grid makes the reject path the whole cost. The
+packer instead rejects on a sparse sample of footprint voxels first, which
+is exact rather than approximate: a sampled voxel is a footprint voxel, so
+finding it occupied is a genuine clash. Only a candidate that survives the
+sample pays for the full comparison.
+
+At 2 Å the collision grid would reach ~6.75 billion voxels, past the budget
+`packing_voxel_size` enforces, so packing runs on a 4 Å grid while
+rendering stays at 2 Å. This is automatic and needs no configuration. It
+costs some packing density, since a coarser grid represents each molecule
+slightly more crudely, and it is what allows a fine `voxel_size` to remain
+tractable at all: colliding natively at 1 Å over this field of view would
+require a 36 GB occupancy grid.
+
+At 2 Å you will also see a warning that the membrane is being generated on
+a coarser grid and upsampled. That is deliberate: resolving the bilayer
+directly at this voxel size would need ~125M working-grid voxels, past the
+memory one field generation is allowed to cost, so it builds at ~100M and
+upsamples instead. The membrane's physical size and position are preserved
+exactly; only its bilayer sub-structure is resolved less crisply. The
+budget behind that switch is fixed (identical on every machine, so the same
+config produces the same specimen anywhere) and sized so one field
+generation fits an 8 GB card and a 16 GB host; it is not something you
+configure. If you want a crisper membrane, use a coarser `voxel_size` or a
+smaller field of view.
+
+**Hardware**: single NVIDIA L40 (46 GB VRAM, one idle card selected via
+`SPECTER_BENCHMARK_DEVICE` (`cuda:3` for this run), with the host otherwise
+close to idle (load average 3 of 128 threads at the start of the sweep), `accumulator_device="auto"`,
+`render_workers="auto"`, `render_chunk_size=64`), with CuPy 14.1 (a core
+dependency, see [Installation](../installation.md)), on a host with an AMD EPYC 7763 64-Core Processor (128
+threads) and 503 GB system RAM. Wall time is the `run_build_tomogram()`
+call only (a one-time CUDA context init immediately before it is excluded,
+since it's a constant ~1-2s regardless of resolution); GPU peak is
+`torch.cuda.max_memory_allocated()` **plus** CuPy's own pool (the membrane
+distance transform allocates outside torch's allocator, so torch's counter
+alone understates it by 1.7-3.6 GB here); RAM peak is `/usr/bin/time -v`'s
 "Maximum resident set size" for the whole process, each resolution run in
-its own fresh subprocess so peaks don't carry over between runs. Picks and
-segmentation output were disabled for these runs specifically (at
-v_size=2, those label volumes alone would add ~40 GB of writes on top of
-the ~27 GB density volume — real runs at this scale should budget disk
+its own fresh subprocess so peaks don't carry over between runs. These
+benchmark runs turn off picks and segmentation output (at voxel_size=2,
+those label volumes alone would add ~40 GB of writes on top of
+the ~27 GB density volume; real runs at this scale should budget disk
 space accordingly). Reproduce with
 [`docs-figures/build_tomogram_benchmark.py`](https://github.com/joelyeois/specter/blob/main/docs-figures/build_tomogram_benchmark.py)
-(writes its scratch output outside the repo — the 2 Å volume alone is
+(writes its scratch output outside the repo; the 2 Å volume alone is
 larger than many systems' per-user home-directory quota).
 
 ## Output: picks & segmentation
 
 Alongside `{filename}.mrc`, by default you get:
 
-- **Picks** (`write_picks`) — one copick-style
-  `{species}-{annotation_version}_orientedpoint.ndjson` file per species.
-- **Segmentation** (`write_segmentation`) —
+- **Picks** (`write_picks`): one copick-style
+  `{species}-{annotation_version}_orientedpoint.ndjson` file per species,
+  filler included (see [Placement order & regions](#placement-order-regions)).
+  Each pick's `xyz_rotation_matrix` is the rotation the template was given,
+  in xyz: the template's coordinates turned by it about the template's
+  centre reproduce the copy at that location. A transmembrane protein's
+  matrix maps the template's membrane axis (+z) onto the outward membrane
+  normal.
+- **Segmentation** (`write_segmentation`):
   `{filename}_protein_labels.mrc` (always), plus
   `{filename}_membrane_labels.mrc` and `{filename}_regions.mrc`
-  (`0=cytosol`/`1=shell`/`2=lumen`) when a `[[membrane]]` is set. This is
-  the intended ground truth for membrane geometry specifically — a
+  (`0=cytosol`/`1=shell`/`2=lumen`/`3=carbon film`) when a `[[membrane]]`
+  is set. This is the intended ground truth for membrane geometry: a
   membrane surface has no single natural "position" the way a protein
   does, so it isn't represented in the picks files.
+
+The run in [Basic usage](#basic-usage) wrote these files, with picks for
+every species:
+
+```{ .text .output }
+--8<-- "docs-includes/cli-guides/build_tomogram-files.txt"
+--8<-- "docs-includes/cli-guides/build_tomogram-labels.txt"
+```
+
+![The three segmentation volumes on one slice.](../assets/images/cli-guides/build_tomogram-labels.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+The three label volumes on the slice shown above: 1939 protein instances,
+each in its own colour; the four bilayers this slice cuts; and the region
+classes. None of this draw's membranes encloses a sealed compartment, so
+their interiors are classified as cytosol and the lumen class rounds to
+0.00% of the volume. The carbon film, class 3, does not reach this slice.
+///
+
+`protein_labels` holds every protein instance on one id counter,
+transmembrane proteins included; `membrane_labels` holds the bilayer they
+are embedded in. The two partition the membrane rather than double-claiming
+it: a voxel where a transmembrane protein displaced the lipid carries that
+protein's id and is absent from the bilayer label, using the same
+displacement boundary the density model itself applies (see
+`MembraneGenerator.transmembrane_occupancy_fraction`). Nothing is claimed by
+both, so a per-class target can be built by union and a single-label atlas
+by whatever priority you prefer. Neither reduction is written for you: the
+volumes are kept separate because an exclusive atlas cannot be turned back
+into overlapping masks, while the reverse is trivial.
+
+## Job tracking
+
+By default a run writes into `output_dir` as a flat directory. Setting
+`--project` or `--job_id` routes the output through `specter.jobs` instead:
+the run lands in `output_dir/[project/]tomograms/J00N/`, numbered, with a
+`job.json` recording the full parameter set and git commit. When this
+config is chained into `specter simulate tiltseries` via
+`--tomogram_config`, leaving both fields unset here while tracking the tilt
+series run passes that run's project down to the tomogram. See
+[Manage jobs](jobs.md) for the directory layout and the `specter jobs`
+commands.
 
 ## Multiple tomograms
 
 `--n_tomograms` generates several independent tomograms in one run. Beyond
-the first, each is written into its own numbered subdirectory of
-`output_dir` (`0001/`, `0002/`, ...) and, if `seed`/`--seed` is set, gets
-its own incrementing seed — so runs don't collide but stay reproducible.
+the first, each lands in its own numbered subdirectory of
+`output_dir` (`0001/`, `0002/`, ...) and, if you set `seed`/`--seed`, gets
+its own incrementing seed, so runs don't collide but stay reproducible.
 
 ## Using it from Python instead of the CLI
 
 `run_build_tomogram(config)` (`specter.pipelines`) is the same function the
-CLI calls — build a `TomogramConfig` directly in Python (or load one with
+CLI calls. Build a `TomogramConfig` directly in Python (or load one with
 `specter.config.load_config`) instead of going through the command line.
 
 ## See also
 
-- [`configs/tomogram.toml`](https://github.com/joelyeois/specter/tree/main/configs) —
+- [`configs/tomogram.toml`](https://github.com/joelyeois/specter/tree/main/configs):
   the canonical, heavily-commented example config.
-- [Specimens](../concepts/specimens.md) — how cryo-ET specimen assembly
-  differs from single-particle.
-- [Membrane shape](../concepts/membrane-shape/index.md) — the
+- [Cryo-ET specimen assembly](../concepts/cryoet-specimen/index.md): what
+  each component is and how the pieces are composited, with a page per
+  component ([membranes](../concepts/cryoet-specimen/bilayer.md),
+  [filaments](../concepts/cryoet-specimen/filaments.md),
+  [beads](../concepts/cryoet-specimen/beads.md),
+  [carbon film](../concepts/cryoet-specimen/carbon-film.md),
+  [regions & packing](../concepts/cryoet-specimen/packing.md)).
+- [Membrane shape](../concepts/membrane-shape/index.md): the
   `spherical_harmonics`/`swept_spline` geometry backends.
-- [Generate a tilt series](tilt-series.md) — imaging the volume this page
+- [Generate a tilt series](tilt-series.md): imaging the volume this page
   builds.
-- [Configure a run](configuration.md) — general TOML/CLI field reference
+- [Configure a run](configuration.md): general TOML/CLI field reference
   conventions shared across all `specter` commands.
+
+## References
+
+- Ermel, U. H., Schwartz, J., Zhao, Z., Ji, D., Peck, A., Yu, Y.,
+  Paraan, M., Carragher, B., Frangakis, A. S., & Harrington, K. I. S.
+  (2026). copick: An open dataset interface and toolkit for collaborative
+  annotation and analysis of cryo-electron tomography data. *Protein
+  Science*, 35(5), e70578.
+  [doi:10.1002/pro.70578](https://doi.org/10.1002/pro.70578)
+- Kirkland, E. J. (2010). *Advanced computing in electron microscopy*
+  (2nd ed.). Springer.
+  [doi:10.1007/978-1-4419-6533-2](https://doi.org/10.1007/978-1-4419-6533-2)
+- Pei, L., Xu, M., Frazier, Z., & Alber, F. (2016). Simulating cryo
+  electron tomograms of crowded cell cytoplasm for assessment of automated
+  particle picking. *BMC Bioinformatics*, 17(1), 405.
+  [doi:10.1186/s12859-016-1283-3](https://doi.org/10.1186/s12859-016-1283-3)
+- Peng, L.-M., Ren, G., Dudarev, S. L., & Whelan, M. J. (1996). Robust
+  parameterization of elastic and absorptive electron atomic scattering
+  factors. *Acta Crystallographica Section A*, 52(2), 257–276.
+  [doi:10.1107/S0108767395014371](https://doi.org/10.1107/S0108767395014371)
+- Shtyrov, A., Wilson, H., Slowik, D., Yamashita, K., Li, J., Wojdyr, M.,
+  et al. (2026). Measurement of atomic scattering factors by cryoelectron
+  microscopy. *Proceedings of the National Academy of Sciences*, 123(19),
+  e2528758123.
+  [doi:10.1073/pnas.2528758123](https://doi.org/10.1073/pnas.2528758123)
+- Stojanovska, F., Sanchez, R. M., Jensen, R. K., Mahamid, J., Kreshuk, A.,
+  & Zaugg, J. B. (2025). CryoSiam: self-supervised representation learning
+  for automated analysis of cryo-electron tomograms. *bioRxiv*.
+  [doi:10.1101/2025.11.11.687379](https://doi.org/10.1101/2025.11.11.687379)

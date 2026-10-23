@@ -1,7 +1,13 @@
+"""
+Plotting helpers: volumes, slices, particle stacks, radial distributions
+and FSC curves with their resolution readouts.
+"""
+
 from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 import matplotlib.axes
 import matplotlib.figure
@@ -43,7 +49,7 @@ def _despine(ax: matplotlib.axes.Axes, offset: float = 0) -> None:
 
 
 def plot3d(
-    vol: torch.Tensor,
+    volume: torch.Tensor,
     title: str | None = None,
     vmin: float | None = None,
     vmax: float | None = None,
@@ -55,7 +61,7 @@ def plot3d(
 
     Parameters
     ----------
-    vol : torch.Tensor
+    volume : torch.Tensor
         3D volume tensor.
     title : str or None, optional
         Super title for the plot.
@@ -78,7 +84,7 @@ def plot3d(
     """
     fig, axes = plt.subplots(1, 3, dpi=200, constrained_layout=True, figsize=(8, 3.6))
     for i, ax in enumerate(axes.ravel()):
-        im = ax.imshow(vol.sum(i), vmin=vmin, vmax=vmax, cmap=cmap)
+        im = ax.imshow(volume.sum(i), vmin=vmin, vmax=vmax, cmap=cmap)
         ax.set(xticks=[], yticks=[], title=f"projection along axis {i}")
         fig.colorbar(im, ax=ax, location="bottom")
     if title is not None:
@@ -101,13 +107,13 @@ try:
             self.every_n_steps = every_n_steps
             self._display_handle = None
 
-        def _plot_volume(self, pl_module, title):
-            vol = pl_module.V.data.detach().cpu().float()
+        def _plot_volume(self, pl_module: L.LightningModule, title: str) -> None:
+            volume = pl_module.V.data.detach().cpu().float()
             fig, axes = plt.subplots(
                 1, 3, dpi=200, constrained_layout=True, figsize=(8, 3.6)
             )
             for i, ax in enumerate(axes.ravel()):
-                im = ax.imshow(vol.sum(i), cmap="bone")
+                im = ax.imshow(volume.sum(i), cmap="bone")
                 ax.set(xticks=[], yticks=[], title=f"projection along axis {i}")
                 fig.colorbar(im, ax=ax, location="bottom")
             plt.suptitle(title, fontsize=15)
@@ -117,7 +123,14 @@ try:
                 self._display_handle.update(fig)
             plt.close(fig)
 
-        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        def on_train_batch_end(
+            self,
+            trainer: L.Trainer,
+            pl_module: L.LightningModule,
+            outputs: Any,
+            batch: Any,
+            batch_idx: int,
+        ) -> None:
             # Rank-0-only under multi-GPU (DDP): pl_module.V is already
             # identical across replicas (DDP gradient all-reduce every
             # step), so every rank would otherwise plot/display redundantly.
@@ -132,7 +145,13 @@ try:
             )
             self._plot_volume(pl_module, title=f"Step {trainer.global_step} / {total}")
 
-        def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        def on_train_batch_start(
+            self,
+            trainer: L.Trainer,
+            pl_module: L.LightningModule,
+            batch: Any,
+            batch_idx: int,
+        ) -> None:
             if not trainer.is_global_zero:
                 return
             # Plot after the previous epoch's symmetry has been applied
@@ -147,7 +166,9 @@ try:
                     title=f"Epoch {trainer.current_epoch} (Step {trainer.global_step} / {total})",
                 )
 
-        def on_train_end(self, trainer, pl_module):
+        def on_train_end(
+            self, trainer: L.Trainer, pl_module: L.LightningModule
+        ) -> None:
             if not trainer.is_global_zero:
                 return
             # Plot the final epoch after symmetry
@@ -166,7 +187,7 @@ except ImportError:
 
 
 def plot_slices(
-    vol: torch.Tensor,
+    volume: torch.Tensor,
     start_idx: int = 0,
     end_idx: int | None = None,
     axis: int = 0,
@@ -179,7 +200,7 @@ def plot_slices(
 
     Parameters
     ----------
-    vol : torch.Tensor
+    volume : torch.Tensor
         3D volume tensor.
     start_idx : int, optional
         Starting slice index. Default 0.
@@ -195,7 +216,7 @@ def plot_slices(
         Maximum value for colormap.
     """
     nslices = 5
-    sh = vol.shape
+    sh = volume.shape
     if end_idx is None:
         end_idx = sh[axis] - 1
     indices = torch.linspace(start_idx, end_idx, nslices).type(torch.int)
@@ -204,11 +225,11 @@ def plot_slices(
     for ax, i in zip(axes.ravel(), indices):
         ax.set(xticks=[], yticks=[])
         if axis == 0:
-            im = ax.imshow(vol[i, :, :], vmin=vmin, vmax=vmax)
+            im = ax.imshow(volume[i, :, :], vmin=vmin, vmax=vmax)
         elif axis == 1:
-            im = ax.imshow(vol[:, i, :], vmin=vmin, vmax=vmax)
+            im = ax.imshow(volume[:, i, :], vmin=vmin, vmax=vmax)
         elif axis == 2:
-            im = ax.imshow(vol[:, :, i], vmin=vmin, vmax=vmax)
+            im = ax.imshow(volume[:, :, i], vmin=vmin, vmax=vmax)
         ax.set_title(f"Slice {i}")
         fig.colorbar(im, ax=ax, location="bottom")
 
@@ -300,9 +321,9 @@ def plot_particle_stack(
     images : torch.Tensor
         Stack of images, shape (N, H, W).
     pixel_size : float
-        Pixel size in Angstroms.
+        Pixel size in Å.
     defocus_values : torch.Tensor or None, optional
-        Defocus values in Angstroms, shape (N,). Default is None.
+        Defocus values in Å, shape (N,). Default is None.
     max_images : int, optional
         Maximum number of images to display. Default is 5.
     """
@@ -395,8 +416,112 @@ def plot_particle_stack(
     plt.show()
 
 
+#: Gold-standard half-map FSC threshold (two independent half-set reconstructions;
+#: Rosenthal & Henderson 2003).
+HALFMAP_FSC_THRESHOLD = 0.143
+#: Map-to-model FSC threshold (a reconstruction against a known reference): the
+#: correlation with a perfect reference that a half-map FSC of 0.143 corresponds
+#: to (Rosenthal & Henderson 2003).
+MAP_TO_MODEL_FSC_THRESHOLD = 0.5
+
+
+def fsc_resolution(
+    k: torch.Tensor,
+    fsc: torch.Tensor,
+    threshold: float,
+    k_max: float | None = None,
+) -> str:
+    """
+    Resolution at the first FSC threshold crossing, linearly interpolated.
+
+    The *first* crossing, as RELION and CryoSPARC report it. A masked FSC
+    rises again toward Nyquist when both maps share the mask, because the
+    mask correlates their noise; reading the last crossing then reports that
+    artefact as resolution (1.79 A against a true ~1.91 A on EMPIAR-13203).
+
+    Parameters
+    ----------
+    k : torch.Tensor
+        Spatial frequencies (1/Å), one per shell.
+    fsc : torch.Tensor
+        FSC value per shell, same length as ``k``.
+    threshold : float
+        Crossing to interpolate -- `HALFMAP_FSC_THRESHOLD` for two half-sets,
+        `MAP_TO_MODEL_FSC_THRESHOLD` against a known reference.
+    k_max : float, optional
+        Ignore shells above this frequency (pass the Nyquist frequency to stop
+        a crossing in the aliased tail from being reported as a resolution).
+
+    Returns
+    -------
+    str
+        Resolution formatted as ``"1.397 Å"``, or ``">Nyquist"`` when the FSC
+        never crosses the threshold.
+
+    References
+    ----------
+    .. [1] Rosenthal, P. B., & Henderson, R. (2003). Optimal determination of
+       particle orientation, absolute hand, and contrast loss in
+       single-particle electron cryomicroscopy. *Journal of Molecular
+       Biology*, 333(4), 721–745. https://doi.org/10.1016/j.jmb.2003.07.013
+    """
+    kf = k.cpu().float()
+    ff = fsc.cpu().float()
+    for i in range(len(ff) - 1):
+        if k_max is not None and kf[i] > k_max:
+            break
+        if ff[i] >= threshold > ff[i + 1]:
+            t = (threshold - ff[i]) / (ff[i + 1] - ff[i])
+            k_cross = kf[i] + t * (kf[i + 1] - kf[i])
+            return f"{1.0 / k_cross.item():.3f} Å"
+    return ">Nyquist"
+
+
+def resolution_between(
+    volume_a: torch.Tensor,
+    volume_b: torch.Tensor,
+    voxel_size: float,
+    threshold: float,
+    mask: torch.Tensor | None = None,
+) -> str:
+    """
+    Resolution at an FSC threshold between two volumes, optionally masked.
+
+    The numeric counterpart to `plot_map_to_model_fsc`/`plot_halfmap_fsc`,
+    for callers that want to record a resolution rather than draw one. Those
+    two return only the *unmasked* resolution even when given a mask, so a
+    masked figure and a masked number cannot come from the same call.
+
+    Parameters
+    ----------
+    volume_a, volume_b : torch.Tensor
+        Volumes to correlate, shape ``(Z, Y, X)``. Two half-sets for a
+        gold-standard resolution, or a reconstruction and its reference for
+        map-to-model.
+    voxel_size : float
+        Voxel size in Å.
+    threshold : float
+        `HALFMAP_FSC_THRESHOLD` for two half-sets, `MAP_TO_MODEL_FSC_THRESHOLD`
+        against a known reference.
+    mask : torch.Tensor, optional
+        Applied to both volumes before correlation. None correlates them as-is.
+
+    Returns
+    -------
+    str
+        Resolution formatted as ``"1.397 Å"``, or ``">Nyquist"``.
+    """
+    a = volume_a.detach().cpu().float()
+    b = volume_b.detach().cpu().float()
+    if mask is not None:
+        m = mask.detach().cpu().float()
+        a, b = a * m, b * m
+    k, fsc = fourier_shell_correlation(a, b, pixel_size=voxel_size)
+    return fsc_resolution(k, fsc, threshold, k_max=1.0 / (2.0 * voxel_size))
+
+
 def plot_map_to_model_fsc(
-    vols: torch.Tensor | list[torch.Tensor],
+    volumes: torch.Tensor | list[torch.Tensor],
     reference: torch.Tensor,
     voxel_size: float,
     mask: torch.Tensor | None = None,
@@ -413,7 +538,7 @@ def plot_map_to_model_fsc(
 
     Parameters
     ----------
-    vols : torch.Tensor or list of torch.Tensor
+    volumes : torch.Tensor or list of torch.Tensor
         Input volumes. Either a ``(B, Z, Y, X)`` batch tensor or a list of
         ``(Z, Y, X)`` tensors.
     reference : torch.Tensor
@@ -425,7 +550,7 @@ def plot_map_to_model_fsc(
         (masked) FSC is computed for each volume by multiplying both the input
         and the reference with the mask before correlation.
     labels : list of str, optional
-        One label per volume. Defaults to ``["vol 0", "vol 1", ...]``.
+        One label per volume. Defaults to ``["volume 0", "volume 1", ...]``.
     show : bool, optional
         Whether to display the figure immediately. Set ``False`` to get the
         figure object back (e.g. for saving to disk). Default is True.
@@ -436,54 +561,51 @@ def plot_map_to_model_fsc(
         ``None`` when ``show=True`` (figure is displayed and closed).
         The figure object when ``show=False``; caller is responsible for
         closing it.
+
+    References
+    ----------
+    .. [1] Rosenthal, P. B., & Henderson, R. (2003). Optimal determination of
+       particle orientation, absolute hand, and contrast loss in
+       single-particle electron cryomicroscopy. *Journal of Molecular
+       Biology*, 333(4), 721–745. https://doi.org/10.1016/j.jmb.2003.07.013
     """
     # Normalise to a flat list of (Z, Y, X) tensors
-    if isinstance(vols, torch.Tensor):
-        vol_list: list[torch.Tensor] = list(vols) if vols.ndim == 4 else [vols]
+    if isinstance(volumes, torch.Tensor):
+        volume_list: list[torch.Tensor] = (
+            list(volumes) if volumes.ndim == 4 else [volumes]
+        )
     else:
-        vol_list = list(vols)
+        volume_list = list(volumes)
 
-    n_vols = len(vol_list)
+    n_volumes = len(volume_list)
     if labels is None:
-        labels = [f"vol {i}" for i in range(n_vols)]
-
-    def _res_at_half(k_arr: torch.Tensor, fsc_arr: torch.Tensor) -> str:
-        """Linearly interpolate the resolution (Å) at the last FSC=0.5 crossing."""
-        kf = k_arr.cpu().float()
-        ff = fsc_arr.cpu().float()
-        last_k_cross: torch.Tensor | None = None
-        for i in range(len(ff) - 1):
-            if ff[i] >= 0.5 > ff[i + 1]:
-                t = (0.5 - ff[i]) / (ff[i + 1] - ff[i])
-                last_k_cross = kf[i] + t * (kf[i + 1] - kf[i])
-        if last_k_cross is not None:
-            return f"{1.0 / last_k_cross.item():.3f} Å"
-        return ">Nyquist"
+        labels = [f"vol {i}" for i in range(n_volumes)]
 
     nyquist = 1.0 / (2.0 * voxel_size)
-    palette = _deep_palette(max(n_vols, 1))
+
+    palette = _deep_palette(max(n_volumes, 1))
 
     fig, ax = plt.subplots(figsize=(7, 4.5), dpi=150)
 
-    for i, (vol, label) in enumerate(zip(vol_list, labels)):
+    for i, (volume, label) in enumerate(zip(volume_list, labels)):
         color = palette[i]
-        vol_f = vol.float()
+        volume_f = volume.float()
         ref_f = reference.float()
 
-        k, fsc = fourier_shell_correlation(vol_f, ref_f, pixelsize=voxel_size)
+        k, fsc = fourier_shell_correlation(volume_f, ref_f, pixel_size=voxel_size)
         ax.plot(
             k.cpu(),
             fsc.cpu(),
             color=color,
             ls="-",
             lw=1.8,
-            label=f"{label} ({_res_at_half(k, fsc)})",
+            label=f"{label} ({fsc_resolution(k, fsc, MAP_TO_MODEL_FSC_THRESHOLD, k_max=nyquist)})",
         )
 
         if mask is not None:
             m = mask.float()
             k_m, fsc_m = fourier_shell_correlation(
-                vol_f * m, ref_f * m, pixelsize=voxel_size
+                volume_f * m, ref_f * m, pixel_size=voxel_size
             )
             ax.plot(
                 k_m.cpu(),
@@ -491,7 +613,7 @@ def plot_map_to_model_fsc(
                 color=color,
                 ls="--",
                 lw=1.8,
-                label=f"{label} masked ({_res_at_half(k_m, fsc_m)})",
+                label=f"{label} masked ({fsc_resolution(k_m, fsc_m, MAP_TO_MODEL_FSC_THRESHOLD, k_max=nyquist)})",
             )
 
     # FSC = 0.5 criterion line
@@ -521,29 +643,30 @@ def plot_map_to_model_fsc(
 
 
 def plot_halfmap_fsc(
-    vols_A: torch.Tensor | list[torch.Tensor],
-    vols_B: torch.Tensor | list[torch.Tensor],
+    volumes_A: torch.Tensor | list[torch.Tensor],
+    volumes_B: torch.Tensor | list[torch.Tensor],
     voxel_size: float,
     mask: torch.Tensor | None = None,
     labels: list[str] | None = None,
     show: bool = True,
-) -> matplotlib.figure.Figure | None:
+) -> tuple[matplotlib.figure.Figure | None, list[str]]:
     """
     Compute and plot half-map Fourier Shell Correlations.
 
-    Each volume in vols_A is correlated against the corresponding volume in vols_B.
+    Each volume in volumes_A is correlated against the corresponding volume in volumes_B.
     When ``mask`` is provided, both an unmasked and a masked FSC are computed for
-    each volume pair. The resolution at FSC = 0.5 is interpolated from each curve
-    and appended to its legend label.
+    each volume pair. The (unmasked) resolution at the gold-standard FSC = 0.143
+    threshold is interpolated from each curve, appended to its legend label, and
+    returned alongside the figure.
 
     Parameters
     ----------
-    vols_A : torch.Tensor or list of torch.Tensor
+    volumes_A : torch.Tensor or list of torch.Tensor
         First set of input volumes. Either a ``(B, Z, Y, X)`` batch tensor or a list of
         ``(Z, Y, X)`` tensors.
-    vols_B : torch.Tensor or list of torch.Tensor
+    volumes_B : torch.Tensor or list of torch.Tensor
         Second set of input volumes. Either a ``(B, Z, Y, X)`` batch tensor or a list of
-        ``(Z, Y, X)`` tensors. Must have the same number of volumes as ``vols_A``.
+        ``(Z, Y, X)`` tensors. Must have the same number of volumes as ``volumes_A``.
     voxel_size : float
         Voxel size in Å. Determines the Nyquist frequency and the x-axis scale.
     mask : torch.Tensor, optional
@@ -558,78 +681,87 @@ def plot_halfmap_fsc(
 
     Returns
     -------
-    matplotlib.figure.Figure or None
+    fig : matplotlib.figure.Figure or None
         ``None`` when ``show=True`` (figure is displayed and closed).
         The figure object when ``show=False``; caller is responsible for
         closing it.
+    resolutions : list of str
+        Unmasked resolution at the FSC=0.143 crossing for each volume pair,
+        e.g. ``"3.201 Å"`` or ``">Nyquist"`` if the curve never drops below
+        0.143 within the Nyquist limit. Same order as ``labels``.
 
     Raises
     ------
     ValueError
-        If the number of volumes in vols_A and vols_B do not match.
+        If the number of volumes in volumes_A and volumes_B do not match.
+
+    References
+    ----------
+    .. [1] Rosenthal, P. B., & Henderson, R. (2003). Optimal determination of
+       particle orientation, absolute hand, and contrast loss in
+       single-particle electron cryomicroscopy. *Journal of Molecular
+       Biology*, 333(4), 721–745. https://doi.org/10.1016/j.jmb.2003.07.013
     """
     # Normalise to flat lists of (Z, Y, X) tensors
-    if isinstance(vols_A, torch.Tensor):
-        vol_list_A: list[torch.Tensor] = list(vols_A) if vols_A.ndim == 4 else [vols_A]
+    if isinstance(volumes_A, torch.Tensor):
+        volume_list_A: list[torch.Tensor] = (
+            list(volumes_A) if volumes_A.ndim == 4 else [volumes_A]
+        )
     else:
-        vol_list_A = list(vols_A)
+        volume_list_A = list(volumes_A)
 
-    if isinstance(vols_B, torch.Tensor):
-        vol_list_B: list[torch.Tensor] = list(vols_B) if vols_B.ndim == 4 else [vols_B]
+    if isinstance(volumes_B, torch.Tensor):
+        volume_list_B: list[torch.Tensor] = (
+            list(volumes_B) if volumes_B.ndim == 4 else [volumes_B]
+        )
     else:
-        vol_list_B = list(vols_B)
+        volume_list_B = list(volumes_B)
 
     # Check that the number of volumes matches
-    if len(vol_list_A) != len(vol_list_B):
+    if len(volume_list_A) != len(volume_list_B):
         raise ValueError(
-            f"Number of volumes in vols_A ({len(vol_list_A)}) must match "
-            f"the number in vols_B ({len(vol_list_B)})"
+            f"Number of volumes in volumes_A ({len(volume_list_A)}) must match "
+            f"the number in volumes_B ({len(volume_list_B)})"
         )
 
-    n_vols = len(vol_list_A)
+    n_volumes = len(volume_list_A)
     if labels is None:
-        labels = [f"pair {i}" for i in range(n_vols)]
+        labels = [f"pair {i}" for i in range(n_volumes)]
 
     nyquist = 1.0 / (2.0 * voxel_size)
 
-    def _res_at_half(k_arr: torch.Tensor, fsc_arr: torch.Tensor) -> str:
-        """Linearly interpolate the resolution (Å) at the last FSC=0.143 crossing up to Nyquist."""
-        kf = k_arr.cpu().float()
-        ff = fsc_arr.cpu().float()
-        last_k_cross: torch.Tensor | None = None
-        for i in range(len(ff) - 1):
-            if kf[i] > nyquist:
-                break
-            if ff[i] >= 0.143 > ff[i + 1]:
-                t = (0.143 - ff[i]) / (ff[i + 1] - ff[i])
-                last_k_cross = kf[i] + t * (kf[i + 1] - kf[i])
-        if last_k_cross is not None:
-            return f"{1.0 / last_k_cross.item():.3f} Å"
-        return ">Nyquist"
-
-    palette = _deep_palette(max(n_vols, 1))
+    palette = _deep_palette(max(n_volumes, 1))
 
     fig, ax = plt.subplots(figsize=(7, 4.5), dpi=150)
+    resolutions: list[str] = []
 
-    for i, (vol_a, vol_b, label) in enumerate(zip(vol_list_A, vol_list_B, labels)):
+    for i, (volume_a, volume_b, label) in enumerate(
+        zip(volume_list_A, volume_list_B, labels)
+    ):
         color = palette[i]
-        vol_a_f = vol_a.float()
-        vol_b_f = vol_b.float()
+        volume_a_f = volume_a.float()
+        volume_b_f = volume_b.float()
 
-        k, fsc = fourier_shell_correlation(vol_a_f, vol_b_f, pixelsize=voxel_size)
+        k, fsc = fourier_shell_correlation(
+            volume_a_f, volume_b_f, pixel_size=voxel_size
+        )
+        resolution = fsc_resolution(k, fsc, HALFMAP_FSC_THRESHOLD, k_max=nyquist)
+        resolutions.append(resolution)
         ax.plot(
             k.cpu(),
             fsc.cpu(),
             color=color,
             ls="-",
             lw=1.8,
-            label=f"{label} ({_res_at_half(k, fsc)})",
+            label=f"{label} ({resolution})",
         )
 
         if mask is not None:
-            m = mask.float()
+            # A reconstructor's fsc_mask is a registered buffer on the GPU,
+            # while half-maps read back from disk are on the CPU.
+            m = mask.detach().to(volume_a_f.device).float()
             k_m, fsc_m = fourier_shell_correlation(
-                vol_a_f * m, vol_b_f * m, pixelsize=voxel_size
+                volume_a_f * m, volume_b_f * m, pixel_size=voxel_size
             )
             ax.plot(
                 k_m.cpu(),
@@ -637,7 +769,7 @@ def plot_halfmap_fsc(
                 color=color,
                 ls="--",
                 lw=1.8,
-                label=f"{label} masked ({_res_at_half(k_m, fsc_m)})",
+                label=f"{label} masked ({fsc_resolution(k_m, fsc_m, HALFMAP_FSC_THRESHOLD, k_max=nyquist)})",
             )
 
     # FSC = 0.143 criterion line
@@ -662,8 +794,8 @@ def plot_halfmap_fsc(
     if show:
         plt.show()
         plt.close(fig)
-        return None
-    return fig
+        return None, resolutions
+    return fig, resolutions
 
 
 def _extract_epoch_number(filename: str) -> int | None:
@@ -673,26 +805,26 @@ def _extract_epoch_number(filename: str) -> int | None:
     Parameters
     ----------
     filename : str
-        Filename like "fsc_001_B.png" or "vol_042_A.png"
+        Filename like "fsc_001_B.png" or "volume_042_A.png"
 
     Returns
     -------
     int or None
         Epoch number if matched, None otherwise.
     """
-    match = re.search(r"(?:fsc|vol)_(\d+)(?:_[A-Z])?", filename)
+    match = re.search(r"(?:fsc|volume)_(\d+)(?:_[A-Z])?", filename)
     return int(match.group(1)) if match else None
 
 
 def _discover_fsc_images(
-    job_folder: str | Path, suffix: str | None = None
+    job_dir: str | Path, suffix: str | None = None
 ) -> list[tuple[int, Path]]:
     """
-    Find FSC PNG files in job_folder/epochs/, sorted by epoch number.
+    Find FSC PNG files in job_dir/epochs/, sorted by epoch number.
 
     Parameters
     ----------
-    job_folder : str or Path
+    job_dir : str or Path
         Job folder path.
     suffix : str or None
         If specified, only return files matching this suffix (e.g., "A" for fsc_001_A.png).
@@ -705,10 +837,10 @@ def _discover_fsc_images(
     Raises
     ------
     FileNotFoundError
-        If job_folder/epochs/ does not exist.
+        If job_dir/epochs/ does not exist.
     """
-    job_folder = Path(job_folder)
-    epochs_dir = job_folder / "epochs"
+    job_dir = Path(job_dir)
+    epochs_dir = job_dir / "epochs"
 
     if not epochs_dir.exists():
         raise FileNotFoundError(f"Epochs directory not found: {epochs_dir}")
@@ -726,13 +858,13 @@ def _discover_fsc_images(
     return fsc_files
 
 
-def _discover_vol_images(job_folder: str | Path) -> list[tuple[int, Path]]:
+def _discover_volume_images(job_dir: str | Path) -> list[tuple[int, Path]]:
     """
-    Find volume PNG files in job_folder/epochs/, sorted by epoch number.
+    Find volume PNG files in job_dir/epochs/, sorted by epoch number.
 
     Parameters
     ----------
-    job_folder : str or Path
+    job_dir : str or Path
         Job folder path.
 
     Returns
@@ -743,24 +875,24 @@ def _discover_vol_images(job_folder: str | Path) -> list[tuple[int, Path]]:
     Raises
     ------
     FileNotFoundError
-        If job_folder/epochs/ does not exist.
+        If job_dir/epochs/ does not exist.
     """
-    job_folder = Path(job_folder)
-    epochs_dir = job_folder / "epochs"
+    job_dir = Path(job_dir)
+    epochs_dir = job_dir / "epochs"
 
     if not epochs_dir.exists():
         raise FileNotFoundError(f"Epochs directory not found: {epochs_dir}")
 
     # Find volume files
-    vol_files = []
-    for vol_file in sorted(epochs_dir.glob("vol_*.png")):
-        epoch = _extract_epoch_number(vol_file.name)
+    volume_files = []
+    for volume_file in sorted(epochs_dir.glob("volume_*.png")):
+        epoch = _extract_epoch_number(volume_file.name)
         if epoch is not None:
-            vol_files.append((epoch, vol_file))
+            volume_files.append((epoch, volume_file))
 
     # Sort by epoch number
-    vol_files.sort(key=lambda x: x[0])
-    return vol_files
+    volume_files.sort(key=lambda x: x[0])
+    return volume_files
 
 
 try:
@@ -768,7 +900,7 @@ try:
     from IPython.display import display, Markdown
 
     def visualize_job_epochs(
-        job_folder: str | Path,
+        job_dir: str | Path,
         suffix: str | None = None,
         image_width: int = 8,
     ) -> None:
@@ -781,8 +913,8 @@ try:
 
         Parameters
         ----------
-        job_folder : str or Path
-            Path to the job folder (e.g., "~/specter-data/empiar-10202/J002").
+        job_dir : str or Path
+            Path to the job folder (e.g., "~/empiar-10202/reconstructions/J002").
         suffix : str, optional
             Filter FSC images by suffix (e.g., "A" shows only fsc_001A.png).
             If None, all FSC images are shown.
@@ -792,61 +924,59 @@ try:
         Raises
         ------
         FileNotFoundError
-            If job_folder/epochs/ does not exist.
+            If job_dir/epochs/ does not exist.
         ValueError
             If no FSC or volume images are found.
 
         Examples
         --------
-        >>> visualize_job_epochs("~/specter-data/empiar-10202/J002")
-        >>> visualize_job_epochs("~/specter-data/empiar-10202/J002", suffix="A")
+        >>> visualize_job_epochs("~/empiar-10202/reconstructions/J002")
+        >>> visualize_job_epochs("~/empiar-10202/reconstructions/J002", suffix="A")
         """
-        job_folder = Path(job_folder).expanduser()
+        job_dir = Path(job_dir).expanduser()
 
         # Discover images
         try:
-            fsc_files = _discover_fsc_images(job_folder, suffix=suffix)
+            fsc_files = _discover_fsc_images(job_dir, suffix=suffix)
         except FileNotFoundError as e:
             raise FileNotFoundError(str(e)) from e
 
         try:
-            vol_files = _discover_vol_images(job_folder)
+            volume_files = _discover_volume_images(job_dir)
         except FileNotFoundError as e:
             raise FileNotFoundError(str(e)) from e
 
         if not fsc_files:
             suffix_str = f" with suffix '{suffix}'" if suffix else ""
-            raise ValueError(
-                f"No FSC images found{suffix_str} in {job_folder / 'epochs'}"
-            )
-        if not vol_files:
-            raise ValueError(f"No volume images found in {job_folder / 'epochs'}")
+            raise ValueError(f"No FSC images found{suffix_str} in {job_dir / 'epochs'}")
+        if not volume_files:
+            raise ValueError(f"No volume images found in {job_dir / 'epochs'}")
 
         # Create epoch lists (use max range, show N/A for missing)
         fsc_epochs = {epoch: path for epoch, path in fsc_files}
-        vol_epochs = {epoch: path for epoch, path in vol_files}
-        all_epochs = sorted(set(fsc_epochs.keys()) | set(vol_epochs.keys()))
+        volume_epochs = {epoch: path for epoch, path in volume_files}
+        all_epochs = sorted(set(fsc_epochs.keys()) | set(volume_epochs.keys()))
 
         # Create matplotlib figures for display
         fig_fsc, ax_fsc = plt.subplots(
             figsize=(image_width, image_width * 0.75), dpi=100
         )
-        fig_vol, ax_vol = plt.subplots(
+        fig_volume, ax_volume = plt.subplots(
             figsize=(image_width, image_width * 0.75), dpi=100
         )
         plt.close(fig_fsc)
-        plt.close(fig_vol)
+        plt.close(fig_volume)
 
         # Create output widgets
         output_fsc = widgets.Output()
-        output_vol = widgets.Output()
+        output_volume = widgets.Output()
 
         def update_display(epoch_idx: int) -> None:
             """Update both images for the selected epoch index."""
             epoch = all_epochs[epoch_idx]
 
             output_fsc.clear_output(wait=True)
-            output_vol.clear_output(wait=True)
+            output_volume.clear_output(wait=True)
 
             with output_fsc:
                 if epoch in fsc_epochs:
@@ -860,15 +990,15 @@ try:
                 else:
                     display(Markdown(f"**FSC**: No image for epoch {epoch}"))
 
-            with output_vol:
-                if epoch in vol_epochs:
-                    img_vol = PILImage.open(vol_epochs[epoch])
-                    ax_vol.clear()
-                    ax_vol.imshow(img_vol)
-                    ax_vol.set_title(f"Volume Epoch {epoch}")
-                    ax_vol.axis("off")
-                    fig_vol.tight_layout()
-                    display(fig_vol)
+            with output_volume:
+                if epoch in volume_epochs:
+                    img_volume = PILImage.open(volume_epochs[epoch])
+                    ax_volume.clear()
+                    ax_volume.imshow(img_volume)
+                    ax_volume.set_title(f"Volume Epoch {epoch}")
+                    ax_volume.axis("off")
+                    fig_volume.tight_layout()
+                    display(fig_volume)
                 else:
                     display(Markdown(f"**Volume**: No image for epoch {epoch}"))
 
@@ -892,11 +1022,11 @@ try:
         btn_prev = widgets.Button(description="◀", layout=widgets.Layout(width="50px"))
         btn_next = widgets.Button(description="▶", layout=widgets.Layout(width="50px"))
 
-        def on_prev_clicked(btn) -> None:
+        def on_prev_clicked(btn: widgets.Button) -> None:
             if slider.value > 0:
                 slider.value -= 1
 
-        def on_next_clicked(btn) -> None:
+        def on_next_clicked(btn: widgets.Button) -> None:
             if slider.value < len(all_epochs) - 1:
                 slider.value += 1
 
@@ -904,8 +1034,8 @@ try:
         btn_next.on_click(on_next_clicked)
 
         # Layout: title, images side-by-side, slider with buttons
-        header = widgets.HTML(f"<h3>Job: {job_folder.name}</h3>")
-        images_hbox = widgets.HBox([output_fsc, output_vol])
+        header = widgets.HTML(f"<h3>Job: {job_dir.name}</h3>")
+        images_hbox = widgets.HBox([output_fsc, output_volume])
         slider_hbox = widgets.HBox([btn_prev, slider, btn_next])
 
         vbox = widgets.VBox([header, images_hbox, slider_hbox])
@@ -917,7 +1047,7 @@ try:
 except ImportError:
 
     def visualize_job_epochs(
-        job_folder: str | Path,
+        job_dir: str | Path,
         suffix: str | None = None,
         image_width: int = 8,
     ) -> None:

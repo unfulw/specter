@@ -1,12 +1,19 @@
 """
 Per-atom Q-score calculation using PyTorch with optional GPU support.
 
-Implements the algorithm of Pintilie et al. (2020) Science 370 (6516).
+Implements the algorithm of Pintilie et al. (2020) [1]_.
 Each atom receives a Pearson correlation score between the density sampled
 on concentric shells around it and the profile of an ideal Gaussian peak.
 
-Based on the original qscore implementation by Jamali et al.:
+Based on K. Jamali's Python implementation of Q-scores:
     https://github.com/jamaliki/qscore
+
+References
+----------
+.. [1] Pintilie, G., Zhang, K., Su, Z., Li, S., Schmid, M. F., & Chiu, W.
+   (2020). Measurement of atom resolvability in cryo-EM maps with Q-scores.
+   *Nature Methods*, 17(3), 328–334.
+   https://doi.org/10.1038/s41592-020-0731-1
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from scipy.spatial import cKDTree
 
+from specter import logger
 from specter.pdb import PDB
 
 # Standard residue and atom names — mirrors qscore's selection so per-atom
@@ -131,9 +139,9 @@ class QScore:
     ----------
     device : str
         Torch device string: ``'cpu'``, ``'cuda'``, ``'cuda:1'``, etc.
-    num_radii : int
+    n_radii : int
         Number of radial shells. Default 21 → R = 0.0, 0.1, …, 2.0 Å.
-    num_points : int
+    n_points : int
         Points sampled uniformly on each shell per atom. Default 8.
     ref_gaussian_width : float
         σ of the reference Gaussian in Å. Default 0.6.
@@ -162,13 +170,20 @@ class QScore:
     >>> qs = QScore(device="cuda:0")
     >>> q = qs.score("structure.cif", "map.mrc")
     >>> qs.summarize(q)
+
+    References
+    ----------
+    .. [1] Pintilie, G., Zhang, K., Su, Z., Li, S., Schmid, M. F., & Chiu, W.
+       (2020). Measurement of atom resolvability in cryo-EM maps with
+       Q-scores. *Nature Methods*, 17(3), 328–334.
+       https://doi.org/10.1038/s41592-020-0731-1
     """
 
     def __init__(
         self,
         device: str = "cpu",
-        num_radii: int = 21,
-        num_points: int = 8,
+        n_radii: int = 21,
+        n_points: int = 8,
         ref_gaussian_width: float = 0.6,
         k_neighbors: int = 32,
         epsilon: float = 1e-6,
@@ -176,13 +191,13 @@ class QScore:
         standard_residues_only: bool = True,
     ) -> None:
         self.device = torch.device(device)
-        self.num_radii = num_radii
-        self.num_points = num_points
+        self.n_radii = n_radii
+        self.n_points = n_points
         self.ref_gaussian_width = ref_gaussian_width
         self.k_neighbors = k_neighbors
         self.epsilon = epsilon
         self.radii = torch.linspace(
-            0.0, (num_radii - 1) / 10.0, num_radii, device=self.device
+            0.0, (n_radii - 1) / 10.0, n_radii, device=self.device
         )
 
         # Cached state populated by load_cif / load_mrc.
@@ -199,10 +214,10 @@ class QScore:
         self._centroid: np.ndarray | None = None
         self._atom_keys: list[tuple[str, int, str, str]] | None = None
 
-        print(
-            "[QScore] Reminder: verify that the CIF/PDB structure is spatially "
-            "aligned to the MRC map before scoring. Misaligned inputs will "
-            "produce Q-scores near zero regardless of map quality."
+        logger.warning(
+            "QScore: verify that the CIF/PDB structure is spatially aligned to "
+            "the MRC map before scoring. Misaligned inputs produce Q-scores "
+            "near zero regardless of map quality."
         )
 
         if cif_path is not None:
@@ -366,7 +381,7 @@ class QScore:
         max_tries: int = 100,
     ) -> torch.Tensor:
         N = atoms.shape[0]
-        P = self.num_points
+        P = self.n_points
 
         if R == 0.0:
             return atoms.unsqueeze(1).expand(N, P, 3).clone()
@@ -473,7 +488,7 @@ class QScore:
         ref_vals = self._reference_gaussian(grid)
 
         map_vals_list: list[torch.Tensor] = []
-        for r_idx in range(self.num_radii):
+        for r_idx in range(self.n_radii):
             R = self.radii[r_idx].item()
             pts = self._sample_shell(atoms, R, neighbor_positions)
             vals = self._interpolate_shell(grid, pts, voxel_size)
@@ -482,11 +497,11 @@ class QScore:
         map_vals = torch.stack(map_vals_list, dim=1)
 
         N = atoms.shape[0]
-        M = self.num_radii * self.num_points
+        M = self.n_radii * self.n_points
         u = map_vals.reshape(N, M)
         v = (
             ref_vals.unsqueeze(1)
-            .expand(self.num_radii, self.num_points)
+            .expand(self.n_radii, self.n_points)
             .reshape(M)
             .unsqueeze(0)
             .expand(N, M)
@@ -573,14 +588,17 @@ class QScore:
         label: str = "",
         plot: bool = True,
     ) -> dict[str, float]:
-        """Print Q-score statistics and optionally show a histogram.
+        """Compute Q-score statistics, log them, and optionally show a histogram.
+
+        The summary is logged through ``specter.logger`` at info level, so it
+        is shown once ``specter.set_verbosity("INFO")`` has been called.
 
         Parameters
         ----------
         q : torch.Tensor
             Per-atom Q-scores, shape ``(N,)``.
         label : str
-            Optional label shown in the printed header and plot title.
+            Optional label shown in the logged header and plot title.
         plot : bool
             If ``True`` (default), display a histogram using matplotlib.
             Silently skipped if matplotlib is not available.
@@ -606,17 +624,20 @@ class QScore:
             "frac_above_0.7": float((q_np > 0.7).mean()),
         }
 
-        print(f"Q-score summary{tag}")
-        print(f"  atoms            : {int(stats['n_atoms'])}")
-        print(f"  mean / median    : {stats['mean']:.4f} / {stats['median']:.4f}")
-        print(f"  std              : {stats['std']:.4f}")
-        print(
-            f"  10/25/75/90 pct  : "
-            f"{stats['p10']:.3f} / {stats['p25']:.3f} / "
-            f"{stats['p75']:.3f} / {stats['p90']:.3f}"
+        logger.info(
+            "\n".join(
+                [
+                    f"Q-score summary{tag}",
+                    f"  atoms            : {int(stats['n_atoms'])}",
+                    f"  mean / median    : {stats['mean']:.4f} / {stats['median']:.4f}",
+                    f"  std              : {stats['std']:.4f}",
+                    f"  10/25/75/90 pct  : {stats['p10']:.3f} / {stats['p25']:.3f} / "
+                    f"{stats['p75']:.3f} / {stats['p90']:.3f}",
+                    f"  fraction > 0.5   : {stats['frac_above_0.5']:.1%}",
+                    f"  fraction > 0.7   : {stats['frac_above_0.7']:.1%}",
+                ]
+            )
         )
-        print(f"  fraction > 0.5   : {stats['frac_above_0.5']:.1%}")
-        print(f"  fraction > 0.7   : {stats['frac_above_0.7']:.1%}")
 
         if plot:
             try:
@@ -657,7 +678,7 @@ class QScore:
     def to_cif(
         self,
         q: torch.Tensor,
-        out_path: str,
+        cif_path: str,
         per_atom: bool = True,
     ) -> None:
         """Write a CIF file with Q-scores stored as B-factors (× 100).
@@ -669,7 +690,7 @@ class QScore:
         ----------
         q : torch.Tensor
             Per-atom Q-scores, shape ``(N,)``.
-        out_path : str
+        cif_path : str
             Path for the output ``.cif`` file.
         per_atom : bool
             If ``True`` (default), each atom gets its own Q-score as
@@ -730,5 +751,5 @@ class QScore:
         structure = builder.get_structure()
         io = MMCIFIO()
         io.set_structure(structure)
-        io.save(out_path)
-        print(f"[QScore] Written: {out_path}  (B-factor = Q-score × 100)")
+        io.save(cif_path)
+        logger.info(f"QScore: written {cif_path} (B-factor = Q-score x 100)")

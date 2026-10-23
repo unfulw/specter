@@ -13,44 +13,172 @@ same physical scale as ``PotentialBuilder``-rendered protein templates
 
 The lipid coordinates are a schematic idealized model: per-leaflet atom
 z-offsets from the mid-plane (phosphate headgroup peak, glycerol backbone,
-acyl chain, terminal methyls) taken from known bilayer structural biology
-(e.g. a ~40 A phosphate-to-phosphate spacing for a fluid PC bilayer), with
-small per-atom jitter standing in for conformational disorder -- not a
-relaxed or MD-equilibrated structure. Good enough to get the profile's
-shape and physical length scale right; swap in a real coordinate set later
-if higher fidelity is needed.
+acyl chain, terminal methyls), with small per-atom jitter standing in for
+conformational disorder. They come from no deposited structure and no MD
+trajectory. What IS anchored is the census, and through it the integral
+(see the identity below); what is MODELLED is where along z each group
+sits. Measured against a joint SANS/SAXS refinement of POPC at 30 C [1]
+and an X-ray one at the same temperature [2]:
 
-Amplitude calibration is deliberately NOT read off a laterally-averaged
-multi-lipid render (an earlier version of ``estimate_bilayer_peak_
-amplitude`` did exactly that, and diluted the true peak by ~20x with no
-physical justification -- see that function's own docstring for the full
-story and the measured numbers). Real membranes aren't laterally
-pre-averaged before imaging any more than a protein's atoms are; the
-smoothing that makes real cryo-ET membranes look continuous comes from the
-microscope's own resolution limits (CTF, multislice, detector MTF),
-applied identically to membrane and protein potential alike AFTER the
-ground truth is built (and already handled downstream by
-``_raster.py``'s anti-aliasing step) -- not baked into the ground truth
-itself.
+    ===========================  ==================  ==========
+    quantity                     published           this model
+    ===========================  ==================  ==========
+    area per lipid A             64.3 +/- 1.3 [1]    65.0
+    hydrocarbon thickness 2*D_C  28.8 +/- 0.6 [1]    ~27
+    phosphate-phosphate D_HH     37.0 [2]            40
+    ===========================  ==================  ==========
+
+Fluid phosphatidylcholines span D_HH = 35-38 A: 35.3 A for DMPC and 36.7 A
+for DOPC at 30 C [2], 38.3 A for DPPC at 50 C [3].
+
+The area per lipid is right, inside 1 sigma, which matters because it is
+the denominator of the identity. THE ERROR IS LOCALISED IN THE HEADGROUP
+REGION, not the chains: D_H1, the phosphate-to-chain-interface distance,
+is 6.0 A here against the ~4.1 A that D_HH [2] and 2*D_C [1] together
+imply, so the phosphates sit about 2 A too far out. The core is also
+slightly thin, so the correction is not one rigid shift -- headgroups move
+in AND chains spread out.
+
+Not patched, deliberately. Moving an atom along z adds and removes
+nothing, so integral(psi dz) is untouched by construction and every
+projected-contrast number is unaffected; 2 A is sub-voxel on the 5 and
+10 A grids membranes are rendered on (one voxel at 2 A). Nudging the
+offsets until D_HH lands on 37 A would swap one hand-picked table for
+another tuned to two moments, leaving the shape between them invented. The
+real fix is to take the whole z-distribution from an SDP decomposition or
+an MD trajectory: the NMRlipids / FAIRMD Lipids Databank
+(databank.nmrlipids.fi) serves POPC trajectories through an API, and
+psi(z) is a lateral average, so only a small z-table need be committed.
+
+A deposited PDB lipid is the WRONG source and has already been checked,
+so do not re-propose it. A fluid bilayer is a 2-D liquid with no lattice
+and no unique conformer, so nothing of the kind is deposited; the lipids
+that do appear are protein-bound fragments, ordered only because a protein
+immobilised them, truncated (1C3W's LI1 ranges 8-41 atoms per copy, 5A63's
+PC1 has 43 heavy atoms against POPC's 52) and hydrogen-free, which would
+reintroduce exactly the census deficit that 7946bfa fixed. Tiling one rigid
+conformer would also give gel-phase order rather than a fluid bilayer. The
+microtubule path works precisely because an MT IS a crystalline lattice of
+fully-resolved subunits; a membrane is the opposite kind of object and
+needs a statistical primitive.
+
+There is no amplitude scalar anywhere here: ``psi(d)`` is used as
+measured, in volts, and nothing rescales it to a peak. Two constructions
+that look reasonable are wrong, and are worth knowing about.
+
+An amplitude fitted from a single isolated atom's peak potential, on the
+reasoning that a plane average dilutes the true peak ~20x, is wrong twice
+over: that dilution comes from averaging over the whole patch including
+its under-populated jittered edges, which :func:`compute_bilayer_profile`
+never does (``lateral_core_fraction`` 0.6 recovers 64.9 A^2 per lipid
+against the 65.0 target), and an atom's own centre is a cusp with no
+grid-independent value, so it cannot calibrate anything at any voxel
+size. The rule governing any scalar taken from this module: a plane
+average is commensurate only with another plane average.
+
+An analytic two-Gaussian profile is wrong for a different reason. Two
+Gaussians standing on vacuum model a bilayer's *appearance* in a
+micrograph rather than its density, and deleting the acyl core that way
+costs 4.8x of the integrated potential at the template's native 40 A
+thickness (4.4x at ``MembraneGenerator``'s default 37 A, since the
+integral scales with thickness). The loss is invisible in a slice and
+dominant in a projection. The smoothing that makes real cryo-ET membranes look
+continuous comes from the microscope's own resolution limits (CTF,
+multislice, detector MTF), applied to membrane and protein alike AFTER
+the ground truth is built, and downstream by ``_raster.py``'s
+anti-aliasing. It is not something to bake into the ground truth.
+
+Calibration is anchored by one parameter-free identity: integral(psi dz)
+is fixed by chemistry alone, at 2 * (scattering per lipid) / (area per
+lipid). Measured 254.0 V*A against 254.5 predicted. The same identity on
+the protein side predicts 1FA2's mean inner potential as 7.03 V against
+7.00 V measured by rendering it. Note what it does and does not constrain:
+it pins the INTEGRAL, so it is untouched by the z-geometry above, and the
+two are complementary rather than in tension -- any replacement profile
+must still pass ``test_bilayer_profile_integral_matches_popc_stoichiometry``.
+
+References
+----------
+.. [1] Kučerka, N., Nieh, M.-P., & Katsaras, J. (2011). Fluid phase lipid
+       areas and bilayer thicknesses of commonly used phosphatidylcholines
+       as a function of temperature. *Biochimica et Biophysica Acta (BBA) –
+       Biomembranes*, 1808(11), 2761–2771.
+       https://doi.org/10.1016/j.bbamem.2011.07.022
+       Tables 1-3 give A, D_B and 2*D_C per lipid and temperature; D_HH
+       is in the supplementary Table S7, which the open-access accepted
+       manuscript does not carry, so the D_HH above is taken from [2].
+       The paper's SDP model decomposes a bilayer into exactly the shape
+       this module's template has (chemical group, mean depth, width):
+       CholCH3, PCN and CG as Gaussians, the hydrocarbon region as an
+       error function with CH and CH3 subtracted off. That makes it a
+       drop-in replacement for `_LEAFLET_TEMPLATE` rather than a rewrite.
+.. [2] Kučerka, N., Tristram-Nagle, S., & Nagle, J. F. (2005). Structure of
+       fully hydrated fluid phase lipid bilayers with monounsaturated
+       chains. *Journal of Membrane Biology*, 208(3), 193–202.
+       https://doi.org/10.1007/s00232-005-7006-8
+       Table 1 gives D_HH at 30 C: DMPC 35.3, DOPC 36.7, POPC 37.0 A.
+.. [3] Nagle, J. F., & Tristram-Nagle, S. (2000). Structure of lipid
+       bilayers. *Biochimica et Biophysica Acta (BBA) – Reviews on
+       Biomembranes*, 1469(3), 159–195.
+       https://doi.org/10.1016/S0304-4157(00)00016-2
+       Table 6 gives D_HH for DPPC at 50 C (38.3 A), DMPC (36.0),
+       DOPC (36.9) and egg PC (36.9).
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 
 from ...atom import atom_number
 from ...potential import PotentialBuilder
+from specter.options import ScatteringFactors
 
 # Same value as specimen/packing/algorithms.py's own independent copy of
 # this constant -- each specimen generator keeps its own rather than
 # importing, so this module's dependencies stay limited to atom/potential.
-ATOM_KERNEL_HALF_WIDTH_A = 2.5
+ATOM_KERNEL_HALF_WIDTH_ANGSTROM = 2.5
 
-# Schematic single-leaflet lipid atom template: (element, z_offset_a, count,
-# jitter_scale). z_offset_a is distance from the mid-plane for this leaflet
+# Grid spacing the reference lipid patch is rendered on to produce psi(z),
+# A. Deliberately independent of the voxel size a membrane is rendered at:
+# psi is a continuous physical quantity in volts, and the render grid's
+# resolution loss belongs downstream, applied once by
+# rasterize_membrane_density's anti-aliasing.
+#
+# This constant is scaffolding for a SYNTHESIZED profile. psi(z) is
+# obtained by rendering a schematic atomic model and averaging laterally,
+# and any grid-based estimate has a spacing. Source psi(z) from an MD
+# snapshot or from published component density profiles instead (see the
+# module docstring's open item) and this constant has nothing left to do.
+#
+# The value is loose, because what the rasterizer consumes is the whole
+# curve and its integral barely moves. Measured over 0.25-2.0 A, integral
+# (psi dz) spans 240.4-242.1 V*A -- 0.7%, with no trend. The PEAK over the
+# same range spans 7.70-8.59 V and is non-monotonic (8.59, 8.35, 8.39,
+# 8.25, 7.70, 7.88): that is grid-alignment scatter on a narrow feature,
+# not a convergence sequence, so do not read a converged peak off it or
+# tune this constant to make the peak look stable.
+CALIBRATION_VOXEL_SIZE_ANGSTROM = 1.0
+
+# Lipids per leaflet in the reference patch psi(z) is measured from. Fixed
+# independently of a caller's own n_lipids_per_leaflet, which sizes a patch
+# for whatever that caller needs: the profile is a property of the lipid
+# model and must not drift with it. The plane average converges from below
+# as the patch grows, because a small patch's jittered edges eat a larger
+# fraction of its own central window: 3.13 V at 30 lipids/leaflet, 4.10 at
+# 60, 5.14 at 200, then flat within sampling noise at 5.29/5.48/5.31 for
+# 400/800/1600.
+CALIBRATION_N_LIPIDS_PER_LEAFLET = 400
+
+# Seed for that reference patch, so the profile is identical run to run
+# rather than drifting with the lipid jitter draw.
+CALIBRATION_SEED = 0
+
+# Schematic single-leaflet lipid atom template: (element, z_offset_angstrom, count,
+# jitter_scale). z_offset_angstrom is distance from the mid-plane for this leaflet
 # (mirrored for the opposite leaflet); jitter_scale multiplies the base
 # per-atom jitter for that group. Not a relaxed structure -- see module
 # docstring.
@@ -73,9 +201,9 @@ ATOM_KERNEL_HALF_WIDTH_A = 2.5
 # each individually under-blended into its neighbors), instead of a single
 # broad, smoothly-declining shoulder -- the opposite of a real bilayer
 # electron-density profile's two-peaks-with-a-clearly-weaker-middle shape.
-# jitter_scale raised to 2.2-3.0 here (each cluster's std now clearly wider
-# than the 2A inter-cluster spacing) fixes this: verified the rendered
-# profile no longer has any competing peak in the +-4 to +-14A shoulder
+# jitter_scale of 2.2-3.0 here (each cluster's std clearly wider than the
+# 2A inter-cluster spacing) fixes this: the rendered profile has no
+# competing peak in the +-4 to +-14A shoulder
 # region (see test_compute_bilayer_profile_no_competing_peak_in_chain_
 # region in tests/test_membrane_profile.py). The terminal methyls are
 # pushed to the mid-plane itself (0.5A, was 1.0A) with even higher
@@ -83,28 +211,67 @@ ATOM_KERNEL_HALF_WIDTH_A = 2.5
 # rather than piling up right at z=0 -- real bilayers show a genuine dip
 # there (the "methyl trough"), not a peak, precisely because the terminal
 # segment is the MOST conformationally disordered part of the chain.
+# Census note: the counts below are the exact stoichiometry of POPC,
+# C42 H82 N O8 P -- 1-palmitoyl-2-oleoyl-sn-glycero-3-phosphocholine, the
+# standard fluid-phase model lipid, and the one this module's own
+# area_per_lipid_a2=65.0 and the phosphate-phosphate spacing tests were
+# already calibrated against. A template of the 31 carbons alone, with no
+# hydrogens, carries 59% of POPC's electron-scattering power and
+# understates the whole bilayer 1.74x.
+#
+# Hydrogen is not negligible for electrons even though it is nearly so for
+# X-rays. Mott-Bethe makes a diffuse one-electron atom screen its own
+# proton poorly at low k, so per unit mass hydrogen is 2.5x the scatterer
+# carbon is (25.2 vs 10.0 V*A^3/Da here). POPC's 82 hydrogens are 25% of
+# its total scattering, and they are why the acyl core -- pure CH2, the
+# most hydrogen-rich part of the molecule -- sits ABOVE amorphous ice
+# (5.78 V against 4.6 V) despite hydrocarbon at 0.9 g/cm^3 being the less
+# dense material. The same effect is documented for the ice water kernel.
+#
+# Hydrogens are placed at their parent carbon's z rather than given their
+# own offsets: a C-H bond is 1.09 A, well inside every jitter_scale here,
+# and each H draws its jitter independently, so the pair spreads the way
+# the group does. This is a z-DISTRIBUTION model, not a conformer.
 _LEAFLET_TEMPLATE: list[tuple[str, float, int, float]] = [
     ("N", 21.5, 1, 0.45),  # choline nitrogen
-    ("C", 20.5, 3, 0.45),  # choline methyls
+    ("C", 20.5, 5, 0.45),  # choline: 3 methyls + the -CH2-CH2- linker
+    ("H", 20.5, 13, 0.45),  # 9 on the methyls, 4 on the linker
     ("P", 19.5, 1, 0.45),  # phosphate
     ("O", 19.0, 4, 0.45),  # phosphate oxygens
     ("C", 15.0, 3, 1.3),  # glycerol backbone
+    ("H", 15.0, 5, 1.3),  # glycerol hydrogens
+    ("C", 13.5, 2, 1.3),  # the two ester carbonyl carbons
     ("O", 13.5, 2, 1.3),  # ester oxygens
     ("O", 13.0, 2, 1.3),  # carbonyl oxygens
-    ("C", 12.0, 3, 2.2),  # acyl chains
-    ("C", 10.0, 4, 2.2),  # acyl chains
-    ("C", 8.0, 4, 2.2),  # acyl chains
-    ("C", 6.0, 4, 2.2),  # acyl chains
-    ("C", 4.0, 4, 2.6),  # acyl chains, distal
+    # 32 chain carbons and 64 chain hydrogens, tapering toward the
+    # mid-plane: palmitoyl is C16 and oleoyl C18, so the two chains do not
+    # reach equally deep and fewer carbons occupy the innermost levels.
+    # The taper is what brings the integrated profile onto its independent
+    # prediction (254.0 vs 254.5 V*A, see the module docstring).
+    ("C", 12.0, 6, 2.2),  # acyl chains
+    ("H", 12.0, 12, 2.2),
+    ("C", 10.0, 5, 2.2),  # acyl chains
+    ("H", 10.0, 10, 2.2),
+    ("C", 8.0, 5, 2.2),  # acyl chains
+    ("H", 8.0, 10, 2.2),
+    ("C", 6.0, 5, 2.2),  # acyl chains
+    ("H", 6.0, 10, 2.2),
+    ("C", 4.0, 5, 2.6),  # acyl chains, distal
+    ("H", 4.0, 10, 2.6),
     ("C", 2.0, 4, 3.0),  # acyl chains, distal
-    ("C", 0.5, 2, 4.5),  # terminal methyls -- high disorder, "methyl trough"
+    ("H", 2.0, 6, 3.0),
+    # Exactly two terminal methyl carbons, one per chain -- the count is
+    # chemical, not a tuning knob, and it is what sets the depth of the
+    # "methyl trough" both leaflets' termini share at the mid-plane.
+    ("C", 0.5, 2, 4.5),
+    ("H", 0.5, 6, 4.5),
 ]
 
 
 def build_reference_lipid_patch(
     n_lipids_per_leaflet: int = 200,
     area_per_lipid_a2: float = 65.0,
-    jitter_a: float = 2.5,
+    jitter_angstrom: float = 2.5,
     seed: int | None = None,
     device: str | torch.device = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -122,10 +289,10 @@ def build_reference_lipid_patch(
         sampling noise, even though it is consistently the taller feature
         once averaged over enough lipids.
     area_per_lipid_a2 : float, optional
-        Lateral area per lipid, Angstrom^2, used to size the patch. Default
+        Lateral area per lipid, Å², used to size the patch. Default
         65.0 (a typical fluid-phase PC value).
-    jitter_a : float, optional
-        Standard deviation of per-atom positional jitter, Angstrom, standing
+    jitter_angstrom : float, optional
+        Standard deviation of per-atom positional jitter, Å, standing
         in for conformational/thermal disorder. Default 2.5.
     seed : int, optional
         Random seed. Default None.
@@ -137,14 +304,14 @@ def build_reference_lipid_patch(
     atomic_numbers : torch.Tensor
         Shape ``(N,)``.
     coordinates : torch.Tensor
-        Shape ``(N, 3)``, ``(x, y, z)`` Angstrom, centered at the bilayer
+        Shape ``(N, 3)``, ``(x, y, z)`` Å, centered at the bilayer
         mid-plane (``z=0``) and patch center (``x=y=0``).
     """
     generator = torch.Generator(device="cpu")
     if seed is not None:
         generator.manual_seed(seed)
 
-    side_a = math.sqrt(n_lipids_per_leaflet * area_per_lipid_a2)
+    side_angstrom = math.sqrt(n_lipids_per_leaflet * area_per_lipid_a2)
 
     elements: list[str] = []
     xs: list[float] = []
@@ -152,10 +319,10 @@ def build_reference_lipid_patch(
     zs: list[float] = []
     for leaflet_sign in (1.0, -1.0):
         for _ in range(n_lipids_per_leaflet):
-            lipid_xy = (torch.rand(2, generator=generator) - 0.5) * side_a
+            lipid_xy = (torch.rand(2, generator=generator) - 0.5) * side_angstrom
             for element, z_offset, count, jitter_scale in _LEAFLET_TEMPLATE:
                 jitter = torch.randn((count, 3), generator=generator) * (
-                    jitter_a * jitter_scale
+                    jitter_angstrom * jitter_scale
                 )
                 elements.extend([element] * count)
                 xs.extend((lipid_xy[0] + jitter[:, 0]).tolist())
@@ -192,13 +359,13 @@ class BilayerProfile:
 
     Parameters
     ----------
-    distance_a : torch.Tensor
-        Sorted ascending signed distances, shape ``(N,)``, Angstrom.
+    distance_angstrom : torch.Tensor
+        Sorted ascending signed distances, shape ``(N,)``, Å.
     psi : torch.Tensor
         Laterally-averaged potential at each distance, shape ``(N,)``.
     """
 
-    distance_a: torch.Tensor
+    distance_angstrom: torch.Tensor
     psi: torch.Tensor
 
     def __call__(self, d: torch.Tensor) -> torch.Tensor:
@@ -208,7 +375,7 @@ class BilayerProfile:
         Parameters
         ----------
         d : torch.Tensor
-            Signed distance from the bilayer mid-plane, Angstrom, any shape.
+            Signed distance from the bilayer mid-plane, Å, any shape.
 
         Returns
         -------
@@ -216,15 +383,15 @@ class BilayerProfile:
             Interpolated potential, same shape as ``d``. Values beyond the
             table's range are clamped to the nearest tabulated value.
         """
-        flat = _interp1d(d.reshape(-1), self.distance_a, self.psi)
+        flat = _interp1d(d.reshape(-1), self.distance_angstrom, self.psi)
         return flat.reshape(d.shape)
 
 
 def compute_bilayer_profile(
     atomic_numbers: torch.Tensor,
     coordinates: torch.Tensor,
-    v_size: float = 2.0,
-    parameterization: str = "shtyrov",
+    voxel_size: float = 2.0,
+    parameterization: ScatteringFactors = "shtyrov",
     lateral_core_fraction: float = 0.6,
     device: str | torch.device = "cpu",
 ) -> BilayerProfile:
@@ -237,8 +404,8 @@ def compute_bilayer_profile(
         From :func:`build_reference_lipid_patch`.
     coordinates : torch.Tensor
         From :func:`build_reference_lipid_patch`.
-    v_size : float, optional
-        Voxel size for the one-time atomic render, Angstrom. Default 2.0.
+    voxel_size : float, optional
+        Voxel size for the one-time atomic render, Å. Default 2.0.
     parameterization : str, optional
         ``PotentialBuilder`` parameterization. Default "shtyrov".
     lateral_core_fraction : float, optional
@@ -255,14 +422,15 @@ def compute_bilayer_profile(
     """
     coordinates = coordinates.to(device)
     extent = (coordinates.max(dim=0).values - coordinates.min(dim=0).values).tolist()
-    margin_a = 2 * ATOM_KERNEL_HALF_WIDTH_A
+    margin_angstrom = 2 * ATOM_KERNEL_HALF_WIDTH_ANGSTROM
     n_xyz = tuple(
-        int(math.ceil((e + 2 * margin_a) / v_size)) // 2 * 2 + 2 for e in extent
+        int(math.ceil((e + 2 * margin_angstrom) / voxel_size)) // 2 * 2 + 2
+        for e in extent
     )
 
     builder = PotentialBuilder(
         n_xyz=n_xyz,
-        dx=v_size,
+        dx=voxel_size,
         atomic_numbers=atomic_numbers,
         progressbars=False,
         parameterization=parameterization,
@@ -281,164 +449,91 @@ def compute_bilayer_profile(
 
     core = volume[:, y_mask][:, :, x_mask]
     psi = core.mean(dim=(1, 2))
-    distance_a = z_idx.to(dtype=psi.dtype) * v_size
+    distance_angstrom = z_idx.to(dtype=psi.dtype) * voxel_size
 
-    return BilayerProfile(distance_a=distance_a, psi=psi)
+    return BilayerProfile(distance_angstrom=distance_angstrom, psi=psi)
 
 
-def _isolated_atom_peak_potential(
-    atomic_number: int,
-    v_size: float,
-    parameterization: str,
-    device: str | torch.device,
-) -> float:
-    """Raw, undiluted peak scattering potential of a single isolated atom
-    -- the calibration reference `estimate_bilayer_peak_amplitude` uses.
-    Same `PotentialBuilder` atomic-form-factor physics as everything else
-    in this module, just with nothing else nearby to average against."""
-    n = int(math.ceil(2 * ATOM_KERNEL_HALF_WIDTH_A / v_size)) // 2 * 2 + 2
-    builder = PotentialBuilder(
-        n_xyz=(n, n, n),
-        dx=v_size,
-        atomic_numbers=torch.tensor([atomic_number], device=device),
-        progressbars=False,
+@lru_cache(maxsize=None)
+def _measured_bilayer_profile(
+    parameterization: ScatteringFactors = "shtyrov",
+) -> BilayerProfile:
+    """
+    The bilayer's psi(z), measured once per process from the reference
+    lipid patch. Cached; see :func:`build_measured_bilayer_profile`.
+    """
+    atomic_numbers, coordinates = build_reference_lipid_patch(
+        n_lipids_per_leaflet=CALIBRATION_N_LIPIDS_PER_LEAFLET,
+        seed=CALIBRATION_SEED,
+    )
+    return compute_bilayer_profile(
+        atomic_numbers,
+        coordinates,
+        voxel_size=CALIBRATION_VOXEL_SIZE_ANGSTROM,
         parameterization=parameterization,
     )
-    volume = builder.forward(torch.zeros((1, 3), device=device), method="analytic")
-    return float(volume.max())
 
 
-def estimate_bilayer_peak_amplitude(
-    atomic_numbers: torch.Tensor,
-    coordinates: torch.Tensor,
-    v_size: float = 2.0,
-    parameterization: str = "shtyrov",
-    device: str | torch.device = "cpu",
-) -> float:
+def native_bilayer_thickness_angstrom(parameterization: str = "shtyrov") -> float:
     """
-    Peak scattering potential to calibrate
-    :func:`build_analytic_bilayer_profile`'s `amplitude` against real
-    atomic scattering physics -- the same units as ``PotentialBuilder``-
-    rendered protein templates, so a membrane and an inserted
-    transmembrane protein sit on a physically consistent scale in the same
-    rendered volume.
+    Phosphate-to-phosphate spacing of the measured profile, A.
 
-    Renders each unique atomic species present in `atomic_numbers` (via
-    :func:`_isolated_atom_peak_potential`) as a single ISOLATED atom, not
-    the full reference lipid patch, and returns the tallest of those raw
-    peaks -- typically the phosphate phosphorus, the heaviest/most
-    strongly-scattering species in the default lipid template, matching
-    real bilayer electron-density profiles where the phosphate headgroup
-    is the dominant feature.
-
-    An earlier version instead rendered the FULL reference lipid patch
-    (:func:`compute_bilayer_profile`) and took its LATERALLY-AVERAGED peak
-    (``psi.max()``, averaged over ``lateral_core_fraction`` of the whole
-    patch -- ~70 lipids' worth of mostly-empty lateral area at this
-    module's own default ``n_lipids_per_leaflet=200``). Measured directly
-    on a real patch: that diluted the true single-atom peak by ~20x (97.5
-    -> 4.8), with no physical justification -- a real bilayer's phosphate
-    atoms don't scatter more weakly than the same atom embedded in a
-    protein, and the visual "smoothness" real membranes show in cryo-ET
-    data comes from the microscope's own resolution limits applied to the
-    ground truth AFTER it's built (already handled by
-    ``rasterize_membrane_density``'s anti-aliasing step), not from
-    pre-averaging the ground truth itself. This was a real, previously
-    unnoticed bug (a user-reported visual mismatch -- a transmembrane
-    protein's density looked 5-10x brighter than the surrounding membrane
-    in a rendered volume -- led directly to finding and fixing it), not a
-    deliberate design choice.
+    Peak-to-peak of :func:`_measured_bilayer_profile`, which is what
+    `thickness_angstrom` means everywhere in this module. About 40 A for the
+    default POPC template, against 37.0 A measured for fluid POPC at 30 C
+    and 35-38 A across fluid phosphatidylcholines (see the module
+    docstring).
 
     Parameters
     ----------
-    atomic_numbers : torch.Tensor
-        From :func:`build_reference_lipid_patch` (or any atom set) --
-        only the set of unique species present is used; a single-atom
-        peak has no position dependence, so patch size no longer matters
-        here (unlike `compute_bilayer_profile`, which still needs a large
-        patch to converge the profile's SHAPE past per-lipid sampling
-        noise -- these are independent uses of the same reference patch).
-    coordinates : torch.Tensor
-        Unused; accepted for call-site symmetry with
-        :func:`compute_bilayer_profile` (both are built together by
-        :func:`build_reference_lipid_patch`).
-    v_size, parameterization, device
-        Forwarded to the single-atom :class:`~specter.potential.PotentialBuilder`
-        render.
+    parameterization : str, optional
+        ``PotentialBuilder`` parameterization. Default "shtyrov".
 
     Returns
     -------
     float
     """
-    del coordinates  # unused, see docstring
-    unique_z = atomic_numbers.unique().tolist()
-    return max(
-        _isolated_atom_peak_potential(z, v_size, parameterization, device)
-        for z in unique_z
-    )
+    profile = _measured_bilayer_profile(parameterization)
+    upper = profile.distance_angstrom > 0
+    return 2.0 * float(profile.distance_angstrom[upper][profile.psi[upper].argmax()])
 
 
-def build_analytic_bilayer_profile(
-    thickness_a: float = 30.0,
-    layer_sigma_a: float = 1.25,
-    amplitude: float = 1.0,
-    distance_half_range_a: float | None = None,
-    n_points: int = 241,
+def build_measured_bilayer_profile(
+    thickness_angstrom: float = 37.0,
+    extra_sigma_angstrom: float = 0.0,
+    parameterization: ScatteringFactors = "shtyrov",
     device: str | torch.device = "cpu",
 ) -> BilayerProfile:
     """
-    Build a bilayer profile as two analytic Gaussian peaks, matching
-    real cryo-EM bilayer micrographs' "railroad track" appearance far more
-    directly than :func:`compute_bilayer_profile`'s simulated-atom-cloud
-    approach does.
+    The bilayer profile the rasterizer renders: psi(z) measured from the
+    reference lipid patch, rescaled in z to the requested thickness.
 
-    ``compute_bilayer_profile`` derives the profile's SHAPE by jittering a
-    schematic atomic lipid model and rendering it -- physically motivated,
-    but fragile: getting the acyl-chain region to actually stay featureless
-    relative to the phosphate peaks (rather than accidentally forming a
-    competing secondary hump, or leaving the center only mildly lower than
-    the chain shoulder -- both real bugs found and fixed by direct
-    inspection, see this module's git history) means fighting per-cluster
-    jitter-scale tuning against emergent Gaussian-sum interference, with no
-    guarantee a slightly different lipid count/seed doesn't reintroduce a
-    bump. `polnet` (`polnet.sample.membranes.mb_sphere.SphGen._build`) takes
-    a structurally different, much more robust approach for exactly this
-    problem: build two geometrically-separated thin shells (one per
-    leaflet, offset by `+-thickness/2`) and Gaussian-blur them with a small
-    sigma -- since the blur is far smaller than the leaflet separation, the
-    two peaks cannot bleed into each other or spawn a secondary peak
-    in between, by construction, not by tuning. This function is the same
-    idea reduced to 1D (`psi(d)` is already evaluated against a signed
-    distance from the mid-plane everywhere it's used, so the exact "thin
-    shell" step is unnecessary -- a Gaussian centered at each leaflet's
-    offset IS the 1D cross-section of that shell-then-blur construction).
+    The profile every membrane renders with. See the module docstring for
+    why an analytic two-Gaussian form (two peaks on vacuum) discards most
+    of a bilayer's integrated potential (53 V*A against this one's 254)
+    and why that is invisible in a slice but dominant in a projection.
+
+    Rescaling is a pure z-stretch at fixed amplitude, so the integral
+    scales with thickness. That is the physical relationship: lipid
+    volume is conserved, so a bilayer of thickness `t` built from lipids
+    of volume `V` occupies area ``2V/t`` per lipid and therefore deposits
+    ``t * (scattering per lipid) / V`` per unit area. Normalising the
+    integral instead would make a thinner membrane denser, which is
+    wrong.
 
     Parameters
     ----------
-    thickness_a : float, optional
-        Phosphate-to-phosphate (outer leaflet peak to inner leaflet peak)
-        spacing, Angstrom. Default 30.0 -- midpoint of `polnet`'s own
-        `MB_THICK_RG` default range (25.0, 35.0); matched to polnet
-        directly rather than to the old atomic model's own headgroup
-        z-offsets (38.0), which sat above polnet's entire range and read
-        as visibly too widely spaced.
-    layer_sigma_a : float, optional
-        Gaussian width of each leaflet peak, Angstrom -- matches `polnet`'s
-        own `MB_LAYER_S_RG` parameter. Default 1.25, the midpoint of
-        polnet's own default range (0.5, 2.0).
-    amplitude : float, optional
-        Peak height. Pass :func:`estimate_bilayer_peak_amplitude`'s output
-        to calibrate against real scattering-potential units rather than an
-        arbitrary constant. Default 1.0 (uncalibrated).
-    distance_half_range_a : float, optional
-        Half-width of the returned lookup table's domain, Angstrom. Default
-        ``thickness_a / 2 + 6 * layer_sigma_a`` (comfortably past both
-        peaks' Gaussian tails). Values beyond this range are clamped to the
-        table's edge (near-zero) by `BilayerProfile.__call__`.
-    n_points : int, optional
-        Lookup table resolution. Default 241 -- fine enough for accurate
-        interpolation at any downstream rendering voxel size, independent
-        of `layer_sigma_a`.
+    thickness_angstrom : float, optional
+        Phosphate-to-phosphate spacing to rescale to, A. Default 37.0,
+        matching `MembraneGenerator`. See
+        :func:`native_bilayer_thickness_angstrom` for the template's own value.
+    extra_sigma_angstrom : float, optional
+        Additional Gaussian broadening applied along z, A. Default 0.0:
+        the measured profile already carries the width its atomic model
+        implies, and the rasterizer anti-aliases to the render grid
+        separately. Raise it only to deliberately blur a bilayer.
+    parameterization : str, optional
+        ``PotentialBuilder`` parameterization. Default "shtyrov".
     device : str or torch.device, optional
         Device for the returned tensors. Default "cpu".
 
@@ -446,24 +541,31 @@ def build_analytic_bilayer_profile(
     -------
     BilayerProfile
     """
-    if distance_half_range_a is None:
-        distance_half_range_a = thickness_a / 2.0 + 6.0 * layer_sigma_a
+    profile = _measured_bilayer_profile(parameterization)
+    scale = thickness_angstrom / native_bilayer_thickness_angstrom(parameterization)
+    distance_angstrom = profile.distance_angstrom * scale
+    psi = profile.psi.clone()
 
-    distance_a = torch.linspace(
-        -distance_half_range_a, distance_half_range_a, n_points, device=device
+    if extra_sigma_angstrom > 0.0:
+        spacing = float(distance_angstrom[1] - distance_angstrom[0])
+        sigma_samples = extra_sigma_angstrom / spacing
+        half = max(1, int(math.ceil(3.0 * sigma_samples)))
+        offsets = torch.arange(-half, half + 1, dtype=psi.dtype, device=psi.device)
+        kernel = torch.exp(-0.5 * (offsets / sigma_samples) ** 2)
+        kernel = kernel / kernel.sum()
+        psi = torch.nn.functional.conv1d(
+            psi.view(1, 1, -1), kernel.view(1, 1, -1), padding=half
+        ).view(-1)
+
+    return BilayerProfile(
+        distance_angstrom=distance_angstrom.to(device), psi=psi.to(device)
     )
-    half_t = thickness_a / 2.0
-    outer_leaflet = torch.exp(-0.5 * ((distance_a - half_t) / layer_sigma_a) ** 2)
-    inner_leaflet = torch.exp(-0.5 * ((distance_a + half_t) / layer_sigma_a) ** 2)
-    psi = amplitude * (outer_leaflet + inner_leaflet)
-
-    return BilayerProfile(distance_a=distance_a, psi=psi)
 
 
 __all__ = [
     "build_reference_lipid_patch",
     "compute_bilayer_profile",
-    "estimate_bilayer_peak_amplitude",
-    "build_analytic_bilayer_profile",
+    "build_measured_bilayer_profile",
+    "native_bilayer_thickness_angstrom",
     "BilayerProfile",
 ]

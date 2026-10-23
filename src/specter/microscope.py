@@ -1,12 +1,46 @@
+"""
+Aberration and detector models.
+
+The detector's coincidence-loss model (:meth:`Detector.apply_coincidence`) is
+an original, deliberately simplified spatial simulation -- it is not an
+implementation of any published closed-form theory. For an analytical
+treatment of the same phenomenon (exact mean/variance of recorded counts and
+events versus incoming rate, via Roach's statistical-overlap model), and for
+the DQE/SNR consequences, see the reference below. Note that such closed-form
+per-pixel statistics carry no spatial-correlation information and therefore do
+not by themselves reproduce the low-spatial-frequency dip that coincidence
+loss imprints on a power spectrum.
+
+References
+----------
+.. [1] Zambon, P. (2024). Modeling the impact of coincidence loss on count
+   rate statistics and noise performance in counting detectors for imaging
+   applications. *Frontiers in Physics*, 12, 1408430.
+   https://doi.org/10.3389/fphy.2024.1408430
+"""
+
 from __future__ import annotations
 
+import math
+import warnings
+
 import numpy as np
+from collections.abc import Sequence
+
 import torch
 import torch.nn.functional as F
 import lightning as L
 
+from .aberrations import FocalSpread
 from .fft import fft2, ifft2
+from .scattering._kernels import fourier_crop_xy
 from .progress import track
+from specter.options import AberrationModel, NoiseModel
+
+
+# Bound the dense coincidence lookup to 8 MiB and, below, four cells per
+# arriving electron. Sparse frames and tiny radii retain the sorting path.
+_COINCIDENCE_MAX_DENSE_CELLS = 2**20
 
 
 class Detector(L.LightningModule):
@@ -22,36 +56,109 @@ class Detector(L.LightningModule):
     pixel_size : float
         Pixel size in Å.
     aberration_model : str, optional
-        Specifies aberration model to use. Options include 'holography' and 'ctf'.
-        Default is 'holography'.
+        Specifies aberration model to use. Options include 'nonlinear' and 'linear'.
+        Default is 'nonlinear'.
     noise_model : str, optional
         Specifies noise model. Currently only 'poisson' available. Default is None
         (no noise applied).
     mtf : torch.Tensor, optional
         Modulation transfer function in Fourier space to apply to images.
-        Default is None (no MTF applied).
-    num_frames : int, optional
+        Must be normalised so ``MTF(0) == 1``; it is a pure blur and conserves
+        total counts. Default is None (no MTF applied).
+    dqe0 : float, optional
+        Zero-frequency detective quantum efficiency, i.e. the fraction of
+        incident electrons the detector records at all. Scales the expected
+        electron count, so it reduces the mean *and* the shot noise
+        consistently (thinning a Poisson process leaves a Poisson process).
+        Default 1.0 (an ideal counter: every electron is recorded).
+
+        Applied to the signal in :meth:`image`, so it takes effect regardless
+        of ``noise_model`` -- it is a property of detection, not of noise.
+        Use :func:`specter.detectors.dqe0_for_detector` to get the published
+        value for a named detector.
+    n_frames : int, optional
         Number of frames for dose-fractionated noise.
     progressbars : bool, optional
         Whether to show progress bars. Default True.
+    oversample : int, optional
+        How many times finer than the pixels the arriving wave's grid is; the
+        intensity is formed there and Fourier-cropped to the pixel grid.
+        Default 1.
+    focal_spread : FocalSpread, optional
+        Form the intensity as the incoherent sum over a Gaussian spread of
+        defocus (partial temporal coherence) instead of ``|psi|^2`` at the
+        nominal defocus; see :class:`~specter.aberrations.FocalSpread`. The
+        arriving wave must then carry no Cc envelope. Default None.
+
+    Notes
+    -----
+    ``mtf`` and ``dqe0`` are the two halves of a measured DQE curve and should
+    be taken from the same detector: ``dqe0 = DQE(0)`` and
+    ``MTF(k) = sqrt(DQE(k)/DQE(0))``. Setting one without the other silently
+    mis-models the detector.
+
+    References
+    ----------
+    .. [1] McMullan, G., Chen, S., Henderson, R., & Faruqi, A. R. (2009). Detective
+       quantum efficiency of electron area detectors in electron microscopy.
+       *Ultramicroscopy*, 109(9), 1126–1143.
+       https://doi.org/10.1016/j.ultramic.2009.04.002
     """
 
     def __init__(
         self,
         pixel_size: float,
-        aberration_model: str = "holography",
-        noise_model: str | None = None,
+        aberration_model: AberrationModel = "nonlinear",
+        noise_model: NoiseModel | None = None,
         mtf: torch.Tensor | None = None,
-        num_frames: int | None = None,
+        dqe0: float = 1.0,
+        n_frames: int | None = None,
+        dose_weights: torch.Tensor | None = None,
+        dose_weights_max_frequency: float | None = None,
         progressbars: bool = True,
+        oversample: int = 1,
+        focal_spread: FocalSpread | None = None,
     ):
         super().__init__()
+        if not 0.0 < dqe0 <= 1.0:
+            raise ValueError(f"dqe0 must be in (0, 1], got {dqe0}")
         self.pixel_size = pixel_size
         self.aberration_model = aberration_model
         self.noise_model = noise_model
-        self.register_buffer("mtf", mtf)
-        self.num_frames = num_frames
+        self.register_buffer("mtf", mtf, persistent=False)
+        self.dqe0 = dqe0
+        self.n_frames = n_frames
+        if dose_weights is not None:
+            # The weights' first dimension IS the motion-correction job's own
+            # fractionation, so it is data and takes precedence over a config
+            # value the same way a .cs file's pixel size, voltage and amplitude
+            # contrast do. `n_frames` otherwise defaults to 40, which is a
+            # convention rather than anything read from the movie -- EER stores
+            # ~2100 hardware frames and the grouping is a processing choice.
+            #
+            # Getting this wrong is silent, not loud: `apply_coincidence` loops
+            # over n_frames and indexes weights[i] while `_frame_weight_grids`
+            # normalises by the weights' own count, so a mismatch applies a
+            # prefix of the weights under the wrong normalisation and the
+            # filter stops preserving the signal.
+            weight_frames = int(dose_weights.shape[0])
+            if n_frames is not None and weight_frames != int(n_frames):
+                warnings.warn(
+                    f"dose_weights carries {weight_frames} frames but "
+                    f"n_frames={n_frames}; using {weight_frames}, since the "
+                    "weights record the motion-correction job's own "
+                    "fractionation. Set n_frames to match to silence this.",
+                    stacklevel=2,
+                )
+            self.n_frames = weight_frames
+        self.register_buffer("dose_weights", dose_weights, persistent=False)
+        self.dose_weights_max_frequency = dose_weights_max_frequency
         self.progressbars = progressbars
+        # The image is formed on the propagation grid, this many times finer
+        # than the pixel grid, and sampled down here before the detector's
+        # own response; see `imaging.ExitWave.apply_ctf`.
+        self.oversample = oversample
+        self.focal_spread = focal_spread
 
     def image(
         self, aberrated_exitwave: torch.Tensor, dose: torch.Tensor
@@ -64,58 +171,151 @@ class Detector(L.LightningModule):
         aberrated_exitwave : torch.Tensor
             Aberrated exit wave from microscope aberration module, shape (B, Y, X).
         dose : torch.Tensor
-            Dose per image in e-/Å², shape (B,). Used for CTF model scaling.
+            Total dose per image in e⁻/Å², shape (B,). Used for CTF model
+            scaling.
 
         Returns
         -------
         images : torch.Tensor
-            Detector image. For holography model, returns intensity (squared
-            magnitude). For CTF model, returns dose-scaled image.
+            Detector image. For the nonlinear model, returns intensity
+            (squared magnitude). For the linear model, returns dose-scaled
+            image.
+
+        Notes
+        -----
+        ``dqe0`` is folded into the dose here rather than applied downstream:
+        an electron that is never detected cannot contribute to the image, be
+        blurred by the MTF, or block a neighbour via coincidence loss. Scaling
+        the expected count is exactly equivalent to thinning the arrival
+        process, so the shot noise stays correct once ``torch.poisson`` is
+        applied later.
         """
-        dose_per_pixel = dose * self.pixel_size**2  # (B,)
-        if self.aberration_model == "holography":
-            images = dose_per_pixel[:, None, None] * torch.abs(aberrated_exitwave) ** 2
-        elif self.aberration_model == "ctf":
+        dose_per_pixel = dose * self.pixel_size**2 * self.dqe0  # (B,)
+        if self.aberration_model == "nonlinear":
+            images = dose_per_pixel[:, None, None] * self.intensity(aberrated_exitwave)
+        elif self.aberration_model == "linear":
             images = dose_per_pixel[:, None, None] * (aberrated_exitwave + 1)
         return images
+
+    def intensity(self, aberrated_exitwave: torch.Tensor) -> torch.Tensor:
+        """
+        The intensity an aberrated wave deposits, on the wave's own grid.
+
+        ``|psi|^2``, or with a :class:`~specter.aberrations.FocalSpread` the
+        incoherent sum of ``|psi|^2`` over the beam's spread of defocus. The
+        one place a wave becomes an intensity, so every image path (and the
+        frozen-exposure path, which sums intensities itself) agrees on it.
+
+        Parameters
+        ----------
+        aberrated_exitwave : torch.Tensor
+            Complex ``(..., Y, X)`` wave after the transfer function.
+
+        Returns
+        -------
+        torch.Tensor
+            Real ``(..., Y, X)``.
+        """
+        if self.focal_spread is None:
+            return aberrated_exitwave.abs().square()
+        return self.focal_spread.intensity(
+            aberrated_exitwave, self.pixel_size / self.oversample, self.oversample
+        )
 
     def anisomagnify(
         self, images: torch.Tensor, anisomag: torch.Tensor
     ) -> torch.Tensor:
         """
-        Apply anisotropic magnification to images.
+        Apply anisotropic magnification to images, without interpolating them.
+
+        Each image is resampled as ``out(x) = img(A (x - c) + c)`` about its
+        centre ``c = ((W - 1) / 2, (H - 1) / 2)``, with ``A`` the matrix in
+        `torch.nn.functional.affine_grid`'s normalised coordinates (the
+        convention the matrices from `specter.io` are written in) taken to
+        pixels. ``img`` between pixels is the image's own trigonometric
+        interpolant, ``sum_k F[k] exp(2 pi i k . u) / (H W)`` over its DFT
+        coefficients ``F``, evaluated at every warped position ``u`` at once by
+        a type-2 NUFFT (`specter.nufft.sample_transform`). That is exact for a
+        band-limited image and differentiable in it.
 
         Parameters
         ----------
         images : torch.Tensor
-            Input images with shape (B, H, W) where B is batch size.
+            Real images, shape (B, H, W).
         anisomag : torch.Tensor
             2x2 anisotropic magnification matrix for each image in batch,
-            shape (B, 2, 2).
+            shape (B, 2, 2), acting on (x, y).
 
         Returns
         -------
         magnified_images : torch.Tensor
             Images after anisotropic magnification, shape (B, H, W).
+
+        Notes
+        -----
+        A bilinear resampling of the pixel grid (``grid_sample``, used until
+        2026-10-18) attenuates a frequency ``f`` by ``|1 - t + t exp(2 pi i
+        f)|`` at a fractional offset ``t``, about 0.16 at ``f = 0.45`` cycles
+        per pixel and ``t = 0.5``. Under a 0.9% magnification anisotropy those
+        offsets reach a pixel across a large particle and vary over it, so
+        the near-Nyquist signal of an inverse problem's prediction was damped
+        in a way its map could not absorb. On EMPIAR-10551 (0.781 A/px)
+        replacing it moved Ghostbuster's half-map resolution from 1.660 to
+        1.616 A, and on EMPIAR-12391 from 2.221 to 2.185 A.
+
+        The interpolant is periodic, so what the warp moves past one edge of
+        the box re-enters at the other. Sampling the image's discrete-space
+        transform at ``A^-T k`` instead would treat the image as zero outside
+        the box, and the box edge then rings across the whole image. The
+        image mean is removed before the transform and restored after it, so
+        the NUFFT's error, which is relative to the total norm, is set by the
+        fluctuation rather than by the mean.
+
+        References
+        ----------
+        .. [1] Zivanov, J., Nakane, T., & Scheres, S. H. W. (2020). Estimation of
+           high-order aberrations and anisotropic magnification from cryo-EM data
+           sets in *RELION*-3.1. *IUCrJ*, 7(2), 253–267.
+           https://doi.org/10.1107/S2052252520000081
         """
-        images = images.unsqueeze(1)
-        B = len(images)
+        from .nufft import sample_transform
 
-        # Identity matrix (Bx3x3)
-        M_affine = torch.eye(3).unsqueeze(0).repeat(B, 1, 1)
-        M_affine = M_affine.to(images.device)
-        M_affine[:, :2, :2] = anisomag
-
-        # Convert to (B, 2, 3) format by repeating for all batch elements
-        M_affine = M_affine[:, :2, :]  # Shape: (B, 2, 3)
-
-        # Generate affine grid for the batch
-        grid = F.affine_grid(M_affine, list(images.shape), align_corners=False)
-
-        # Apply transformation using grid sampling
-        images = F.grid_sample(images, grid, align_corners=False, padding_mode="border")
-        images = torch.squeeze(images, dim=1)
-        return images
+        with torch.autocast(images.device.type, enabled=False):
+            x = images if images.dtype == torch.float64 else images.float()
+            dtype, device = x.dtype, x.device
+            _, H, W = x.shape
+            mean = x.mean(dim=(-2, -1), keepdim=True)
+            # Centred DFT coefficients: index n holds frequency n - (H//2, W//2)
+            # cycles per box, sample_transform's own phase origin.
+            coeffs = torch.fft.fftshift(torch.fft.fft2(x - mean), dim=(-2, -1))
+            yy, xx = torch.meshgrid(
+                torch.arange(H, device=device, dtype=dtype),
+                torch.arange(W, device=device, dtype=dtype),
+                indexing="ij",
+            )
+            c = torch.tensor([(W - 1) / 2, (H - 1) / 2], device=device, dtype=dtype)
+            pix = torch.stack([xx.flatten(), yy.flatten()], dim=-1) - c  # (x, y)
+            # affine_grid's normalised coordinate is (pixel - c) / (W / 2, H / 2):
+            # the same matrix in pixels is D A D^-1.
+            D = torch.tensor([W / 2, H / 2], device=device, dtype=dtype)
+            A = anisomag.to(device=device, dtype=dtype)
+            A = D[:, None] * A / D[None, :]
+            box = torch.tensor([W, H], device=device, dtype=dtype)
+            # Images sharing a matrix (one optics group, as a rule) share their
+            # sample points, which are set once for the group.
+            groups, which = torch.unique(A.reshape(-1, 4), dim=0, return_inverse=True)
+            out = torch.empty_like(x)
+            for g, flat_matrix in enumerate(groups):
+                idx = (which == g).nonzero().flatten()
+                u = (
+                    pix @ flat_matrix.reshape(2, 2).T + c
+                )  # where each output pixel samples
+                # sum_m F[m] exp(+2 pi i m . u / box) is the transform at -u / box,
+                # which is 1-periodic: wrapped into [-1/2, 1/2) for the NUFFT.
+                q = -u / box
+                vals = sample_transform(coeffs[idx], q - torch.round(q))
+                out[idx] = vals.real.reshape(-1, H, W) / (H * W)
+            return (out + mean).to(images.dtype)
 
     def add_mtf(self, images: torch.Tensor, mtf: torch.Tensor) -> torch.Tensor:
         """
@@ -142,6 +342,7 @@ class Detector(L.LightningModule):
         coincidence_radius: torch.Tensor,
         anisomag: torch.Tensor | None = None,
         nxy: int | None = None,
+        seeds: Sequence[int] | None = None,
     ) -> torch.Tensor:
         """
         Simulate detection process: conversion to intensity, magnification, MTF, and noise.
@@ -151,13 +352,16 @@ class Detector(L.LightningModule):
         aberrated_exitwave : torch.Tensor
             Aberrated exit wave from microscope aberration module.
         dose : torch.Tensor
-            Dose per image in e-/Å², shape (B,).
+            Total dose per image in e⁻/Å², shape (B,).
         coincidence_radius : torch.Tensor
             Coincidence radius per image in pixels, shape (B,).
         anisomag : torch.Tensor, optional
             Anisotropic magnification matrices.
         nxy : int, optional
             Output image size in pixels. If provided, center-crops the image.
+        seeds : sequence of int, optional
+            One RNG seed per image for the noise draws, see
+            :meth:`detect_expected_counts`.
 
         Returns
         -------
@@ -165,6 +369,56 @@ class Detector(L.LightningModule):
             Simulated images after detection.
         """
         images = self.image(aberrated_exitwave, dose)
+        return self.detect_expected_counts(
+            images, dose, coincidence_radius, anisomag, nxy, seeds=seeds
+        )
+
+    def from_intensity(
+        self,
+        intensity: torch.Tensor,
+        dose: torch.Tensor,
+        coincidence_radius: torch.Tensor,
+        anisomag: torch.Tensor | None = None,
+        nxy: int | None = None,
+    ) -> torch.Tensor:
+        """Detect an incoherent, dose-averaged intensity (vacuum intensity = 1).
+
+        Used after integrating frozen configurations. Does not take a square
+        root or invent a coherent wave. DQE, pixel area and dose enter once.
+        """
+        if intensity.is_complex() or intensity.ndim != 3:
+            raise ValueError("intensity must be real with shape (B,Y,X)")
+        if not torch.isfinite(intensity).all() or (intensity < 0).any():
+            raise ValueError("intensity must be finite and nonnegative")
+        images = intensity * (dose * self.pixel_size**2 * self.dqe0)[:, None, None]
+        return self.detect_expected_counts(
+            images, dose, coincidence_radius, anisomag, nxy
+        )
+
+    def detect_expected_counts(
+        self,
+        images: torch.Tensor,
+        dose: torch.Tensor,
+        coincidence_radius: torch.Tensor,
+        anisomag: torch.Tensor | None = None,
+        nxy: int | None = None,
+        seeds: Sequence[int] | None = None,
+    ) -> torch.Tensor:
+        """Apply spatial detector response and sampling to expected counts.
+
+        Input counts already include dose, pixel area and detection efficiency.
+        Noise is drawn only here, after configuration integration. With
+        `seeds`, one per image, each image's draws come from its own
+        generator seeded to its entry, so they depend on nothing but that
+        seed -- not on the batch it arrived in or on what was drawn before.
+        Without, every draw comes from the global RNG.
+        """
+        # The intensity on the propagation grid, sampled to the pixel grid:
+        # a band-limited (Fourier) crop, since the camera's measured MTF
+        # already carries the pixel aperture. Before anything that is defined
+        # on the pixel grid (crop size, magnification, MTF, noise).
+        if self.oversample > 1:
+            images = fourier_crop_xy(images, images.shape[-1] // self.oversample)
 
         # Set default crop size
         if nxy is None:
@@ -186,101 +440,121 @@ class Detector(L.LightningModule):
         if anisomag is not None:
             images = self.anisomagnify(images, anisomag)
 
-        # Apply detector MTF
+        # Apply detector MTF -- deliberately BEFORE the Poisson draw below, which is
+        # what makes this a COUNTING detector. `apply_coincidence` samples arrivals and
+        # deposits one count per surviving electron into one pixel, so the recorded
+        # noise is white however wide the MTF is: a Poisson point process whose points
+        # are independently displaced is still a Poisson point process. The blur lives
+        # in the ensemble mean (hence MTF < 1) and not in any single event. That is the
+        # right model for K2/K3/Falcon counting mode -- every MTF bundled in
+        # detectors.py is a counting-mode curve -- and it is the published behaviour:
+        # a counting detector's NPS is flat "due to the counting mode which assigns
+        # detected electrons to single pixels" (Ruskin, Yu & Grigorieff 2013,
+        # J. Struct. Biol. 184, 385-393).
+        #
+        # Do not "fix" this ordering. Drawing the noise first and blurring afterwards
+        # models an INTEGRATING sensor, where one electron's charge cloud really is
+        # split between neighbouring pixels, so the noise carries the kernel and NPS
+        # becomes proportional to MTF^2 (ibid., Eq. 11). That is a different camera,
+        # not a bug fix, and it is only self-consistent alongside the Landau/Swank
+        # spread of deposited charge and the removal of coincidence loss, which is a
+        # failure of the event finder and has no meaning without one.
         if self.mtf is not None:
             images = self.add_mtf(images, self.mtf)
 
         if self.noise_model is None:
             return images
-        else:
-            return torch.stack(
-                [
-                    self.apply_coincidence(img, d.item(), r.item())
-                    for img, d, r in zip(images, dose, coincidence_radius)
-                ]
+        # One host transfer per argument for the whole batch rather than two
+        # `.item()` syncs per image, and the frame-weight grids built once:
+        # every image in the batch shares their shape and device.
+        radii = coincidence_radius.tolist()
+        weights = (
+            self._frame_weight_grids(
+                (int(images.shape[-2]), int(images.shape[-1])), images.device
             )
+            if self.noise_model == "poisson"
+            else None
+        )
+        if seeds is None:
+            generators: list[torch.Generator | None] = [None] * len(radii)
+        else:
+            if len(seeds) != len(radii):
+                raise ValueError(
+                    f"{len(seeds)} seeds for {len(radii)} images: pass one per image"
+                )
+            generators = [
+                torch.Generator(device=images.device).manual_seed(int(s)) for s in seeds
+            ]
+        return torch.stack(
+            [
+                self._apply_coincidence(img, r, weights, generator=g)
+                for img, r, g in zip(images, radii, generators)
+            ]
+        )
 
     def apply_detector_physics(
         self,
         intensity_map: torch.Tensor,
-        pixel_size_angstrom: float,
+        pixel_size: float,
         dose_per_angstrom_sq_per_frame: float,
-        coinc_radius_pixels: float = 1.5,
+        coinc_radius_pixels: float = 0.6,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """
-        Simulates a single frame of a Direct Electron Detector (DED).
+        Simulates a single frame of a Direct Electron Detector (DED), using a
+        randomized square-cell grid to suppress coincident arrivals.
 
         Parameters
         ----------
         intensity_map : torch.Tensor
             2D Tensor (normalized psi^2 from multislice).
-        pixel_size_angstrom : float
-            Size of one pixel in Angstroms (e.g., 1.0).
+        pixel_size : float
+            Size of one pixel in Å.
         dose_per_angstrom_sq_per_frame : float
-            Physical dose (e/A^2).
+            Physical dose in this single frame, in e⁻/Å² (the image total
+            divided by ``n_frames``).
         coinc_radius_pixels : float, optional
-            Dead-time radius in pixels.
+            Effective coincidence exclusion radius in pixels -- see
+            :meth:`apply_coincidence` for the definition and calibration.
+        generator : torch.Generator, optional
+            RNG for every draw in the frame, on `intensity_map`'s device.
+            Default the global RNG.
+
+        Notes
+        -----
+        The suppression grid's cell side is ``r * sqrt(pi)`` so that the cell
+        *area* equals ``pi * r**2``, i.e. the area of the exclusion disc of
+        radius ``r``. Since the electron-loss rate depends on the exclusion
+        *area* (not on the cell's shape), this makes ``coinc_radius_pixels``
+        numerically equivalent to the radius of a true pairwise exclusion
+        disc, rather than a shape-specific grid parameter. Verified against an
+        exact O(n^2) pairwise implementation: the fitted effective area of
+        this rule matches ``pi * r**2`` to within 0.4% over r = 1-3 px, and
+        the pairwise rule to within 0.2% -- see
+        ``tests/test_detector_coincidence.py``.
+
+        Resolving exclusion per cell also keeps coincidence *locally bounded*:
+        it cannot chain transitively across the frame the way a pairwise
+        connected-component rule does, which is what keeps the model stable at
+        the high dose rates it was calibrated against.
         """
-        det_h, det_w = intensity_map.shape
         device = intensity_map.device
 
-        # 1. Convert physical dose to expected electrons in this frame
-        dose_per_pixel = dose_per_angstrom_sq_per_frame * (pixel_size_angstrom**2)
-        total_expected_electrons = dose_per_pixel * (det_h * det_w)
+        if coinc_radius_pixels <= 0.0:
+            # No coincidence cells: the frame is its Poisson draw alone. Also
+            # the only safe path here -- a zero cell side divides by zero
+            # below, and a zero pad crops the frame to nothing.
+            h, w = intensity_map.shape
+            dose_per_pixel = dose_per_angstrom_sq_per_frame * (pixel_size**2)
+            return torch.poisson(
+                intensity_map * (dose_per_pixel * h * w), generator=generator
+            )
 
-        # 2. Poisson number of incident electrons
-        n_e = int(
-            torch.poisson(torch.tensor(total_expected_electrons, device=device)).item()
-        )
-        if n_e <= 0:
-            return torch.zeros_like(intensity_map)
+        # Nominal cell side, chosen so cell area == pi*r^2 (see Notes above).
+        cell_size_nominal = coinc_radius_pixels * math.sqrt(math.pi)
 
-        # 3. Sample landing coordinates from intensity_map distribution
-        prob_dist = intensity_map.reshape(-1)
-        prob_dist = prob_dist / prob_dist.sum()
-        indices = torch.multinomial(prob_dist, n_e, replacement=True)
-
-        iy = (indices // det_w).float()
-        ix = (indices % det_w).float()
-        coords = torch.stack([ix, iy], dim=1)
-        coords += torch.rand((n_e, 2), device=device)
-
-        # 4. Coincidence suppression (greedy, as requested)
-        keep = torch.ones(n_e, dtype=torch.bool, device=device)
-        r_sq = float(coinc_radius_pixels) * float(coinc_radius_pixels)
-        for i in range(n_e):
-            if not keep[i]:
-                continue
-            if i + 1 >= n_e:
-                break
-            d_sq = torch.sum((coords[i + 1 :] - coords[i]) ** 2, dim=1)
-            close = d_sq < r_sq
-            keep[i + 1 :][close] = False
-
-        coords = coords[keep]
-
-        # 5. Bin into detector pixels
-        pixels = torch.zeros_like(intensity_map)
-        ix_f = coords[:, 0].long().clamp(0, det_w - 1)
-        iy_f = coords[:, 1].long().clamp(0, det_h - 1)
-        pixels.index_put_(
-            (iy_f, ix_f),
-            torch.ones_like(ix_f, dtype=intensity_map.dtype),
-            accumulate=True,
-        )
-        return pixels
-
-    def apply_detector_physics_fast(
-        self,
-        intensity_map: torch.Tensor,
-        pixel_size_angstrom: float,
-        dose_per_angstrom_sq_per_frame: float,
-        coinc_radius_pixels: float = 1.5,
-    ) -> torch.Tensor:
-        device = intensity_map.device
-
-        # 0. Pad map to avoid edge artifacts
-        pad = int(np.ceil(coinc_radius_pixels * 2))
+        # 0. Pad map to avoid edge artifacts (a few cell widths)
+        pad = int(np.ceil(cell_size_nominal * 3))
         orig_h, orig_w = intensity_map.shape
         # Use reflect padding to keep intensity levels consistent at the edge
         intensity_map = F.pad(
@@ -293,7 +567,7 @@ class Detector(L.LightningModule):
         # 1. Convert physical dose to expected electron count
         # Use original (unpadded) dimensions: Poisson-per-pixel sampling means
         # padded pixels inflate the per-pixel lambda in the original region.
-        dose_per_pixel = dose_per_angstrom_sq_per_frame * (pixel_size_angstrom**2)
+        dose_per_pixel = dose_per_angstrom_sq_per_frame * (pixel_size**2)
         total_expected = dose_per_pixel * orig_h * orig_w
 
         # 2. Sample landing positions from intensity map + sub-pixel jitter
@@ -301,7 +575,7 @@ class Detector(L.LightningModule):
         lambda_map = intensity_map * total_expected
 
         # sample electrons per pixel
-        counts = torch.poisson(lambda_map)
+        counts = torch.poisson(lambda_map, generator=generator)
 
         # get pixels that received electrons
         iy, ix = torch.nonzero(counts, as_tuple=True)
@@ -313,54 +587,69 @@ class Detector(L.LightningModule):
             return torch.zeros_like(intensity_map)[pad:-pad, pad:-pad]
 
         # repeat pixel coordinates
-        ix = ix.repeat_interleave(n_per_pixel)
-        iy = iy.repeat_interleave(n_per_pixel)
+        ix = ix.repeat_interleave(n_per_pixel, output_size=n_e)
+        iy = iy.repeat_interleave(n_per_pixel, output_size=n_e)
 
         coords = torch.stack([ix.float(), iy.float()], dim=1)
 
         # add subpixel jitter
-        coords += torch.rand((n_e, 2), device=device)
+        coords += torch.rand((n_e, 2), device=device, generator=generator)
 
         # 3. Assign electrons to coincidence grid cells
         # Introduce a slight randomization to the cell size to mimic detector variation
-        base_cell_size = coinc_radius_pixels / (2**0.5)
-        cell_size = base_cell_size * (1 + 0.05 * torch.randn(1, device=device)).clamp(
-            0.8, 1.2
-        )
+        cell_size = cell_size_nominal * (
+            1 + 0.05 * torch.randn(1, device=device, generator=generator)
+        ).clamp(0.8, 1.2)
 
         # Random shift to prevent the grid from "locking" onto specific pixels
-        shift = (torch.rand(2, device=device) - 0.5) * cell_size
+        shift = (torch.rand(2, device=device, generator=generator) - 0.5) * cell_size
         shifted_coords = coords + shift
 
         # Calculate cell coordinates
         cell_x = (shifted_coords[:, 0] / cell_size).floor().long()
         cell_y = (shifted_coords[:, 1] / cell_size).floor().long()
 
-        # 2. Robust cell_id generation
-        # Normalize to zero by subtracting the minimums found in this specific frame
-        cx_min, cy_min = cell_x.min(), cell_y.min()
-        grid_w = (cell_x.max() - cx_min) + 1
-
-        # Generate unique 1D hash for each grid cell
-        cell_id = (cell_y - cy_min) * grid_w + (cell_x - cx_min)
-
-        # 4. Coincidence suppression
-        perm = torch.randperm(n_e, device=device)
-        sort_idx = torch.argsort(cell_id[perm], stable=True)
-        sorted_cell_id = cell_id[perm][sort_idx]
-
-        is_first = torch.ones(n_e, dtype=torch.bool, device=device)
-        is_first[1:] = sorted_cell_id[1:] != sorted_cell_id[:-1]
-        coords_kept = coords[perm][sort_idx][is_first]
+        # The random shift moves coordinates by at most half a cell, so
+        # cell indices start at -1. Bound the other end using the smallest
+        # allowed cell width; this avoids a GPU scalar read to size the lookup.
+        grid_w = math.ceil(det_w / (cell_size_nominal * 0.8)) + 2
+        grid_h = math.ceil(det_h / (cell_size_nominal * 0.8)) + 2
+        n_cells = grid_w * grid_h
+        perm = torch.randperm(n_e, device=device, generator=generator)
+        if n_cells <= min(_COINCIDENCE_MAX_DENSE_CELLS, 4 * n_e):
+            cell_id = (cell_y + 1) * grid_w + (cell_x + 1)
+            permuted_cells = cell_id[perm]
+            order = torch.arange(n_e, device=device)
+            first = torch.full((n_cells,), n_e, dtype=torch.long, device=device)
+            first.scatter_reduce_(
+                0, permuted_cells, order, reduce="amin", include_self=True
+            )
+            # The minimum shuffled rank is exactly the first entry a stable
+            # sort by cell would retain. Deposit zero for rejected arrivals
+            # to avoid a dynamic boolean gather and its CUDA synchronization.
+            weights = (first[permuted_cells] == order).to(intensity_map.dtype)
+            coords_kept = coords[perm]
+        else:
+            # Memory scales with arrivals here, even when tiny radii imply
+            # billions of mostly empty cells. Keep the original stable sort.
+            cx_min, cy_min = cell_x.min(), cell_y.min()
+            occupied_grid_w = (cell_x.max() - cx_min) + 1
+            cell_id = (cell_y - cy_min) * occupied_grid_w + (cell_x - cx_min)
+            sort_idx = torch.argsort(cell_id[perm], stable=True)
+            sorted_cell_id = cell_id[perm][sort_idx]
+            is_first = torch.ones(n_e, dtype=torch.bool, device=device)
+            is_first[1:] = sorted_cell_id[1:] != sorted_cell_id[:-1]
+            coords_kept = coords[perm][sort_idx][is_first]
+            weights = torch.ones(
+                len(coords_kept), dtype=intensity_map.dtype, device=device
+            )
 
         # 5. Bin into detector pixels
         ix_f = coords_kept[:, 0].long().clamp(0, det_w - 1)
         iy_f = coords_kept[:, 1].long().clamp(0, det_h - 1)
         flat_idx = iy_f * det_w + ix_f
         pixels = torch.zeros(det_h * det_w, dtype=intensity_map.dtype, device=device)
-        pixels.scatter_add_(
-            0, flat_idx, torch.ones_like(flat_idx, dtype=intensity_map.dtype)
-        )
+        pixels.scatter_add_(0, flat_idx, weights)
 
         return pixels.reshape(det_h, det_w)[pad:-pad, pad:-pad]
 
@@ -375,49 +664,228 @@ class Detector(L.LightningModule):
         img : torch.Tensor
             Total-dose image, shape (H, W).
         dose : float
-            Total dose for this image in e-/Å².
+            Total dose for this image in e⁻/Å². Unused: the expected counts
+            per frame are derived from ``img`` itself, which already carries
+            the dose. Kept for the callers that pass it positionally.
         coincidence_radius : float
-            Coincidence radius in pixels. If <= 0, plain Poisson noise is applied.
+            Effective coincidence exclusion radius in pixels: within a single
+            readout frame, an arriving electron is lost if it lands inside the
+            exclusion area (``pi * r**2``) of one already recorded. If <= 0,
+            plain Poisson noise is applied with no coincidence loss.
+
+            This is a *physical* radius -- the lateral scale over which one
+            electron's charge cloud renders the detector unable to resolve a
+            second arrival -- so it converts directly to real units by
+            multiplying by the detector's physical pixel pitch.
 
         Returns
         -------
         final_image : torch.Tensor
             Simulated image after dose-fractionated noise and coincidence.
+
+        Notes
+        -----
+        Calibrated against beam-only Falcon 4i micrographs spanning
+        0.15-31.29 e-/px/s, with the detector's counting efficiency modelled
+        explicitly as ``dqe0=0.92``: ``coincidence_radius = 2.0`` px (~28 um
+        at the 4096^2 sensor's 14 um pitch) reproduces the measured
+        detected-electron yield to ~3% RMSE across the full dose range,
+        together with the characteristic low-spatial-frequency dip in the
+        power spectrum (``manuscript/coincidence-loss-exp.ipynb``). An
+        earlier fit of 2.394 px was made without DQE(0) and absorbed that
+        ~8% loss into the radius; using it together with ``dqe0=0.92`` counts
+        the loss twice. The radius is a property of the camera unit and its
+        counting configuration, so treat this value as a prior and
+        re-calibrate from beam-only or empty-ice frames when a dataset
+        provides them.
+
+        This is a deliberately simplified, *locally bounded* model: exclusion
+        is resolved per grid cell, so coincidence cannot chain transitively
+        across the frame. Roach-style statistical-overlap models (see the
+        module docstring's Zambon reference) instead merge any connected chain
+        of overlapping events into one, which is a good description at low
+        flux but percolates into a single frame-spanning cluster at the
+        higher dose rates measured here.
+
+        The radius is a true exclusion radius: the suppression grid's cell
+        side is ``r * sqrt(pi)``, so the cell area, and with it the effective
+        exclusion area, is ``pi * r**2`` (see
+        :meth:`apply_detector_physics`).
+
+        References
+        ----------
+        .. [1] Li, X., Zheng, S. Q., Egami, K., Agard, D. A., & Cheng, Y. (2013).
+           Influence of electron dose rate on electron counting images recorded
+           with the K2 camera. *Journal of Structural Biology*, 184(2), 251–260.
+           https://doi.org/10.1016/j.jsb.2013.08.005
+        .. [2] McMullan, G., Faruqi, A. R., Clare, D., & Henderson, R. (2014).
+           Comparison of optimal performance at 300 keV of three direct electron
+           detectors for use in low dose electron microscopy. *Ultramicroscopy*,
+           147, 156–163. https://doi.org/10.1016/j.ultramic.2014.08.002
+        .. [3] Zambon, P. (2024). Modeling the impact of coincidence loss on count rate
+           statistics and noise performance in counting detectors for imaging
+           applications. *Frontiers in Physics*, 12, 1408430.
+           https://doi.org/10.3389/fphy.2024.1408430
+        """
+        if self.noise_model != "poisson":
+            return img
+        weights = self._frame_weight_grids(
+            (int(img.shape[-2]), int(img.shape[-1])), img.device
+        )
+        return self._apply_coincidence(img, coincidence_radius, weights)
+
+    def _apply_coincidence(
+        self,
+        img: torch.Tensor,
+        coincidence_radius: float,
+        weights: torch.Tensor | None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """
+        Body of :meth:`apply_coincidence`, with the frame-weight grids given.
+
+        Parameters
+        ----------
+        img : torch.Tensor
+            Total-dose image, shape (H, W).
+        coincidence_radius : float
+            Coincidence exclusion radius in pixels.
+        weights : torch.Tensor or None
+            ``self._frame_weight_grids(img.shape, img.device)``, hoisted so a
+            batch builds it once rather than once per image.
+        generator : torch.Generator, optional
+            RNG for every draw, on `img`'s device. Default the global RNG.
+
+        Returns
+        -------
+        torch.Tensor
+            Simulated image after dose-fractionated noise and coincidence.
         """
         if self.noise_model != "poisson":
             return img
 
-        if coincidence_radius <= 0.0:
-            return torch.poisson(torch.clamp(img, min=0.0))
+        if coincidence_radius <= 0.0 and self.dose_weights is None:
+            return torch.poisson(torch.clamp(img, min=0.0), generator=generator)
 
-        if self.num_frames is None:
+        if self.n_frames is None:
             raise ValueError(
-                "num_frames must be set on the Detector to apply dose-fractionated "
+                "n_frames must be set on the Detector to apply dose-fractionated "
                 "coincidence loss (coincidence_radius > 0)."
             )
-        n_frames = self.num_frames
-        intensity_map = img / img.sum()
+        n_frames = self.n_frames
 
-        # Use img.sum() to derive the effective dose so that the radius>0 path
-        # agrees with torch.poisson(img) at radius=0: both correctly account
-        # for real electron absorption from alpha (imaginary potential), and
-        # B-factor attenuation is treated consistently across both paths.
-        dose_effective = (
-            img.sum() / (self.pixel_size**2 * img.shape[0] * img.shape[1])
-        ).item()
+        # Clamp before normalizing, matching the coincidence_radius<=0 branch
+        # above -- otherwise any negative pixel survives the division below.
+        img = torch.clamp(img, min=0.0)
+        img_sum = img.sum()
+        # Both scalars in one host transfer. The effective dose is divided on
+        # the device, in the image's own precision, exactly as before.
+        img_sum_host, dose_effective = torch.stack(
+            [img_sum, img_sum / (self.pixel_size**2 * img.shape[0] * img.shape[1])]
+        ).tolist()
+        if img_sum_host <= 0.0:
+            # No expected electrons anywhere (e.g. an all-zero specimen
+            # volume -- can happen with scattering_model="ctf", which has no
+            # vacuum baseline, unlike multislice's exp(i*sigma*dz*V) == 1 at
+            # V=0). img / img_sum would be 0/0 = NaN here; the physically
+            # correct output for zero expected signal is a blank frame.
+            return torch.zeros_like(img)
+        intensity_map = img / img_sum
+
+        # dose_effective above is derived from img_sum so that the radius>0
+        # path agrees with torch.poisson(img) at radius=0: both correctly
+        # account for real electron absorption from alpha (imaginary
+        # potential), and B-factor attenuation is treated consistently across
+        # both paths.
 
         final_image = torch.zeros_like(img)
-        for _ in track(
+        accum_k = None
+        for i in track(
             range(n_frames),
             description="Applying coincidence loss",
             transient=True,
             disable=not (self.progressbars),
         ):
-            final_image += self.apply_detector_physics_fast(
+            frame = self.apply_detector_physics(
                 intensity_map,
                 self.pixel_size,
                 dose_effective / n_frames,
                 coinc_radius_pixels=coincidence_radius,
+                generator=generator,
             )
+            if weights is None:
+                final_image += frame
+            else:
+                # Sum the frames in Fourier space under the exposure filter's
+                # own per-frequency weights, rather than adding them equally.
+                # Every frame carries the same expected signal, so weights
+                # normalised to sum to n_frames leave the signal untouched and
+                # multiply the noise POWER by sum(w^2)/n_frames -- the rising
+                # floor a signal-preserving dose weighting leaves behind, and
+                # the one thing `dose_envelope` cannot express, since it
+                # attenuates the signal and leaves the noise white.
+                f = torch.fft.rfft2(frame)
+                accum_k = (
+                    f * weights[i] if accum_k is None else accum_k + f * weights[i]
+                )
+        if accum_k is not None:
+            final_image = torch.fft.irfft2(accum_k, s=tuple(img.shape[-2:]))
 
         return final_image
+
+    def _frame_weight_grids(
+        self, shape: tuple[int, int], device: torch.device
+    ) -> torch.Tensor | None:
+        """
+        Per-frame, per-frequency weights on this image's rfft2 grid.
+
+        `dose_weights` is stored as ``(n_frames, n_bins)`` over a radial axis
+        running to the Nyquist **of the movie it was computed on**, which is
+        not in general the Nyquist of the particles. Super-resolution and EER
+        movies are the usual case: EMPIAR-11377's Falcon 4i weights span twice
+        the Nyquist of its 0.731 A/px particles, so reading them as if the
+        axis ended at the particles' own Nyquist stretches the steep half of
+        the curve across the whole measurable band and overstates the noise
+        gain threefold (6.76x against a measured 2.22x at 0.9 Nyquist).
+
+        `dose_weights_max_frequency` is the frequency its last bin sits at,
+        in 1/Angstrom, so the mapping is done in absolute frequency and a
+        stack downsampled or Fourier-cropped after motion correction still
+        gets the weights that apply at the frequencies it kept.
+        :func:`~specter.io.load_dose_weights` derives it from the job's own
+        files. Without it the axis is assumed to end at the image's Nyquist,
+        which is right only by coincidence.
+
+        Parameters
+        ----------
+        shape : tuple of int
+            Image shape ``(Y, X)``.
+        device : torch.device
+            Device for the returned grids.
+
+        Returns
+        -------
+        torch.Tensor or None
+            Shape ``(n_frames, Y, X // 2 + 1)``, normalised so the weights at
+            each frequency sum to ``n_frames``; None when no weights are set.
+        """
+        if self.dose_weights is None:
+            return None
+        w = self.dose_weights.to(device).float()
+        n_frames, n_bins = w.shape
+        ky = torch.fft.fftfreq(shape[0], device=device)
+        kx = torch.fft.rfftfreq(shape[1], device=device)
+        # Fraction of the WEIGHTS' Nyquist, which is what the radial axis
+        # indexes -- not the image's, when the two differ.
+        # Absolute frequency, in 1/Angstrom, mapped onto the weights' own
+        # axis. Keying on frequency rather than on a fraction of somebody's
+        # Nyquist is what makes a later crop or downsample harmless.
+        k = torch.sqrt(ky[:, None] ** 2 + kx[None, :] ** 2) / self.pixel_size
+        max_freq = self.dose_weights_max_frequency
+        if max_freq is None:
+            max_freq = 1.0 / (2.0 * self.pixel_size)
+        r = k / max_freq
+        idx = torch.clamp((r * (n_bins - 1)).round().long(), 0, n_bins - 1)
+        grids = w[:, idx.reshape(-1)].reshape(n_frames, *idx.shape)
+        total = grids.sum(dim=0, keepdim=True).clamp(min=1e-12)
+        return grids * (n_frames / total)

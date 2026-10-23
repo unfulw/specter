@@ -9,6 +9,7 @@ writes a `.mrc` volume this pipeline then loads directly.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import time
@@ -16,21 +17,43 @@ import time
 import torch
 
 import specter
-from specter.config import TiltSeriesConfig
-from specter.imagegenerator import TiltSeriesGenerator
+from specter.config import (
+    TiltSeriesConfig,
+    TomogramConfig,
+    validate_config,
+)
+from specter.imaging import CTF, Exposure, Poses, Sample
+from specter.imaging._stages import SEED_STAGE_SPECIMEN, read_dose_weights
+from specter.random_seed import derive_seed
 from specter.io import create_micrograph_starfile
 from specter.specimen import load_specimen_volume
 
-from ._common import (
-    _console,
-    _format_elapsed,
-    _parse_device,
-    _save_exitwave_pair,
-    _section,
+from specter.devices import parse_device, resolve_available_device
+from specter.settings import (
+    Camera,
+    Envelopes,
+    Ice,
+    Propagation,
+    TiltGeometry,
+    bundle_from_config,
 )
+from specter.progress import console, section, track
+from ._common import (
+    _mm_to_angstrom,
+    _normalize_images,
+    _print_total_time,
+    _seed_or_draw,
+    _reserve_next_job_id,
+    _save_exitwave_pair,
+    _tracked_output_dir,
+    resolve_output_dir,
+)
+from ._tomogram import run_build_tomogram, tomogram_output_path
 
 
-def run_tilt_series(config: TiltSeriesConfig) -> None:
+def run_tilt_series(
+    config: TiltSeriesConfig, *, tomogram_config: TomogramConfig | None = None
+) -> None:
     """
     Load a specimen volume, simulate a cryo-ET tilt series, and save it as
     ``.mrcs`` + ``.star``.
@@ -41,34 +64,123 @@ def run_tilt_series(config: TiltSeriesConfig) -> None:
         Fully-resolved run configuration, e.g. from
         :func:`specter.config.load_config`, or constructed directly in
         Python. ``config.volume_path`` must be set -- e.g. the output of
-        `specter build tomogram`.
+        `specter build tomogram` -- unless ``tomogram_config`` is given.
+    tomogram_config : TomogramConfig, optional
+        If given, build this specimen volume first (`run_build_tomogram`)
+        and use its output as this run's specimen -- chaining `specter
+        build tomogram` + `specter simulate tiltseries` in one call.
+        ``config.volume_path`` must be unset in this case (the two
+        specimen sources are mutually exclusive). Always builds exactly
+        one tomogram (`run_build_tomogram`'s ``n_tomograms=1`` default,
+        not exposed here) -- for several tomograms, call
+        `run_build_tomogram(tomogram_config, n_tomograms=N)` yourself and
+        loop `run_tilt_series(config=..., ...)` over each resulting
+        ``volume_path`` instead. Unless ``tomogram_config.seed`` is set, the
+        tomogram is seeded from ``config.seed`` (drawn and printed first if
+        unset), so the one seed reproduces specimen and series together.
+
+        If this run is tracked (``config.project``/``job_id`` set) and
+        ``tomogram_config`` wasn't independently configured for tracking,
+        ``tomogram_config``'s project and output_dir are set to match --
+        one tracked chained call then produces two separate jobs, one
+        "tomograms" and one "tiltseries", under the same project, linked
+        implicitly by this run's ``volume_path`` pointing into the
+        tomogram job's directory. Give ``tomogram_config`` its own
+        ``project``/``job_id`` explicitly to opt out of this (e.g. to
+        reuse one tracked tomogram build across several tiltseries runs in
+        a different project).
     """
+    if tomogram_config is not None:
+        if config.volume_path:
+            raise ValueError(
+                "run_tilt_series: tomogram_config and config.volume_path "
+                "can't both be set -- pass exactly one specimen source: "
+                "tomogram_config to build a fresh volume first, or "
+                "config.volume_path to reuse an already-built one."
+            )
+
+        # Cascade project (+ output_dir) from the outer run, but only if
+        # tomogram_config wasn't independently configured for tracking at
+        # all -- an explicit tomogram_config.project must never be
+        # silently overridden.
+        if (
+            tomogram_config.project is None
+            and tomogram_config.job_id is None
+            and (config.project is not None or config.job_id is not None)
+        ):
+            tomogram_config = dataclasses.replace(
+                tomogram_config,
+                project=config.project,
+                output_dir=tomogram_config.output_dir or config.output_dir,
+            )
+
+        # Whichever way tracking ended up on for tomogram_config -- cascaded
+        # above, or the caller's own explicit project -- an unpinned job_id
+        # can't be known ahead of time by tomogram_output_path below, which
+        # runs *after* run_build_tomogram returns using this same config
+        # object. Reserve one now so both agree on the same path without
+        # either function handing anything back to the other -- the same
+        # can't-coordinate-after-the-fact problem multi-GPU DDP has (see
+        # _tracked_output_dir), just between two pipeline calls instead of
+        # two processes.
+        if (
+            tomogram_config.project is not None or tomogram_config.job_id is not None
+        ) and tomogram_config.job_id is None:
+            root = resolve_output_dir(tomogram_config, "tomograms", create=True)
+            job_id = _reserve_next_job_id(tomogram_config.project, root)
+            tomogram_config = dataclasses.replace(
+                tomogram_config, job_id=job_id, output_dir=root
+            )
+
+        # One seed reproduces the whole chained run: the series' own seed,
+        # drawn now and printed if unset, also seeds the tomogram, unless that
+        # config names its own. Derived rather than shared, so the specimen's
+        # draws and the series' are separate streams.
+        seed = config.seed if config.seed is not None else _seed_or_draw(None)
+        config = dataclasses.replace(config, seed=seed)
+        if tomogram_config.seed is None:
+            tomogram_config = dataclasses.replace(
+                tomogram_config, seed=derive_seed(seed, SEED_STAGE_SPECIMEN)
+            )
+
+        section("Building specimen volume (tomogram_config)")
+        run_build_tomogram(tomogram_config)
+        config = dataclasses.replace(
+            config, volume_path=tomogram_output_path(tomogram_config)
+        )
+
     if not config.volume_path:
         raise ValueError(
             "run_tilt_series: config.volume_path must be set to a "
             "pre-built specimen volume -- build one first with `specter "
-            "build tomogram`."
+            "build tomogram`, or pass tomogram_config to build one as "
+            "part of this call."
         )
 
+    validate_config(config)
+
     specter.set_verbosity(logging.INFO)
-    mode, device_target = _parse_device(config.device)
-    if mode == "multi":
+    devices = parse_device(resolve_available_device(config.device))
+    if devices.is_multi:
         raise ValueError(
-            "run_tilt_series: multi-GPU device strings (e.g. '0,1,2') aren't "
+            "run_tilt_series: multi-device strings (e.g. '0,1,2') aren't "
             "supported -- a tilt series is generated as a single volume, not "
             "batched across particles. Pass a single device, e.g. 'cuda:0'."
         )
+    device_target = devices.primary
 
     t_start = time.perf_counter()
 
-    # --- Loading specimen volume ---
-    _section(f"Loading specimen volume from {config.volume_path}")
-    volume = load_specimen_volume(config.volume_path)
-    _console.print(f"  Volume shape: {tuple(volume.shape)}  (Z, Y, X)")
+    run_seed = _seed_or_draw(config.seed)
 
-    # --- Building TiltSeriesGenerator ---
-    _section("Building TiltSeriesGenerator")
-    dx = config.target_v_size
+    # --- Loading specimen volume ---
+    section(f"Loading specimen volume from {config.volume_path}")
+    volume = load_specimen_volume(config.volume_path)
+    console.print(f"  Volume shape: {tuple(volume.shape)}  (Z, Y, X)")
+
+    # --- Preparing the series ---
+    section("Preparing the tilt series")
+    dx = config.voxel_size
     micrograph_size = (
         config.micrograph_size
         if config.micrograph_size is not None
@@ -77,104 +189,137 @@ def run_tilt_series(config: TiltSeriesConfig) -> None:
     angles = torch.linspace(
         config.min_tilt_angle, config.max_tilt_angle, config.n_tilts
     )
-    _console.print(
+    console.print(
         f"  Tilt angles: {config.n_tilts} steps from {config.min_tilt_angle}° "
         f"to {config.max_tilt_angle}°"
     )
 
-    cs_angstrom = config.cs * 1e7
-    cc_angstrom = config.cc * 1e7 if config.cc is not None else None
+    cs_angstrom = _mm_to_angstrom(config.cs)
+    # The mean-free-path model replaces the amplitude-contrast ratio as the
+    # source of the imaginary potential; keeping both would absorb twice.
+    alpha = 0.0 if config.absorption_model == "inelastic_mfp" else config.alpha
 
     ctf_params = {
         "cs": torch.tensor([cs_angstrom]),
         "dfu": torch.tensor([config.defocus]),
     }
 
-    ice_model = None if config.ice_model == "none" else config.ice_model
-    noise_model = None if config.noise_model == "none" else config.noise_model
-    detector_model = None if config.detector_model == "none" else config.detector_model
-
-    model = TiltSeriesGenerator(
-        volume.unsqueeze(0),  # add batch dim: (1, Z, Y, X)
-        micrograph_size,
-        dx,
-        ctf_params,
-        config.voltage,
+    ice = bundle_from_config(
+        Ice, config, prefix="ice_", parameterization=config.bulk_scattering_factors
+    )
+    # Envelopes.cc is in Angstrom and the config's in mm; cc is read from the config.
+    envelopes = bundle_from_config(Envelopes, config, cc=None)
+    damage_on_lens = (
+        envelopes.dose_envelope
+        and envelopes.dose_envelope_target == "transfer_function"
+    )
+    camera = bundle_from_config(Camera, config)
+    weights, weights_max_frequency = read_dose_weights(camera)
+    exposure = Exposure.tilt_series(
         config.dose_per_tilt,
-        angles=angles,
-        ice_model=ice_model,
-        ice_cache_dir=config.ice_cache_dir,
-        ice_relax_steps=config.ice_relax_steps,
-        scattering_model=config.scattering_model,
-        aberration_model=config.aberration_model,
-        noise_model=noise_model,
-        alpha=config.alpha,
-        pad_fft=config.pad_fft,
-        tilt_axis=config.tilt_axis,
-        coincidence_radius=config.coincidence_radius,
-        num_frames=config.num_frames,
-        convergence_angle=config.convergence_angle,
-        cc=cc_angstrom,
-        energy_spread=config.energy_spread,
-        deltaV_V=config.deltaV_V,
-        deltaI_I=config.deltaI_I,
-        dose_envelope=config.dose_envelope,
-        detector_model=detector_model,
-    ).to(device_target)
+        config.n_tilts,
+        n_frames=camera.n_frames,
+        weights=weights,
+        weights_max_frequency=weights_max_frequency,
+    )
+    tilt = bundle_from_config(TiltGeometry, config)
+    series = Sample.from_volume(volume, dx).tilt_series(
+        Poses.tilt_series(angles, axis=tilt.tilt_axis),
+        exposure,
+        voltage=config.voltage,
+        micrograph_size=micrograph_size,
+        ice=ice,
+        damaged=envelopes.dose_envelope and not damage_on_lens,
+        tilt=tilt,
+        seed=run_seed,
+        objective_aperture=config.objective_aperture,
+        propagation=bundle_from_config(Propagation, config, alpha=alpha),
+    )
+    ctf = CTF(ctf_params)
 
     # --- Generating ---
-    _section(f"Generating tilt series on {device_target}")
+    section(f"Generating tilt series on {device_target}")
+    images_list: list[torch.Tensor] = []
+    exitwaves_list: list[torch.Tensor] = []
     with torch.no_grad():
-        images, exitwaves, _clean = model.generate_tilt_series(torch.tensor([0]))
-    images = images[0].cpu()  # (n_tilts, H, W)
-    exitwaves = exitwaves[0].cpu()  # (n_tilts, H, W) complex
+        for i in track(range(config.n_tilts), description="Generating tilt series"):
+            one = slice(i, i + 1)
+            waves = series.scatter(i, device=device_target)
+            if config.save_exitwaves:
+                exitwaves_list.append(waves.pixels().cpu())
+            image = (
+                waves.apply_ctf(
+                    ctf,
+                    bfactor=config.bfactor,
+                    convergence_angle=envelopes.convergence_angle,
+                    dose_envelope=exposure[one] if damage_on_lens else None,
+                )
+                .intensity(
+                    cc=config.cc or None,
+                    energy_spread=envelopes.energy_spread,
+                    deltaV_V=envelopes.deltaV_V,
+                    deltaI_I=envelopes.deltaI_I,
+                    temporal_coherence=envelopes.temporal_coherence,
+                )
+                .detect(
+                    exposure[one],
+                    detector=camera.detector_model,
+                    noise=camera.noise_model,
+                    coincidence_radius=config.coincidence_radius,
+                    detector_pixel_size=camera.detector_pixel_size,
+                    seed=run_seed,
+                )
+            )
+            images_list.append(image.array.cpu())
+    images = torch.cat(images_list)  # (n_tilts, H, W)
+    exitwaves = torch.cat(exitwaves_list) if config.save_exitwaves else None
 
     # --- Post-processing ---
     if config.normalize_tilt_series:
-        _section("Normalizing")
-        mean = images.mean(dim=(-2, -1), keepdim=True)
-        std = images.std(dim=(-2, -1), keepdim=True)
-        images = (images - mean) / std.clamp(min=1e-8)
+        section("Normalizing")
+        images = _normalize_images(images)
 
     # --- Saving ---
-    _section("Saving")
+    section("Saving")
     import mrcfile
 
-    os.makedirs(config.output_dir, exist_ok=True)
+    with _tracked_output_dir(config, "tiltseries") as output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
-    mrcs_path = os.path.join(config.output_dir, config.filename + ".mrcs")
-    with mrcfile.new(mrcs_path, overwrite=True) as mrc:
-        mrc.set_data(images.numpy().astype("float32"))
-    _console.print(f"  [green]✓[/green] {mrcs_path}")
+        mrcs_path = os.path.join(output_dir, config.filename + ".mrcs")
+        with mrcfile.new(mrcs_path, overwrite=True) as mrc:
+            mrc.set_data(images.numpy().astype("float32"))
+            mrc.voxel_size = dx
+        console.print(f"  [green]✓[/green] {mrcs_path}")
 
-    ctf_params_broadcast = {
-        "cs": torch.full((config.n_tilts,), cs_angstrom),
-        "dfu": torch.full((config.n_tilts,), config.defocus),
-    }
-    create_micrograph_starfile(
-        n=config.n_tilts,
-        voltage=config.voltage,
-        pixel_size=dx,
-        alpha=config.alpha,
-        ctf_params=ctf_params_broadcast,
-        folderpath=config.output_dir,
-        filename=config.filename,
-        dose_per_angstrom=config.dose_per_tilt,
-        coincidence_radius=config.coincidence_radius,
-        tilt_angles=angles,
-    )
-
-    if config.save_exitwaves:
-        ew_prefix = "exitwave" if ice_model is not None else "clean_exitwave"
-        _section(f"Saving {ew_prefix.replace('_', ' ')}")
-        _save_exitwave_pair(
-            exitwaves,
-            ew_prefix,
-            config.output_dir,
-            config.filename,
-            config.pad_fft,
-            micrograph_size,
+        ctf_params_broadcast = {
+            "cs": torch.full((config.n_tilts,), cs_angstrom),
+            "dfu": torch.full((config.n_tilts,), config.defocus),
+        }
+        create_micrograph_starfile(
+            n=config.n_tilts,
+            voltage=config.voltage,
+            pixel_size=dx,
+            alpha=alpha,
+            ctf_params=ctf_params_broadcast,
+            output_dir=output_dir,
+            filename=config.filename,
+            dose_per_angstrom=config.dose_per_tilt,
+            coincidence_radius=config.coincidence_radius,
+            tilt_angles=angles,
         )
 
-    elapsed = time.perf_counter() - t_start
-    _console.print(f"\n[bold]Total time:[/bold] {_format_elapsed(elapsed)}")
+        if exitwaves is not None:
+            ew_prefix = "exitwave" if ice.model is not None else "clean_exitwave"
+            section(f"Saving {ew_prefix.replace('_', ' ')}")
+            _save_exitwave_pair(
+                exitwaves,
+                ew_prefix,
+                output_dir,
+                config.filename,
+                config.pad_fft,
+                micrograph_size,
+                dx,
+            )
+
+    _print_total_time(t_start)

@@ -1,3 +1,9 @@
+"""
+`Aberration`: the microscope's transfer function, composed from the phase
+terms in `_functions` and the envelopes in `_envelopes`, applied to an exit
+wave in Fourier space.
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -9,12 +15,13 @@ from . import _envelopes as env
 from . import _functions as fn
 from ..constants import energy_to_wavelength
 from ..fft import fft2, ifft2
+from specter.options import AberrationModel
 
 # Keys read out of the per-batch `ctf_params` dict passed to `forward()` --
 # see `Aberration.transfer_function`. Never constructor arguments -- `bfactor`
 # is the one exception, accepted as a constructor kwarg (see `__init__`) for
-# consistency with `ImageGenerator`/`BaseImager`/`Reconstructor`, which all
-# offer the same convenience with the same override-wins precedence.
+# consistency with `ExitWave.apply_ctf` and `Reconstructor`, which offer the
+# same convenience with the same override-wins precedence.
 _CTF_PARAM_NAMES = frozenset(
     {
         "dfu",
@@ -48,17 +55,34 @@ class Aberration(L.LightningModule):
         Pixel size in Å.
     voltage: float
         Accelerating voltage of the electron beam in kV. Typical values are 100/120/200/300 kV.
-    aberration_model: str, optional
-        Specifies aberration model to use. Options include 'holography' and 'ctf'.
-        Default is 'holography'.
+    aberration_model: AberrationModel, optional
+        Specifies aberration model to use. Options include 'nonlinear' and 'linear'.
+        Default is 'nonlinear'.
     alpha: float, optional
-        The amplitude contrast ratio to use for the CTF model. Common values
-        are 0.07 and 0.1.
+        The amplitude contrast ratio to use for the linear model. Common values
+        are 0.07 and 0.1. Only has an effect on the transfer function when
+        ``specimen_absorption=False`` (see below) -- required whenever
+        ``aberration_model="linear"`` regardless, since :meth:`__init__`
+        raises if it's missing, but with the default ``specimen_absorption``
+        it's stored and otherwise unused.
+    specimen_absorption: bool, optional
+        If True (default), amplitude contrast is assumed to already be
+        baked into the exit wave via ``potential.apply_amplitude_contrast``
+        upstream (true for every ``scattering_model`` except ``"ctf"``,
+        which yields a real-valued, non-absorptive exit wave with nowhere
+        else to represent it) -- so ``alpha`` is accepted but not applied
+        again here, avoiding double-counting the same physical effect at
+        both the specimen and lens stages. Set False to instead fold
+        ``-acos(alpha)`` into the phase-shift term (CryoSPARC's own
+        convention: ``phase_shift - arccos(amp_contrast)``), which is what
+        an exit wave from ``scattering_model="ctf"`` needs. Mirrors
+        ``ctf.TransferFunction``'s identically-named, identically-purposed
+        parameter.
     convergence_angle: float, optional
         Beam convergence semi-angle in milliradians, used for the Cs
         (spatial coherence) envelope. Default is None (envelope disabled).
     cc: float, optional
-        Chromatic aberration coefficient in Angstrom, used for the Cc
+        Chromatic aberration coefficient in Å, used for the Cc
         (temporal coherence) envelope. Default is None (envelope
         disabled).
     energy_spread: float, optional
@@ -71,16 +95,21 @@ class Aberration(L.LightningModule):
         Relative objective-lens current instability, used by the Cc
         envelope. Default 0.01e-6.
     dose_envelope: bool, optional
-        Whether to apply the Grant & Grigorieff (2015) cumulative-dose
-        envelope, using the per-image ``dose`` key in ``ctf_params``.
-        Default False.
+        Whether to apply the Grant & Grigorieff (2015) radiation-damage
+        envelope, using the per-image ``dose`` (and optional
+        ``pre_exposure``) keys in ``ctf_params``. Default False.
+    dose_weighted: bool, optional
+        Whether the simulated image stands for an exposure-filtered
+        (dose-weighted) movie sum (True, default: single-particle data) or
+        a plain sum of frames (False: one tilt of a tilt series). See
+        :func:`specter.aberrations.dose_envelope`.
     bfactor: float or torch.Tensor, optional
         Isotropic B-factor envelope in Å² applied in the microscope transfer
         function, damping high-resolution signal. Scalar (applied to all
         particles) or per-particle tensor. If given, overrides any
         ``"bfactor"`` entry already present in the ``ctf_params`` passed to
         :meth:`forward` -- the same convenience and precedence offered by
-        ``ImageGenerator``/``BaseImager``/``Reconstructor``. None or 0.0
+        ``ExitWave.apply_ctf`` and ``Reconstructor``. None or 0.0
         means no envelope. Default None.
 
     Notes
@@ -94,10 +123,13 @@ class Aberration(L.LightningModule):
     it gets the same constructor-level convenience as ``dose_per_angstrom``
     one level up, rather than requiring a hand-built per-particle tensor.
 
-    .. [1] E. J. Kirkland, Advanced Computing in Electron Microscopy (Springer
-       US, Boston, MA, 2010).
-    .. [2] P. A. Penczek, “Image Restoration in Cryo-Electron Microscopy” in
-       Methods in Enzymology (Academic Press Inc., 2010) vol. 482, pp. 35–72.
+    References
+    ----------
+    .. [1] Kirkland, E. J. (2010). *Advanced computing in electron microscopy*
+       (2nd ed.). Springer. https://doi.org/10.1007/978-1-4419-6533-2
+    .. [2] Penczek, P. A. (2010). Image restoration in cryo-electron
+       microscopy. *Methods in Enzymology*, 482, 35–72.
+       https://doi.org/10.1016/S0076-6879(10)82002-6
     """
 
     def __init__(
@@ -105,14 +137,16 @@ class Aberration(L.LightningModule):
         n_pixels: int,
         pixel_size: float,
         voltage: float,
-        aberration_model: str = "holography",
+        aberration_model: AberrationModel = "nonlinear",
         alpha: float | None = None,
+        specimen_absorption: bool = True,
         convergence_angle: float | None = None,
         cc: float | None = None,
         energy_spread: float = 0.7,
         deltaV_V: float = 0.06e-6,
         deltaI_I: float = 0.01e-6,
         dose_envelope: bool = False,
+        dose_weighted: bool = True,
         bfactor: float | torch.Tensor | None = None,
         progressbars: bool = True,
         **kwargs: Any,
@@ -145,11 +179,20 @@ class Aberration(L.LightningModule):
         KY, KX = torch.meshgrid(kx, kx, indexing="ij")
         k2 = KX**2 + KY**2
         radian = torch.arctan2(KX, KY)
-        self.register_buffer("k", torch.sqrt(k2).unsqueeze(0))
-        self.register_buffer("radian", radian.unsqueeze(0))
-        self.register_buffer("k2", k2.unsqueeze(0))
-        self.register_buffer("KY", KY)
-        self.register_buffer("KX", KX)
+        # Buffers so they follow the module across devices, but non-persistent:
+        # every one is a pure function of n_pixels, pixel_size and voltage, all
+        # of which __init__ already has, so checkpointing them stores nothing a
+        # reconstruction could not rebuild. KY/KX additionally *cannot* be
+        # persisted -- torch.meshgrid returns stride-0 broadcast views, and
+        # load_state_dict restores a buffer with an in-place copy_, which
+        # refuses to write through a stride whose elements alias one address.
+        # A CPU state_dict round-trip raised on them; on the GPU .to() had
+        # already materialised the view, so it only ever failed on the CPU.
+        self.register_buffer("k", torch.sqrt(k2).unsqueeze(0), persistent=False)
+        self.register_buffer("radian", radian.unsqueeze(0), persistent=False)
+        self.register_buffer("k2", k2.unsqueeze(0), persistent=False)
+        self.register_buffer("KY", KY, persistent=False)
+        self.register_buffer("KX", KX, persistent=False)
 
         # dummy tensor for non-existent aberration terms
         self.register_buffer("zero", torch.tensor(0.0))
@@ -160,6 +203,7 @@ class Aberration(L.LightningModule):
         self.deltaV_V = deltaV_V
         self.deltaI_I = deltaI_I
         self.dose_envelope = dose_envelope
+        self.dose_weighted = dose_weighted
 
         if bfactor is None:
             self.bfactor: torch.Tensor | None = None
@@ -168,11 +212,12 @@ class Aberration(L.LightningModule):
                 "bfactor", torch.as_tensor(bfactor, dtype=torch.float32).flatten()
             )
 
-        if aberration_model == "ctf":
+        if aberration_model == "linear":
             if alpha is None:
-                raise Exception("Specify alpha for CTF model.")
+                raise ValueError("Specify alpha for the linear model.")
             else:
                 self.alpha = alpha
+        self.specimen_absorption = specimen_absorption
 
     def transfer_function(self, ctf_params: dict[str, Any]) -> torch.Tensor:
         """
@@ -193,8 +238,10 @@ class Aberration(L.LightningModule):
             - 'trefoil1'/'trefoil2' : Trefoil aberration
             - 'tetrafoil1'/'tetrafoil2'/'tetrafoil3'/'tetrafoil4' : Tetrafoil
             - 'bfactor' : Isotropic B-factor envelope in Å²
-            - 'dose' : Cumulative electron dose in e-/Angstrom^2, used by
-              the dose envelope when ``dose_envelope=True``
+            - 'dose' : Electron dose (fluence) accumulated in this image, in
+              e⁻/Å², used by the dose envelope when ``dose_envelope=True``
+            - 'pre_exposure' : Exposure already received before this image
+              started, in e⁻/Å² (a tilt's earlier tilts). Defaults to 0.
 
         Returns
         -------
@@ -226,11 +273,15 @@ class Aberration(L.LightningModule):
             cs = ctf_params.get("cs", self.zero).view(-1, 1, 1)
             chi = chi + fn.cs(self.k, self.wavelength, cs)
 
-        # --- Phaseshift ---
-        if "phaseshift" in ctf_params:
+        # --- Phaseshift (+ amplitude-contrast offset for the CTF model) ---
+        needs_amp_contrast_offset = (
+            self.aberration_model == "linear" and not self.specimen_absorption
+        )
+        if "phaseshift" in ctf_params or needs_amp_contrast_offset:
             phaseshift = ctf_params.get("phaseshift", self.zero).view(-1, 1, 1)
+            alpha = torch.as_tensor(self.alpha) if needs_amp_contrast_offset else None
             chi = chi + fn.phaseshift(
-                phaseshift, self.k, self.n_pixels, self.aberration_model
+                phaseshift, self.k, self.n_pixels, self.aberration_model, alpha=alpha
             )
 
         # --- Beam tilt ---
@@ -257,7 +308,9 @@ class Aberration(L.LightningModule):
             tetrafoil2 = ctf_params.get("tetrafoil2", self.zero).view(-1, 1, 1)
             tetrafoil3 = ctf_params.get("tetrafoil3", self.zero).view(-1, 1, 1)
             tetrafoil4 = ctf_params.get("tetrafoil4", self.zero).view(-1, 1, 1)
-            chi = chi + fn.tetrafoil(tetrafoil1, tetrafoil2, tetrafoil3, tetrafoil4)
+            chi = chi + fn.tetrafoil(
+                self.k, self.radian, tetrafoil1, tetrafoil2, tetrafoil3, tetrafoil4
+            )
 
         transfer = torch.exp(-1j * chi)
 
@@ -289,7 +342,14 @@ class Aberration(L.LightningModule):
 
         if self.dose_envelope and "dose" in ctf_params:
             dose = ctf_params["dose"].view(-1, 1, 1)
-            transfer = transfer * env.dose_envelope(self.k, dose)
+            pre = ctf_params.get("pre_exposure", self.zero).view(-1, 1, 1)
+            transfer = transfer * env.dose_envelope(
+                self.k,
+                dose,
+                pre_exposure=pre,
+                weighted=self.dose_weighted,
+                voltage=self.voltage,
+            )
 
         return transfer
 
@@ -311,8 +371,8 @@ class Aberration(L.LightningModule):
         Returns
         -------
         aberrated_exitwave : torch.Tensor
-            Exit wave after aberration. Complex-valued for holography model,
-            real-valued for CTF model (projects to real for intensity imaging).
+            Exit wave after aberration. Complex-valued for the nonlinear model,
+            real-valued for the linear model (projects to real for intensity imaging).
 
         Notes
         -----
@@ -323,9 +383,9 @@ class Aberration(L.LightningModule):
             ctf_params = {**ctf_params, "bfactor": self.bfactor}
         self.tf = self.transfer_function(ctf_params)
         aberrated_exitwaves = ifft2(fft2(exitwave) * self.tf)
-        if self.aberration_model == "ctf":
+        if self.aberration_model == "linear":
             return torch.real(aberrated_exitwaves)
-        elif self.aberration_model == "holography":
+        elif self.aberration_model == "nonlinear":
             return aberrated_exitwaves
         else:
             raise ValueError(f"Unknown aberration_model: {self.aberration_model!r}")

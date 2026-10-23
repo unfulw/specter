@@ -9,12 +9,20 @@ the region its biology dictates (see module docstring of
 `MembraneField.phi`'s sign only distinguishes lipid-solid from not-lipid-
 solid; it says nothing about which side of a closed shell a given "not
 lipid solid" point is on. Recovering that requires real topology: this
-module labels the shell's connected complement via
-:func:`scipy.ndimage.label` (full 26-connectivity, so voxelization/
+module labels the shell's connected complement with
+:func:`cc3d.connected_components` (full 26-connectivity, so voxelization/
 thresholding noise doesn't fracture a single open region into spurious
 pieces) and calls whichever labeled component(s) touch the volume's own
 boundary faces "cytosol" -- by construction, that's the one region that
-must be reachable from outside the volume. Everything else non-shell is
+must be reachable from outside the volume.
+
+`cc3d` (``connected-components-3d``) rather than :func:`scipy.ndimage.label`:
+the two return the same partition, but scipy's labeller is generic over
+N dimensions and structuring elements, while cc3d is a fixed-connectivity
+3-D decision-tree scan. Measured on this classifier's own input, a
+300x900x900 shell mask, 3.28 s against 0.62 s, and in a real build at 2 A
+(a 750x3000x3000 box) 2m 39s against 43 s -- the single largest phase of
+that build. Both are single-threaded; neither uses the GPU. Everything else non-shell is
 enclosed, and thus "lumen". This is deliberately membrane-shape-agnostic:
 it works for a single vesicle, several disjoint vesicles, a sheet, or no
 membrane at all (in which case shell/lumen are empty and cytosol is
@@ -24,9 +32,46 @@ the membrane generator's own internal shape-construction state.
 
 from __future__ import annotations
 
+import cc3d
 import numpy as np
 import torch
-from scipy import ndimage
+
+
+def _shell_bounding_box(
+    shell_mask: torch.Tensor,
+) -> tuple[int, int, int, int, int, int] | None:
+    """
+    Half-open ``(z0, z1, y0, y1, x0, x1)`` bounds of the True voxels, or
+    None when there are none.
+
+    Reduced in two full passes rather than six, and never via
+    ``nonzero()``, which would materialize one int64 index per shell voxel.
+
+    Parameters
+    ----------
+    shell_mask : torch.Tensor
+        Boolean volume, shape ``(Z, Y, X)``.
+
+    Returns
+    -------
+    tuple of int or None
+        Bounds suitable for slicing, or None if `shell_mask` is all False.
+    """
+    zy = shell_mask.any(dim=2)
+    z_any = zy.any(dim=1)
+    y_any = zy.any(dim=0)
+    x_any = shell_mask.any(dim=1).any(dim=0)
+    if not bool(z_any.any()):
+        return None
+
+    def _span(flags: torch.Tensor) -> tuple[int, int]:
+        idx = torch.nonzero(flags, as_tuple=False).flatten()
+        return int(idx[0]), int(idx[-1]) + 1
+
+    z0, z1 = _span(z_any)
+    y0, y1 = _span(y_any)
+    x0, x1 = _span(x_any)
+    return z0, z1, y0, y1, x0, x1
 
 
 def classify_membrane_regions(
@@ -48,7 +93,7 @@ def classify_membrane_regions(
         material. Default ``0.05 * density.max()`` -- a small fraction of
         the bilayer's own peak potential, matching the relative-threshold
         convention used elsewhere for binarizing a rendered density (see
-        ``tomogram/generator.py``'s ``_INSTANCE_LABEL_REL_THRESHOLD``). If
+        ``tomogram/_helpers.py``'s ``_INSTANCE_LABEL_REL_THRESHOLD``). If
         ``density`` is all zero (no membrane present), every voxel is
         classified as cytosol.
 
@@ -66,24 +111,99 @@ def classify_membrane_regions(
     shell_mask = density > density_threshold
     non_shell = ~shell_mask
 
-    structure = np.ones((3, 3, 3), dtype=np.int8)  # full 26-connectivity
-    labeled, num_features = ndimage.label(non_shell.cpu().numpy(), structure=structure)
+    # Label the shell's own BOUNDING BOX, not the whole volume. Outside
+    # that box there is no shell by construction, so the space out there is
+    # a single connected shell-free region that reaches the volume's own
+    # faces -- cytosol, decided by geometry with no labelling at all.
+    # Inside the box, a component touching the box surface joins that
+    # exterior (or, where the box sits flush against the volume, touches
+    # the volume boundary itself) and is cytosol; one that does not is
+    # sealed off by shell and is lumen. Identical answers, over as few
+    # voxels as the shell actually spans.
+    #
+    # The box comes from the SHELL, never from a membrane's own geometry,
+    # which is what keeps this exact for the density this is really handed:
+    # `generator.py` stamps the carbon film in before the membrane phase,
+    # so `density` is carbon plus membranes and `shell_mask` is not
+    # membrane-only. Anything else above the threshold simply grows the
+    # box, trading the speedup away rather than the correctness -- a full-
+    # volume shell degenerates to exactly the previous behaviour.
+    #
+    # Worth it because the labeller is single-threaded union-find over
+    # 26-connectivity and its output is 4 bytes/voxel: at the 2 A production
+    # grid (750x3000x3000) scipy's took 12.8 min and a 27 GB label array,
+    # against a 500-cube vesicle occupying 1.9% of that box.
+    bbox = _shell_bounding_box(shell_mask)
+    if bbox is None:
+        # No shell anywhere: every voxel is reachable from outside.
+        return {
+            "shell": shell_mask,
+            "lumen": torch.zeros_like(non_shell),
+            "cytosol": non_shell,
+        }
+    z0, z1, y0, y1, x0, x1 = bbox
+    non_shell_sub = non_shell[z0:z1, y0:y1, x0:x1]
 
+    # Labels are dense 1..N with 0 for the (shell) background, exactly as
+    # ndimage.label's were, so the boundary lookup below is unchanged. uint32
+    # rather than the default uint64: half the label array (13.5 GB at 2 A)
+    # and no box this classifier sees has 4 billion components.
+    labeled, n_features = cc3d.connected_components(
+        np.ascontiguousarray(non_shell_sub.cpu().numpy()),
+        connectivity=26,
+        out_dtype=np.uint32,
+        return_N=True,
+    )
+
+    # np.unique per face rather than a Python `for v in face.ravel()`: the
+    # six faces are O(box^2) elements, so the generator ran ~8.6M Python
+    # iterations at a 300x1200x1200 box (0.50 s) and ~54M at 500x2000x2000
+    # (1.47 s), while the sort-based reduction stays flat (~0.05 s at both).
+    # The same set of labels, by construction.
     boundary_labels: set[int] = set()
-    if num_features > 0:
-        boundary_labels.update(int(v) for v in labeled[0, :, :].ravel() if v > 0)
-        boundary_labels.update(int(v) for v in labeled[-1, :, :].ravel() if v > 0)
-        boundary_labels.update(int(v) for v in labeled[:, 0, :].ravel() if v > 0)
-        boundary_labels.update(int(v) for v in labeled[:, -1, :].ravel() if v > 0)
-        boundary_labels.update(int(v) for v in labeled[:, :, 0].ravel() if v > 0)
-        boundary_labels.update(int(v) for v in labeled[:, :, -1].ravel() if v > 0)
+    if n_features > 0:
+        for face in (
+            labeled[0, :, :],
+            labeled[-1, :, :],
+            labeled[:, 0, :],
+            labeled[:, -1, :],
+            labeled[:, :, 0],
+            labeled[:, :, -1],
+        ):
+            present = np.unique(face)
+            boundary_labels.update(present[present > 0].tolist())
 
-    labeled_t = torch.from_numpy(labeled).to(density.device)
+    # Resolved as a lookup on the CPU-side label array, NOT as
+    # `torch.isin(labeled_t, boundary_label_t)` on the device.
+    #
+    # `torch.isin` has no sorted fast path at these sizes and materializes
+    # `elements.unsqueeze(-1) == test_elements` -- a bool tensor of shape
+    # (n_voxels, n_boundary_labels). Measured at 65.1 bytes per voxel for
+    # 63 boundary labels, so a 300x1200x1200 tomogram asked CUDA for
+    # 25.35 GiB to answer a per-voxel membership test, and OOM'd. The
+    # factor is the label COUNT, which the membrane geometry decides, so
+    # this fired on some random draws and not others -- `configs/
+    # tomogram.toml` unseeded reproduced it, seed 11 did not. (Above
+    # roughly 128 test values torch.isin switches to a sort-based path and
+    # the blowup disappears, which is why only moderate label counts hurt.)
+    #
+    # Labels are dense integers 0..n_features, so a boolean lookup indexed
+    # by label answers it in one gather. Doing that
+    # in numpy also drops the int32 label volume's device transfer, which
+    # existed only to feed the isin: 0.40 GiB of device memory total here,
+    # against 25.35 + 1.73 GiB before.
+    # Everything outside the shell's bounding box is cytosol (see above),
+    # so start from that and overwrite only the box the labelling covered.
+    cytosol_mask = torch.ones_like(non_shell)
     if boundary_labels:
-        boundary_label_t = torch.tensor(sorted(boundary_labels), device=density.device)
-        cytosol_mask = non_shell & torch.isin(labeled_t, boundary_label_t)
+        is_boundary = np.zeros(n_features + 1, dtype=bool)
+        is_boundary[np.fromiter(boundary_labels, dtype=np.int64)] = True
+        cytosol_sub = non_shell_sub & torch.from_numpy(is_boundary[labeled]).to(
+            density.device
+        )
     else:
-        cytosol_mask = torch.zeros_like(non_shell)
+        cytosol_sub = torch.zeros_like(non_shell_sub)
+    cytosol_mask[z0:z1, y0:y1, x0:x1] = cytosol_sub
     lumen_mask = non_shell & ~cytosol_mask
 
     return {"shell": shell_mask, "lumen": lumen_mask, "cytosol": cytosol_mask}

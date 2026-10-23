@@ -1,6 +1,307 @@
 # Generate a tilt series
 
-!!! info "Work in progress"
-    Will cover `specter build tomogram` + `specter simulate tiltseries`
-    (or the combined `generate_tilt_series.py` convenience script), and
-    matching a real tilt series via AreTomo3 alignment files.
+`specter simulate tiltseries` loads a pre-built specimen volume and
+simulates the tilted acquisition: multislice (or first-Born/projection/CTF)
+scattering through the volume at each tilt angle, CTF/aberrations, dose,
+amorphous ice, and detector effects. It saves the result as a `.mrcs` tilt
+stack plus a RELION-style (Scheres 2012) `.star` file. This is the **imaging half** of the
+cryo-ET pipeline; the volume itself comes from `specter build tomogram`.
+See [Build a tomogram specimen](build-tomogram.md) for that half.
+
+## Basic usage
+
+Every run loads a TOML config first, then applies any flags given on the
+command line as overrides:
+
+```bash
+specter simulate tiltseries --config configs/tiltseries.toml \
+    --volume_path tomograms/tomogram.mrc
+```
+
+```bash
+specter simulate tiltseries \
+    --config configs/tiltseries.toml \
+    --volume_path tomograms/tomogram.mrc \
+    --device cuda:0 \
+    --n_tilts 41 \
+    --min_tilt_angle -60 --max_tilt_angle 60
+```
+
+`configs/tiltseries.toml` is the canonical starting point. Copy it and
+edit for your own runs; the
+[command reference](../api/cli/simulate.md#specter-simulate-tiltseries) documents
+every field. `volume_path` has no default and is the one
+field you always need to supply, either in the TOML, via `--volume_path`
+(pointing at whatever `specter build tomogram` already wrote), or by
+passing `--tomogram_config` instead to build it as part of this same
+command. See [Chaining with `specter build
+tomogram`](#chaining-with-specter-build-tomogram) below.
+
+## What you'll usually tune
+
+- **Specimen**: `volume_path` (the `.mrc`/`.mrcs`/`.pt` scattering-potential
+  volume to image, already in scattering-potential units, not a raw density
+  map) and `voxel_size` (Å/voxel, **must match** whatever produced the
+  volume, e.g. `TomogramConfig.voxel_size`; it is not auto-detected from
+  the file).
+- **Microscope**: `voltage` (kV), `dose_per_tilt` (e⁻/Å² per tilt angle,
+  not total dose), `n_frames` (movie frames per tilt, feeds the coincidence-
+  loss model), `cs` (mm), `alpha` (amplitude contrast ratio).
+- **Defocus**: `defocus` (Å, positive = underfocus), applied the same at
+  every tilt.
+- **Tilt geometry**: `min_tilt_angle`/`max_tilt_angle` (degrees) and
+  `n_tilts` span an evenly-spaced tilt series; `tilt_axis` (`x` or `y`)
+  picks which in-plane axis the specimen rotates about. For a tilt axis
+  that isn't exactly horizontal/vertical (typical of real acquisition
+  geometry), see [Beyond angles: real tilt geometry](#beyond-angles-real-tilt-geometry-quaternions-and-aretomo3)
+  below, which needs the Python API, not this CLI.
+- **Models**: `scattering_model` (`multislice` default, most accurate;
+  `firstborn`/`projection`/`ctf` are cheaper approximations; see
+  [Scattering](../concepts/scattering/index.md)), `noise_model` (`poisson`
+  or `none`), `detector_model` (`none`, `perfect`, `k3_300kv`, `k3_200kv`,
+  `k2_300kv`, `falcon4i_300kv`, `falcon4i_200kv`, `falcon3ec_300kv`).
+
+Everything else (envelopes, ice, output naming) lives under its own panel
+in the [command reference](../api/cli/simulate.md#specter-simulate-tiltseries).
+
+## Advanced: envelopes, ice, and edge handling
+
+- **Envelopes**: `convergence_angle` (mrad) is unset by default, which
+  disables the spatial-coherence envelope; set it to enable that envelope.
+  `cc` (mm, chromatic aberration coefficient) defaults to 2.7, and with
+  `energy_spread` (0.7 eV FWHM), `deltaV_V` and `deltaI_I` sets the focal
+  spread each tilt image is summed over (`temporal_coherence =
+  "integrated"`; `"envelope"` applies it as an envelope on the CTF
+  instead). `cc = 0` disables it. `dose_envelope` applies the
+  Grant & Grigorieff (2015) radiation-damage envelope per tilt: each tilt
+  is treated as a plain exposure of `dose_per_tilt` taken after the
+  summed dose of the tilts before it, in index order, so supply the tilt
+  geometry in acquisition order for a dose-symmetric scheme (Hagen et al.
+  2017). See
+  [Aberrations](../concepts/aberrations.md).
+- **Absorption**: `absorption_model = "inelastic_mfp"` replaces the
+  amplitude-contrast ratio with an imaginary potential derived from measured
+  inelastic mean free paths (`inelastic_mfp_solvent`,
+  `inelastic_mfp_specimen`) and, optionally, the elastic loss beyond an
+  `objective_aperture`; `alpha` is then set to 0, including in the `.star`
+  file. The field is a second volume of the padded size and follows the
+  specimen through every tilt. Multislice only. See
+  [Scattering](../concepts/scattering/index.md#mean-free-path-absorption-support).
+- **Radiation damage on the specimen**: `dose_envelope_target = "specimen"`
+  damages the specimen's potential rather than the whole image, so the ice
+  keeps its structure. Each tilt is damaged by its own dose after the
+  pre-exposure of the tilts before it. The dry specimen is kept as its 3D
+  spectrum, which costs four resident volumes instead of one and an inverse
+  transform per tilt (0.03 s on a GPU at 200 × 576 × 576 voxels). See
+  [Aberrations](../concepts/aberrations.md).
+- **Solvent motion**: `ice_motion_variance` filters the ice to what survives
+  each tilt's own exposure. With one dose on every tilt, one filtered ice
+  volume serves the series; with per-tilt doses (Python API), the ice is
+  kept as its 3D spectrum and filtered per tilt, at one inverse transform
+  each. See [Ice structure](../concepts/ice.md).
+- **Ice**: `ice_model`: `"gd"` (default, `IceBank`'s cached
+  `GradientSKIcemaker` configs, realistic and near-free at this
+  cache size), `"random"` (cheap, low-fidelity `RandomIcemaker`), or `"none"`
+  (no ice). `ice_cache_dir` overrides the bundled `specter/ice_data/ice_cache`;
+  `ice_relax_steps` runs local MLBOP (Chan et al. 2019) seam relaxation
+  for `"gd"` (0 by default). See [Ice structure](../concepts/ice.md).
+- **`coincidence_radius`**: effective coincidence-loss exclusion radius in
+  pixels (exclusion area = πr²) for direct-detector modelling; matters most
+  once `detector_model` is one of the `k3_*` presets.
+- **`pad_fft`**: give the multislice canvas a 32 px zero-filled margin so
+  the FFT cannot join the frame's opposite edges, which under tilt cross
+  the slab at different depths. On by default. Turning it off saves 5-9%
+  per tilt and darkens the edges of the high tilts: a uniform slab at 60°
+  images 16% off flat there.
+- **`micrograph_size`**: output tilt-image size in pixels (square).
+  Defaults to the specimen volume's own XY extent; set explicitly to crop
+  or pad the field of view independent of the specimen box.
+
+## Output
+
+Alongside `{filename}.mrcs` (the `(n_tilts, H, W)` tilt stack) and
+`{filename}.star` (RELION-style, one row per tilt: voltage, pixel size, CTF
+params, dose, coincidence radius, tilt angle), `save_exitwaves` additionally
+writes the complex exit wave as two separate `.mrcs` files:
+`{filename}_exitwave_magnitude.mrcs`/`{filename}_exitwave_phase.mrcs` (or
+`clean_exitwave_*` when `ice_model="none"`). `normalize_tilt_series`
+zero-means and unit-normalizes each tilt image independently before saving.
+
+The CLI collects exit waves only when `save_exitwaves=true` and does not
+retain the additional noiseless image stack. In the Python API the three
+stacks are successive steps of one chain: `TiltSeries.scatter(i)` returns
+tilt `i`'s exit wave, `ExitWave.intensity` its noiseless image, and
+`Image.detect` the detected one, so a caller keeps only what it needs.
+`TiltSeries.scatter` propagates the padded volume itself rather than a copy
+of it.
+See the [production comparison](../assets/tiltseries-memory/README.md)
+for measured GPU memory, timings, and matching image/Fourier figures.
+
+## Chaining with `specter build tomogram`
+
+Two ways to run the specimen-building and imaging stages back to back:
+
+**One command**, via `--tomogram_config`: pass a `TomogramConfig` TOML
+instead of `--volume_path`/`volume_path`, and `specter simulate tiltseries`
+builds that specimen first (identical to `specter build tomogram --config
+...`, including writing its own `.mrc` + picks/segmentation to
+`configs/tomogram.toml`'s own `output_dir`/`filename`), then feeds the
+result straight in as this run's volume, with no path to copy by hand:
+
+```bash
+specter simulate tiltseries --config configs/tiltseries.toml \
+    --tomogram_config configs/tomogram.toml \
+    --device cuda:0
+```
+
+With the tilt range of [Basic usage](#basic-usage) and a fixed seed, the
+same command builds the shipped tomogram and images it:
+
+```bash
+--8<-- "docs-includes/cli-guides/tilt_series-command.txt"
+```
+
+```{ .text .output }
+--8<-- "docs-includes/cli-guides/tilt_series-run.txt"
+```
+
+The `.star` file holds one row per tilt:
+
+```{ .text .output }
+--8<-- "docs-includes/cli-guides/tilt_series-output.txt"
+```
+
+![Five of the 41 tilts, whole field and central region.](../assets/images/cli-guides/tilt_series-gallery.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+Five of the 41 tilts, each at 2.2 µm defocus and 3 e⁻/Å². Top: the whole
+6000 Å field, low-pass filtered to 40 Å, where the membranes are dark
+outlines and the carbon film is the dark region at the left. Bottom: the
+central 2000 Å at 20 Å. A tilted view spans more of the specimen's x extent
+than the volume holds; the volume is reflect-padded to cover it, so at
+±60° the film's edge appears together with its mirror image.
+///
+
+`--tomogram_config` and `--volume_path`/`config.volume_path` are mutually
+exclusive; passing both raises an error rather than silently picking one.
+Species/membrane/filament choices still come from the tomogram TOML (edit
+it directly, or see
+[`specter build tomogram`](../api/cli/build.md#specter-build-tomogram) for its own
+per-field flags, which aren't reachable through `simulate tiltseries`); imaging
+choices come from `--config`/its flags as usual.
+
+`--tomogram_config` always builds exactly **one** tomogram. `n_tomograms`
+is `specter build tomogram`'s own CLI-only flag (not a `TomogramConfig`
+field; `load_config` rejects a TOML with `n_tomograms` set outright) and
+isn't settable through this chained path. For several tomograms, use
+the two-command form below with `specter build tomogram --n_tomograms N`
+(writes `output_dir/0001/`, `0002/`, ...; see [Multiple
+tomograms](build-tomogram.md#multiple-tomograms)), then call `specter
+simulate tiltseries --volume_path ...` once per numbered subdirectory.
+
+**Two commands**, for full control over the intermediate volume's path,
+multiple tomograms, or building once and imaging it several ways:
+
+```bash
+specter build tomogram --config configs/tomogram.toml \
+    --output_dir tomograms --filename tomogram
+
+specter simulate tiltseries --config configs/tiltseries.toml \
+    --volume_path tomograms/tomogram.mrc \
+    --device cuda:0
+```
+
+## Beyond angles: real tilt geometry (quaternions and AreTomo3)
+
+The CLI's `min_tilt_angle`/`max_tilt_angle`/`n_tilts`/`tilt_axis` fields
+only describe an idealized, evenly-spaced series about an exactly
+horizontal or vertical axis. Real acquisitions have a tilt axis at some
+arbitrary angle and (after alignment) per-tilt shifts. `specter.tilt`
+(`read_aretomo3_aln`/`read_aretomo3_xf`/`read_aretomo3_global_shifts`,
+`tilt_to_quaternions`) parses the `.aln`/`.xf`/global-shifts output of
+[AreTomo3](https://github.com/czimaginginstitute/AreTomo3) (Peck et al.
+2026), which runs AreTomo's tomographic alignment (Zheng et al. 2022),
+into quaternions/translations for exactly this case. This is a Python-API
+feature only: `Poses` takes arbitrary quaternions and shifts, as an
+alternative to `Poses.tilt_series(angles)`, but `TiltSeriesConfig`/the CLI
+does not currently expose them, so matching a real tilt series' geometry
+means calling `Sample.tilt_series` directly rather than
+`specter simulate tiltseries`:
+
+```python
+import torch
+from specter.imaging import Exposure, Poses, Sample
+from specter.tilt import read_aretomo3_aln
+
+quaternions, shifts = read_aretomo3_aln("TS_001.aln", pixel_size=1.35)
+poses = Poses(quaternions, shifts, ids=torch.arange(len(quaternions)))
+exposure = Exposure.tilt_series(3.0, len(poses))
+series = Sample.from_volume(volume, 1.35).tilt_series(
+    poses, exposure, voltage=300.0, micrograph_size=512
+)
+```
+
+The readers follow AreTomo3's own conventions, which were checked by
+reconstructing a SPECTER-projected bead phantom with AreTomo3 (`-Cmd 2`)
+from the same `.aln`. `ROT` is the tilt-axis angle measured
+counter-clockwise from the image y axis, as in IMOD (Kremer et al.
+1996), so `ROT = 0`
+corresponds to `tilt_axis = "y"`. `TX`/`TY` are the shifts AreTomo3
+applies to align a raw image, so the raw image holds its content displaced
+by `+(TX, TY)`, and the returned translations are `-(TX, TY)` in Å.
+
+## Using it from Python instead of the CLI
+
+`run_tilt_series(config)` (`specter.pipelines`) is the same function the
+CLI calls. Build a `TiltSeriesConfig` directly in Python (or load one with
+`specter.config.load_config`) instead of going through the command line.
+For anything the config/CLI doesn't expose (quaternion-based tilt geometry,
+per-tilt CTF variation, etc.), use `Sample.tilt_series` and `TiltSeries`
+(`specter.imaging`) directly instead; `run_tilt_series` is a thin wrapper
+around them, and `demo-notebooks/create_tilt_series/` steps through the
+same calls.
+
+## See also
+
+- [`configs/tiltseries.toml`](https://github.com/joelyeois/specter/tree/main/configs):
+  the canonical, commented example config.
+- [Build a tomogram specimen](build-tomogram.md): builds the
+  `volume_path` this page images.
+- [Forward simulation](../concepts/forward-simulation.md),
+  [Scattering](../concepts/scattering/index.md),
+  [Aberrations](../concepts/aberrations.md),
+  [Detector](../concepts/detector.md): the physics behind each stage.
+- [Ice structure](../concepts/ice.md): the `ice_model` options.
+
+## References
+
+- Chan, H., Cherukara, M. J., Narayanan, B., Loeffler, T. D., Benmore, C.,
+  Gray, S. K., & Sankaranarayanan, S. K. R. S. (2019). Machine learning
+  coarse grained models for water. *Nature Communications*, 10(1), 379.
+  [doi:10.1038/s41467-018-08222-6](https://doi.org/10.1038/s41467-018-08222-6)
+- Grant, T., & Grigorieff, N. (2015). Measuring the optimal exposure for
+  single particle cryo-EM using a 2.6 Å reconstruction of rotavirus VP6.
+  *eLife*, 4, e06980.
+  [doi:10.7554/eLife.06980](https://doi.org/10.7554/eLife.06980)
+- Hagen, W. J. H., Wan, W., & Briggs, J. A. G. (2017). Implementation of a
+  cryo-electron tomography tilt-scheme optimized for high resolution
+  subtomogram averaging. *Journal of Structural Biology*, 197(2), 191–198.
+  [doi:10.1016/j.jsb.2016.06.007](https://doi.org/10.1016/j.jsb.2016.06.007)
+- Kremer, J. R., Mastronarde, D. N., & McIntosh, J. R. (1996). Computer
+  visualization of three-dimensional image data using IMOD. *Journal of
+  Structural Biology*, 116(1), 71–76.
+  [doi:10.1006/jsbi.1996.0013](https://doi.org/10.1006/jsbi.1996.0013)
+- Peck, A., Yu, Y., Paraan, M., Kimanius, D., Ermel, U. H., Hutchings, J.,
+  et al. (2026). AreTomoLive: automated reconstruction of comprehensively
+  corrected and denoised cryo-electron tomograms in real time and at high
+  throughput. *Nature Methods*, 23(6), 1121–1125.
+  [doi:10.1038/s41592-026-03093-y](https://doi.org/10.1038/s41592-026-03093-y)
+  (Describes AreTomo3.)
+- Scheres, S. H. W. (2012). RELION: Implementation of a Bayesian approach to
+  cryo-EM structure determination. *Journal of Structural Biology*, 180(3),
+  519–530. [doi:10.1016/j.jsb.2012.09.006](https://doi.org/10.1016/j.jsb.2012.09.006)
+- Zheng, S., Wolff, G., Greenan, G., Chen, Z., Faas, F. G. A., Bárcena, M.,
+  Koster, A. J., Cheng, Y., & Agard, D. A. (2022). AreTomo: An integrated
+  software package for automated marker-free, motion-corrected
+  cryo-electron tomographic alignment and reconstruction. *Journal of
+  Structural Biology: X*, 6, 100068.
+  [doi:10.1016/j.yjsbx.2022.100068](https://doi.org/10.1016/j.yjsbx.2022.100068)

@@ -1,14 +1,6 @@
 # Core modules
 
-Standalone top-level modules that are not grouped into a subpackage.
-
-## specter.potential
-
-::: specter.potential
-
-## specter.scattering
-
-::: specter.scattering
+Standalone top-level modules, outside any subpackage.
 
 ## specter.microscope
 
@@ -30,6 +22,18 @@ Standalone top-level modules that are not grouped into a subpackage.
 
 ::: specter.config
 
+## specter.memory
+
+::: specter.memory
+
+## specter.devices
+
+::: specter.devices
+
+## specter.cpu_threads
+
+::: specter.cpu_threads
+
 ## specter.arrays
 
 ::: specter.arrays
@@ -41,6 +45,10 @@ Standalone top-level modules that are not grouped into a subpackage.
 ## specter.fft
 
 ::: specter.fft
+
+## specter.nufft
+
+::: specter.nufft
 
 ## specter.filters
 
@@ -70,10 +78,14 @@ Standalone top-level modules that are not grouped into a subpackage.
 
 ::: specter.symmetries
 
-## specter.aretomo3
-
-::: specter.aretomo3
-
 ## specter.constants
 
 ::: specter.constants
+
+## specter.settings
+
+::: specter.settings
+
+## specter.options
+
+::: specter.options

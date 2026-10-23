@@ -1,5 +1,184 @@
 # Other propagation modes
 
-!!! info "Work in progress"
-    Will cover first Born, kinematic, and the projection approximation,
-    and when each linearisation is valid.
+Three more propagation modes trade accuracy for speed by different means
+than [Rytov](rytov.md): `firstborn` and `kinematic` linearize or
+simplify the per-slice scattering, and `projection` discards
+slice-to-slice propagation entirely.
+
+!!! example "In code"
+    This page is the theory behind [Scattering](../../walkthrough/scattering.md#propagation-models), which shows it step by step with code and figures.
+
+!!! info "Source"
+    `Scattering.firstborn` / `.kinematic` / `.projection` / `.ctf` and
+    their `IterativeScattering` counterparts.
+    `docs-figures/scattering_accuracy.py` produces the figures.
+
+## First Born
+
+First Born, after Born (1926), is the weak phase object approximation
+(Kirkland 2010, Ch. 5): it linearizes each
+slice's transmission function \(\exp(i\sigma\Delta z V_z)\) to its
+first-order Taylor term before propagating and summing it,
+
+\[
+\psi = 1 + i\sigma\Delta z \sum_{z} \mathcal{F}^{-1}\!\big[\mathcal{F}[V_z]\cdot F_z\big]
+\]
+
+using the same per-slice Fresnel propagator \(F_z\) as
+[Rytov](rytov.md#the-exponentiated-born-series). This is the single-scattering
+limit: valid only while the phase accumulated by any one slice is small.
+
+## Kinematic
+
+Kinematic keeps each slice's transmission amplitude exact,
+\(\exp(i\sigma\Delta z V_z) - 1\), rather than linearizing it, but still
+combines slices by addition rather than multiplication:
+
+\[
+\psi = 1 + \sum_{z} \mathcal{F}^{-1}\!\big[\mathcal{F}\big[\exp(i\sigma\Delta z V_z) - 1\big]\cdot F_z\big]
+\]
+
+This is the first-order term of the same multislice Born series
+`multislice` sums exactly, so it is a strictly better single-scattering
+approximation than `firstborn` in principle. In practice, the two track
+each other closely: keeping the per-slice amplitude exact matters far
+less than the additive (rather than multiplicative) slice combination
+they share, which is the actual source of both models' error (see
+below).
+
+## Where the linearization breaks down
+
+`firstborn` and `rytov` share one underlying complex quantity, \(\Theta =
+\sigma\Delta z\sum_z\mathcal{F}^{-1}[\mathcal{F}[V_z]\cdot F_z] = a+ib\):
+`rytov` is \(\exp(i\Theta)\), and `firstborn` is its linearization,
+\(1+i\Theta\). Splitting \(\Theta\) into real and imaginary parts shows
+why linearizing before squaring is not a safe order of operations:
+
+\[
+|\exp(i\Theta)|^2 = \exp(-2b) \quad\text{(depends only on } b=\mathrm{Im}(\Theta)\text{)},
+\qquad
+|1+i\Theta|^2 = 1 - 2b + a^2 + b^2 \quad\text{(picks up a spurious } a^2 \text{ term)}.
+\]
+
+A real phase shift (\(a\)) rotates the wave without changing its
+magnitude at all; only the imaginary part (\(b\), the part Fresnel
+propagation converts into a genuine amplitude change) affects
+\(|\psi|\). Squaring a truncated sum mixes \(a\) and \(b\) together, and
+the resulting \(a^2\) term has no physical counterpart. For any
+predominantly-phase specimen (ice, protein, or any other weakly
+absorptive material), \(a\) dominates \(b\): at low spatial frequency
+the Fresnel propagator is close to a real, unit-magnitude filter
+(\(F_z(k)\approx 1\) as \(k\to0\)), so most of \(\Theta\)'s power lands
+in the real part, and only the higher-frequency content that diffracts
+leaks into \(b\).
+
+![Standard deviation of Re(Θ) and Im(Θ) vs. thickness, for a RandomIcemaker ice slab. Re(Θ) dominates Im(Θ) at every thickness tested, by roughly 50x at the thinnest slab and still 2.6x at the thickest.](../../assets/images/scattering-theta-real-imag-split.png){ width="600" }
+///caption
+Standard deviation of Re(Θ) and Im(Θ) vs. thickness, for a RandomIcemaker ice slab. Re(Θ) dominates Im(Θ) at every thickness tested, by roughly 50x at the thinnest slab and still 2.6x at the thickest.
+///
+
+![Correlation of each mode's intensity pattern with multislice's true pattern, vs. thickness. rytov stays at 1.000 throughout; firstborn and kinematic sit near zero across the entire range, including the thinnest specimen tested.](../../assets/images/scattering-pattern-correlation-vs-thickness.png){ width="600" }
+///caption
+Correlation of each mode's intensity pattern with multislice's true pattern, vs. thickness. rytov stays at 1.000 throughout; firstborn and kinematic sit near zero across the entire range, including the thinnest specimen tested.
+///
+
+The spurious \(a^2\) term dominates `firstborn`'s intensity fluctuation
+rather than the physically correct \(-2b\) term, at every thickness
+tested here, including the thinnest. Its pattern correlation with
+`multislice` never exceeds \({\approx}0.02\) and briefly goes negative.
+The same collapse is not specific to `RandomIcemaker` ice: it also
+reproduces (from \({\approx}0.9\) at the thinnest slice to \({\approx}0\)
+at full depth) on a real protein potential, myoglobin (PDB `1mbo`; Phillips 1980).
+Averaged over the whole image, the same \(a^2+b^2 = |\Theta|^2\) excess
+also explains the mean-intensity bias in [Accuracy vs.
+thickness](#accuracy-vs-thickness) below. [Kinematic](#kinematic)
+inherits the same problem for the same structural reason: additive,
+rather than multiplicative, slice combination. Its per-slice
+linearization is not the cause; kinematic keeps that term exact.
+
+## Projection
+
+The thin-specimen limit (Kirkland 2010, Ch. 5): sum the potential over Z
+first, then apply a single transmission function with no propagation step
+at all,
+
+\[
+\psi = \exp\!\left(i\sigma\Delta z \sum_{z} V_z\right)
+\]
+
+This is also what `scattering_model="ctf"` returns as a real-valued
+projected potential (`2\sigma\Delta z \sum_z V_z`, without the complex
+exponential), which feeds the linear (weak-phase-object) CTF image model
+(see [Detector](../detector.md) and [Aberrations](../aberrations.md)).
+That aberration model is not a separate setting: every imager derives it
+from `scattering_model` (`aberrations.aberration_model_for_scattering`),
+selecting `"linear"` for `"ctf"` and `"nonlinear"` for every other model.
+
+## Accuracy vs. thickness
+
+The metric plotted below is the mean absolute error in exit-wave
+intensity against `multislice`, normalized by `multislice`'s own mean
+intensity:
+
+\[
+E \;=\; \frac{\big\langle\,\lvert I_{\mathrm{model}} - I_{\mathrm{multislice}}\rvert\,\big\rangle}{\langle I_{\mathrm{multislice}}\rangle},
+\qquad I = |\psi|^2,
+\]
+
+using the same `RandomIcemaker` ice slab, 300 kV, sweep as [Rytov's
+accuracy figure](rytov.md#accuracy-vs-thickness):
+
+![Relative error in exit-wave intensity vs. multislice, as a function of ice thickness, for first Born, kinematic, and projection (highlighted) against Rytov (faint, for context).](../../assets/images/scattering-accuracy-vs-thickness-other-modes.png){ width="600" }
+///caption
+Relative error in exit-wave intensity vs. multislice, as a function of ice thickness, for first Born, kinematic, and projection (highlighted) against Rytov (faint, for context).
+///
+
+`projection` scores lower than `firstborn`/`kinematic` here, but not
+because it approximates thickness effects well. Writing
+\(I_{\mathrm{model}} - I_{\mathrm{multislice}} = b + d(x,y)\) with
+\(b = \langle I_{\mathrm{model}}\rangle - \langle
+I_{\mathrm{multislice}}\rangle\) the mean-intensity bias: for
+`firstborn`/`kinematic`, \(|b|\) dominates \(d\)'s spread at every ice
+thickness tested (by a factor of 1.5 at 32 Å, growing to 5.2 at 320 Å),
+so \(E \approx |b|\) almost exactly. This figure amounts to a
+rescaled replot of the mean-intensity bias below. `projection`'s bias is
+exactly 0 at every thickness (its exit wave is unit-modulus by
+construction at `alpha=0`), so its \(E\) instead measures only how far
+`multislice`'s own true contrast is from flat.
+
+![Mean exit-wave intensity vs. thickness, per model. A properly normalized exit wave conserves total intensity (multislice and projection stay pinned to 1.0); firstborn and kinematic drift up to +39% by 320 A.](../../assets/images/scattering-mean-intensity-vs-thickness.png){ width="600" }
+///caption
+Mean exit-wave intensity vs. thickness, per model. A properly normalized exit wave conserves total intensity (multislice and projection stay pinned to 1.0); firstborn and kinematic drift up to +39% by 320 A.
+///
+
+![Exit-wave intensity maps at 320 A, side by side. multislice and rytov show fine, correlated speckle; firstborn is a different, coarser pattern riding on a strongly biased mean; projection is exactly flat.](../../assets/images/scattering-mode-intensity-maps.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+Exit-wave intensity maps at 320 A, side by side. multislice and rytov show fine, correlated speckle; firstborn is a different, coarser pattern riding on a strongly biased mean; projection is exactly flat.
+///
+
+Neither curve tests spatial pattern fidelity; that is the [pattern
+correlation figure](#where-the-linearization-breaks-down) above, where
+only `rytov` tracks the truth. `projection` is not a good general
+substitute for `multislice`: it carries no spatial structure by
+construction and will read as "accurate" on this particular metric for
+exactly as long as the true signal stays small enough for its bias-free
+flatness to win by default. That crossover point is specimen-dependent:
+the bias-driven gap between `projection` and `firstborn` on this ice
+slab (roughly 10x at 320 Å) shrinks to roughly 3x for a real
+single-particle protein at typical imaging depths (tens of Å), where
+accumulated phase, and therefore `firstborn`'s bias, is much smaller.
+`rytov` remains 2-3 orders of magnitude more accurate than every other
+approximate mode at every thickness tested, on both specimen types.
+
+## References
+
+- Born, M. (1926). Quantenmechanik der Stoßvorgänge. *Zeitschrift für
+  Physik*, 38(11–12), 803–827.
+  [doi:10.1007/BF01397184](https://doi.org/10.1007/BF01397184)
+- Kirkland, E. J. (2010). *Advanced computing in electron microscopy* (2nd
+  ed.). Springer.
+  [doi:10.1007/978-1-4419-6533-2](https://doi.org/10.1007/978-1-4419-6533-2)
+  Ch. 5–6 (weak phase object and projection approximations).
+- Phillips, S. E. V. (1980). Structure and refinement of oxymyoglobin at
+  1.6 Å resolution. *Journal of Molecular Biology*, 142(4), 531–554.
+  [doi:10.1016/0022-2836(80)90262-4](https://doi.org/10.1016/0022-2836(80)90262-4)

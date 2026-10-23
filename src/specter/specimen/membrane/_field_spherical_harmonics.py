@@ -36,7 +36,7 @@ Algorithm
    directly -- evaluating ``scipy.special.sph_harm_y_all`` at every voxel's
    own direction (one voxel = one distinct, essentially never-repeated
    direction) does not reuse anything between voxels and was measured to
-   dominate `generate()`'s cost, ~70s at a realistic ~10M-voxel working grid.
+   dominate `generate()`'s cost, 60s at a realistic ~10M-voxel working grid.
    Since the perturbation itself only contains information up to degree
    `sh_max_degree`, it is fully resolved by a MUCH smaller number of angular
    samples (see ``_angular_grid_resolution``); every voxel's own value is
@@ -44,45 +44,62 @@ Algorithm
    (``_interpolate_angular_grid``, via ``torch.nn.functional.grid_sample``,
    with a manual phi-periodic pad since ``grid_sample`` has no circular
    mode). Measured directly: interpolation error is ~0.17% of the
-   perturbation's own RMS scale at the default resolution -- an order of
+   perturbation's own peak at the default resolution -- an order of
    magnitude below the ``distance_transform_edt`` discretization noise step
-   3 already introduces -- while cutting wall time by 30-150x (more at
+   3 already introduces -- while cutting wall time by 31-173x (more at
    larger voxel counts, since the angular synthesis cost is now fixed
    regardless of how many voxels read from it).
 3. For every working-grid point, transform into a unit-sphere frame scaled by
-   the organelle's physical semi-axes ``sh_axes_a`` (anisotropic axes give
+   the organelle's physical semi-axes ``sh_axes`` (anisotropic axes give
    elongated/flattened organelles), and test -- using the interpolated
    perturbation from step 2 -- whether the point's own radius in that frame
    is less than the harmonic-perturbed surface radius at the point's own
    direction.
 4. Feed the resulting boolean solid mask through
    ``scipy.ndimage.distance_transform_edt`` (via ``_signed_distance_
-   transform``) to get a real, physical-Angstrom, Eikonal-
+   transform``) to get a real, physical-Å, Eikonal-
    respecting (``|grad(phi)| ~= 1``) signed distance field -- never an
    analytic-but-approximate radial-residual SDF, whose error grows with the
    surface's local slope and would distort the physically-calibrated
-   ``bilayer_thickness_a`` precisely in the high-frequency, biologically
+   ``bilayer_thickness`` precisely in the high-frequency, biologically
    interesting regions.
 
 No mesh is ever constructed.
+
+The default undulation spectrum, ``Var(a_lm) ~ [l(l+1)]**-2``, is the
+large-``l``, tensionless form of the thermal fluctuation spectrum of a
+quasi-spherical vesicle [2]_ whose bilayer has Helfrich bending
+elasticity [1]_.
+
+References
+----------
+.. [1] Helfrich, W. (1973). Elastic properties of lipid bilayers: theory and
+   possible experiments. *Zeitschrift für Naturforschung C*, 28(11–12),
+   693–703. https://doi.org/10.1515/znc-1973-11-1209
+.. [2] Milner, S. T., & Safran, S. A. (1987). Dynamical fluctuations of droplet
+   microemulsions and vesicles. *Physical Review A*, 36(9), 4371–4379.
+   https://doi.org/10.1103/PhysRevA.36.4371
 """
 
 from __future__ import annotations
 
 import warnings
+from typing import cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.special import sph_harm_y, sph_harm_y_all
 
-from ._field import MembraneField, _grid_points_xyz, _signed_distance_transform
+from ._field import MembraneField, _centred_origin_xyz, _signed_distance_transform
 
-# _placement.py's Newton projection (`x - phi(x) * normal(x)`) only converges
-# reliably if phi closely satisfies the Eikonal property near the surface --
-# true by construction for distance_transform_edt output, but only as
-# well-resolved as the grid.
-_MIN_RELIABLE_VOXELS_PER_RADIUS = 8.0
+# Voxels of the working grid `generate_membrane_field_spherical_harmonics` builds
+# per slab. Bounds the device memory its per-voxel geometry holds at once: the
+# widest intermediate is float64, so ~8 bytes a voxel times a handful of live
+# tensors, i.e. a few hundred MB here. Purely a memory knob -- slabs are
+# independent and the result is identical for any value -- so it is a constant
+# rather than an argument.
+_FIELD_CHUNK_VOXELS = 8_000_000
 
 
 def _real_from_complex(y: np.ndarray, order: int) -> np.ndarray:
@@ -118,10 +135,10 @@ def _real_spherical_harmonic(
     single ``scipy.special.sph_harm_y_all`` call for the whole degree/order
     grid, ~5x faster than one ``sph_harm_y`` call per ``(l, m)`` pair) still
     costs O(voxel count), which dominates `generate()` at realistic working-
-    grid sizes (~70s measured at ~10M voxels). ``generate_membrane_field_
+    grid sizes (60s measured at ~10M voxels). ``generate_membrane_field_
     spherical_harmonics`` instead evaluates the harmonic sum on a small
     angular grid once and interpolates (see ``_synthesize_angular_grid``/
-    ``_interpolate_angular_grid``), a further 30-150x faster. This function
+    ``_interpolate_angular_grid``), a further 31-173x faster. This function
     and ``_real_spherical_harmonics_grid`` remain the ground truth those are
     tested against.
 
@@ -180,9 +197,9 @@ def _real_spherical_harmonics_grid(
     exactly like ``_real_spherical_harmonic``, the real-SH combination for a
     NEGATIVE order ``m`` is built from the POSITIVE-order complex value
     ``Y_l^{|m|}`` (see ``_real_from_complex``), not from ``Y_l^{-|m|}``
-    itself -- those differ by an extra ``(-1)^m`` (a real, previously caught
-    bug here: using the array's own negative-order column instead gave every
-    negative-order real harmonic the wrong sign). So only the trivially
+    itself -- those differ by an extra ``(-1)^m``, so using the array's own
+    negative-order column instead gives every negative-order real harmonic
+    the wrong sign. So only the trivially
     ascending non-negative columns (index ``== order``) are ever indexed.
 
     Parameters
@@ -258,10 +275,10 @@ def _synthesize_angular_grid(
 
 def _interpolate_angular_grid(
     coarse_padded: np.ndarray,
-    theta: np.ndarray,
-    phi: np.ndarray,
+    theta: np.ndarray | torch.Tensor,
+    phi: np.ndarray | torch.Tensor,
     device: str | torch.device,
-) -> np.ndarray:
+) -> np.ndarray | torch.Tensor:
     """
     Bilinearly interpolate ``_synthesize_angular_grid``'s ``(n_theta,
     n_phi + 1)`` output at arbitrary ``(theta, phi)`` points via
@@ -271,22 +288,32 @@ def _interpolate_angular_grid(
     via ``padding_mode="border"`` (exact at ``theta`` exactly 0/pi, and
     the grid already spans the full ``[0, pi]`` range so this only matters
     for floating-point boundary roundoff).
+
+    Returns the same array type it was given: a `torch.Tensor` on `device` for
+    tensor input, a NumPy array for NumPy input. The tensor form exists so
+    `generate_membrane_field_spherical_harmonics` can keep a 100M-voxel working
+    grid on the GPU end to end; the NumPy form is what `specimen/_grid.py`'s
+    bead roughness uses, on a few thousand points where the round trip is free.
     """
+    as_tensor = torch.is_tensor(theta)
     coarse_t = torch.as_tensor(coarse_padded, dtype=torch.float32, device=device)[
         None, None
     ]
     theta_t = torch.as_tensor(theta, dtype=torch.float32, device=device)
-    phi_t = torch.as_tensor(
-        np.mod(phi, 2.0 * np.pi), dtype=torch.float32, device=device
+    phi_t = torch.as_tensor(phi, dtype=torch.float32, device=device).remainder(
+        2.0 * np.pi
     )
     norm_theta = (theta_t / np.pi) * 2.0 - 1.0
     norm_phi = (phi_t / (2.0 * np.pi)) * 2.0 - 1.0
-    grid = torch.stack([norm_phi, norm_theta], dim=-1).reshape(1, -1, 1, 2)
+    grid = torch.stack(torch.broadcast_tensors(norm_phi, norm_theta), dim=-1).reshape(
+        1, -1, 1, 2
+    )
 
     sampled = F.grid_sample(
         coarse_t, grid, mode="bilinear", align_corners=True, padding_mode="border"
     )
-    return sampled.reshape(-1).cpu().numpy()
+    flat = sampled.reshape(-1)
+    return flat if as_tensor else flat.cpu().numpy()
 
 
 def _sample_sh_coefficients(
@@ -337,9 +364,9 @@ def _sample_sh_coefficients(
 
 def generate_membrane_field_spherical_harmonics(
     shape_zyx: tuple[int, int, int],
-    spacing_a: float,
+    spacing_angstrom: float,
     sh_max_degree: int = 8,
-    sh_axes_a: tuple[float, float, float] = (300.0, 300.0, 300.0),
+    sh_axes: tuple[float, float, float] = (300.0, 300.0, 300.0),
     sh_amplitude: float = 0.15,
     sh_spectrum_power: float = 2.0,
     device: str | torch.device = "cpu",
@@ -356,16 +383,16 @@ def generate_membrane_field_spherical_harmonics(
         Working grid shape, ``(Z, Y, X)``. Should cover the intended
         membrane instance's bounding box with margin, matching the other
         backends' own convention.
-    spacing_a : float
-        Working grid voxel spacing, Angstrom. Independent of any downstream
+    spacing_angstrom : float
+        Working grid voxel spacing, Å. Independent of any downstream
         output voxel size.
     sh_max_degree : int, optional
         Highest spherical-harmonic degree included in the random surface
         perturbation. Higher values add finer surface detail (see
         ``_sample_sh_coefficients``). Default 8.
-    sh_axes_a : tuple of float, optional
+    sh_axes : tuple of float, optional
         Physical semi-axes ``(a_x, a_y, a_z)`` of the base ellipsoid,
-        Angstrom -- isotropic (equal) axes give a roughly spherical
+        Å -- isotropic (equal) axes give a roughly spherical
         organelle, anisotropic axes give an elongated/flattened one (e.g.
         a stretched mitochondrion). Default ``(300.0, 300.0, 300.0)``.
     sh_amplitude : float, optional
@@ -374,8 +401,8 @@ def generate_membrane_field_spherical_harmonics(
         coefficient set in ``_sample_sh_coefficients``, so this parameter
         alone controls the perturbation's scale independent of
         `sh_max_degree`/`sh_spectrum_power`. Default 0.15, chosen from a
-        direct visual sweep (0.10/0.15/0.25/0.40, see ``dev/
-        sh_membrane_examples.py``): 0.10 was barely distinguishable from a
+        direct visual sweep (0.10/0.15/0.25/0.40): 0.10 was barely
+        distinguishable from a
         sphere, 0.40 produced visible concave dimples (still a valid,
         non-degenerate star-convex surface -- `R_prime`'s positive floor
         holds even there -- but an unusually irregular-looking organelle);
@@ -402,14 +429,15 @@ def generate_membrane_field_spherical_harmonics(
     ``_angular_grid_resolution(sh_max_degree)`` angular grid and bilinearly
     interpolated at every working-grid voxel (see this module's own
     Algorithm docstring) rather than evaluated directly per voxel -- ~0.17%
-    interpolation error relative to the perturbation's own RMS scale at the
+    interpolation error relative to the perturbation's own peak at the
     default resolution, well below the ``distance_transform_edt``
-    discretization noise already present, for a measured 30-150x wall-time
+    discretization noise already present, for a measured 31-173x wall-time
     reduction depending on working-grid size.
 
-    The same Eikonal/grid-resolution caveat applies to
-    `_placement.sample_surface_sites`'s Newton-projection surface search --
-    see this function's own warning below.
+    `_placement.sample_surface_sites` projects onto this field with a Newton
+    step scaled by phi's measured slope along the normal, since a
+    ``dist_out - dist_in`` field has a slope near 2 across the surface cell
+    rather than the Eikonal 1.
 
     Returns
     -------
@@ -418,21 +446,46 @@ def generate_membrane_field_spherical_harmonics(
     if sh_max_degree < 2:
         raise ValueError(f"sh_max_degree must be >= 2, got {sh_max_degree}")
 
-    extent_a = (
-        torch.tensor([shape_zyx[2], shape_zyx[1], shape_zyx[0]], dtype=torch.float32)
-        * spacing_a
-    )
-    origin_xyz = -0.5 * extent_a
+    origin_xyz = _centred_origin_xyz(shape_zyx, spacing_angstrom)
 
-    points_xyz = _grid_points_xyz(shape_zyx, spacing_a, origin_xyz, device="cpu")
-    query = points_xyz.reshape(-1, 3).numpy()
+    # The per-voxel geometry below runs on `device` and is separable: x depends
+    # only on the column index, y only on the row, z only on the slice, so the
+    # normalized coordinates are three 1-D tensors that broadcast, rather than a
+    # materialized (nz*ny*nx, 3) point cloud.
+    #
+    # On the CPU over a materialized point cloud this is ~14 s per instance,
+    # the single largest cost in `specter build tomogram`'s membrane phase,
+    # and 2.4 GB for the normalized points alone at the ~464^3 working grid
+    # `max_field_voxels` clamps to. On device with broadcast 1-D tensors it
+    # is ~0.1 s (tests/test_membrane_generator.py checks the equivalence).
+    #
+    # float64 is deliberate, and free: this is memory-bound, so float64 measured
+    # the same wall time as float32 on an L40. It is not free in accuracy terms
+    # though -- `inside` is a threshold, `r_prime < r_surface`, and in float32
+    # roughly one voxel in 10^8 lands close enough to tie differently than the
+    # CPU reference did. That sounds ignorable and is not: a 13-voxel change in
+    # the membrane shell moves the region mask, and the cytosol filler packing is
+    # a random sequential addition whose accept/reject sequence then diverges
+    # completely, so a fixed `seed` stops reproducing a fixed tomogram. Building
+    # each axis in float32 FIRST (what `_grid_points_xyz` returned) and upcasting
+    # before dividing by `sh_axes` reproduces NumPy's own dtype sequence, and
+    # with it the reference mask exactly -- 0 differing voxels across seeds.
+    #
+    # `_field_swept_spline` already threads `device` through the same way; this
+    # backend was the one that hardcoded "cpu".
+    device_t = torch.device(device)
+    nz, ny, nx = shape_zyx
+    axes = torch.as_tensor(sh_axes, dtype=torch.float64, device=device_t)
+    origin = origin_xyz.to(device=device_t, dtype=torch.float32)
 
-    axes = np.asarray(sh_axes_a, dtype=np.float64)
-    p_prime = query / axes
-    r_prime = np.linalg.norm(p_prime, axis=-1)
-    r_safe = np.clip(r_prime, 1e-12, None)
-    theta = np.arccos(np.clip(p_prime[:, 2] / r_safe, -1.0, 1.0))
-    phi_ang = np.arctan2(p_prime[:, 1], p_prime[:, 0])
+    def _axis(n: int, i: int) -> torch.Tensor:
+        idx = torch.arange(n, device=device_t, dtype=torch.float32)
+        return (origin[i] + idx * spacing_angstrom).to(torch.float64) / axes[i]
+
+    px = _axis(nx, 0).view(1, 1, nx)
+    py = _axis(ny, 1).view(1, ny, 1)
+    pz = _axis(nz, 2).view(nz, 1, 1)
+    phi_rad = torch.atan2(py, px)
 
     rng = np.random.default_rng(seed)
     coefficients = _sample_sh_coefficients(sh_max_degree, sh_spectrum_power, rng)
@@ -441,33 +494,48 @@ def generate_membrane_field_spherical_harmonics(
     coarse_padded = _synthesize_angular_grid(
         coefficients, sh_max_degree, n_theta, n_phi
     )
-    perturbation = _interpolate_angular_grid(
-        coarse_padded, theta, phi_ang, device="cpu"
-    )
 
-    r_surface = np.clip(1.0 + sh_amplitude * perturbation, 0.05, None)
-    inside = (r_prime < r_surface).reshape(shape_zyx)
+    # Walk z in slabs and copy each finished slab straight to the host, rather
+    # than holding the whole working grid on the device at once.
+    #
+    # Unchunked this peaked at 4.4 GB of device memory for a ~464^3 grid, and
+    # left the caching allocator holding that pool afterwards. It fits at a
+    # coarse voxel size and does not at a fine one: at 1.5 A/voxel the later
+    # per-species template rendering wants a contiguous ~4 GB of its own and
+    # a whole `build tomogram` run OOM'd on a 44 GB card that the pre-GPU code
+    # completed on. Chunking bounds the peak to one slab (~0.3 GB), and slabs
+    # are independent -- every operation here is elementwise in z -- so the
+    # result is unchanged.
+    inside = np.empty(shape_zyx, dtype=bool)
+    chunk_nz = max(1, min(nz, _FIELD_CHUNK_VOXELS // max(ny * nx, 1)))
+    for z0 in range(0, nz, chunk_nz):
+        z1 = min(z0 + chunk_nz, nz)
+        pz_chunk = pz[z0:z1]
+
+        # summed in x, y, z order to match np.linalg.norm's own reduction order
+        r_prime = torch.sqrt(px * px + py * py + pz_chunk * pz_chunk)
+        r_safe = r_prime.clamp(min=1e-12)
+        theta = torch.arccos((pz_chunk / r_safe).clamp(-1.0, 1.0))
+
+        # theta/phi_ang are tensors, so the interpolation returns one too.
+        perturbation = cast(
+            torch.Tensor,
+            _interpolate_angular_grid(coarse_padded, theta, phi_rad, device=device_t),
+        ).view(z1 - z0, ny, nx)
+
+        r_surface = (1.0 + sh_amplitude * perturbation).clamp(min=0.05)
+        # Both distance-transform backends take a NumPy mask (the cupy path's
+        # own error message formats `inside.size` as an int).
+        inside[z0:z1] = (r_prime < r_surface).cpu().numpy()
+        del r_prime, r_safe, theta, perturbation, r_surface
+
+    del px, py, pz, phi_rad
 
     # See _signed_distance_transform's own docstring for why this is
     # GPU-accelerated (optionally) rather than always scipy.
-    phi = _signed_distance_transform(inside, spacing_a, device)
+    phi = _signed_distance_transform(inside, spacing_angstrom, device)
 
-    voxels_per_radius = min(sh_axes_a) / spacing_a
-    if voxels_per_radius < _MIN_RELIABLE_VOXELS_PER_RADIUS:
-        warnings.warn(
-            f"generate_membrane_field_spherical_harmonics: min(sh_axes_a) "
-            f"({min(sh_axes_a):.1f} A) is only {voxels_per_radius:.1f} "
-            f"working-grid voxels at spacing_a={spacing_a:.2f} A -- below the "
-            f"{_MIN_RELIABLE_VOXELS_PER_RADIUS:.0f} voxels/radius verified reliable "
-            "for sample_surface_sites' Newton-projection surface sampling. "
-            "Transmembrane placement may silently find zero sites at this "
-            "resolution. Increase sh_axes_a, or decrease spacing_a (e.g. a "
-            "smaller v_size on the owning MembraneGenerator), to raise this "
-            "ratio.",
-            stacklevel=2,
-        )
-
-    clipped = (
+    clipped = bool(
         inside[0].any()
         or inside[-1].any()
         or inside[:, 0].any()
@@ -482,13 +550,13 @@ def generate_membrane_field_spherical_harmonics(
             "hard-clipped by shape_zyx rather than tapering to zero inside it "
             "(same failure mode the other shape backends' own boundary checks "
             "guard against). Increase shape_zyx (or the owning MembraneGenerator's "
-            "target_shape_zyx/v_size), or reduce sh_axes_a/sh_amplitude.",
+            "target_shape/voxel_size), or reduce sh_axes/sh_amplitude.",
             stacklevel=2,
         )
 
     return MembraneField(
         phi=phi,
-        spacing_a=spacing_a,
+        spacing_angstrom=spacing_angstrom,
         origin_xyz=origin_xyz.to(device),
         clipped_at_boundary=clipped,
     )

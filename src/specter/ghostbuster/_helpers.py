@@ -1,3 +1,8 @@
+"""
+Helpers for the reconstructors: learning-rate schedulers, k-space masks,
+particle-image preprocessing and per-epoch metrics.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Callable
@@ -11,8 +16,8 @@ from torch.optim.lr_scheduler import (
     LRScheduler,
     OneCycleLR,
 )
+from specter.options import ImageUnits, Scheduler
 
-from ..fft import fft3, ifft3
 
 # ---------------------------------------------------------------------------
 # Shared helpers used by both Reconstructor and TomogramReconstructor
@@ -20,7 +25,7 @@ from ..fft import fft3, ifft3
 
 
 def _build_lr_scheduler(
-    scheduler: str,
+    scheduler: Scheduler,
     optimizer: torch.optim.Optimizer,
     lr: float,
     lr_lambda: Callable[[int], float],
@@ -76,37 +81,108 @@ def _build_lr_scheduler(
     )
 
 
-def _preprocess_particle_images(
-    images: torch.Tensor, dose_per_angstrom: float, voxel_size: float
+def _images_to_counts(
+    images: torch.Tensor,
+    image_units: ImageUnits,
+    dose_per_pixel: float | torch.Tensor,
+    flip_contrast: bool,
 ) -> torch.Tensor:
     """
-    Sign-flip and dose-scale a raw particle stack to match the forward model's
-    intensity units.
+    Bring observed images into electron counts per pixel, the units both
+    reconstructors' forward models predict.
+
+    A normalised stack is taken to have unit-variance shot noise about a zero
+    mean, and is mapped back to counts as ``sqrt(N) * x + N`` with ``N`` the
+    expected dose per pixel. Counts are used as they are.
 
     Parameters
     ----------
     images : torch.Tensor
-        Raw particle stack as read from the .mrc/.mrcs file.
-    dose_per_angstrom : float
-        Electron dose in e⁻/Å².
-    voxel_size : float
-        Voxel size in Å.
+        Observed images, shape ``(N, H, W)``.
+    image_units : {"normalized", "counts"}
+        What the values of ``images`` mean.
+    dose_per_pixel : float or torch.Tensor
+        Expected electrons per pixel, ``dose_per_angstrom * voxel_size**2``:
+        a scalar, or a tensor broadcasting against ``images`` for a dose that
+        differs per image. Unused for counts.
+    flip_contrast : bool
+        Negate a normalised stack before the conversion, for a stack stored
+        with inverted contrast. Must be ``False`` for counts, which have a
+        physical sign.
 
     Returns
     -------
     torch.Tensor
-        Preprocessed images.
+        Images in electron counts per pixel.
+
+    Raises
+    ------
+    ValueError
+        If ``flip_contrast`` is requested for counts, or ``image_units`` is
+        not recognised.
     """
-    images = -images
-    dose_per_area = dose_per_angstrom * voxel_size**2
-    return dose_per_area**0.5 * images + dose_per_area
+    if image_units == "counts":
+        if flip_contrast:
+            raise ValueError(
+                "flip_contrast=True is only meaningful for image_units='normalized': "
+                "counts are non-negative, so negating them has no physical reading"
+            )
+        return images if images.is_floating_point() else images.float()
+    if image_units != "normalized":
+        raise ValueError(
+            f"image_units={image_units!r} is invalid: must be 'normalized' or 'counts'"
+        )
+    if flip_contrast:
+        images = -images
+    return dose_per_pixel**0.5 * images + dose_per_pixel
 
 
-def _apply_kmask_inplace(V: torch.Tensor, kmask: torch.Tensor | None) -> None:
-    """Zero V's Fourier components outside ``kmask``, in-place, if a mask is set."""
-    if kmask is None:
+def _kmask_half_spectrum(kmask: torch.Tensor) -> torch.Tensor:
+    """
+    A centred k-mask as the half spectrum ``rfftn`` produces.
+
+    ``ifftshift`` moves the mask's zero frequency to index 0, the layout of
+    an unshifted FFT, and the last axis is cut to the ``n // 2 + 1``
+    non-redundant frequencies of a real volume's transform. Computed once
+    per mask (see :meth:`_BaseReconstructor._kmask_half`), so the per-step
+    application needs no shifts at all.
+
+    Parameters
+    ----------
+    kmask : torch.Tensor
+        Centred mask, shape ``(Z, Y, X)``, symmetric under ``k -> -k``.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(Z, Y, X // 2 + 1)``, same dtype and device.
+    """
+    n = kmask.shape[-1]
+    return torch.fft.ifftshift(kmask)[..., : n // 2 + 1].contiguous()
+
+
+def _apply_kmask_inplace(V: torch.Tensor, kmask_half: torch.Tensor | None) -> None:
+    """
+    Band-limit `V` in place with a half-spectrum k-mask.
+
+    Applied after every optimiser step. A centred complex FFT round trip,
+    ``real(ifft3(fft3(V, shift=True) * kmask, shift=True))``, computes the
+    same thing at twelve ``roll`` passes and two complex 512^3 transforms:
+    137 ms and 6.5 GiB per step on a 512-box reconstruction, against a
+    ~160 ms training step. The real-to-complex transform of a real volume
+    against the mask's unshifted half spectrum is the same operation
+    without them.
+
+    Parameters
+    ----------
+    V : torch.Tensor
+        Real volume, ``(Z, Y, X)``; ``V.data`` is replaced.
+    kmask_half : torch.Tensor or None
+        From :func:`_kmask_half_spectrum`; None leaves `V` untouched.
+    """
+    if kmask_half is None:
         return
-    V.data = torch.real(ifft3(fft3(V.data, shift=True) * kmask, shift=True))
+    V.data = torch.fft.irfftn(torch.fft.rfftn(V.data) * kmask_half, s=V.shape)
 
 
 def _log_current_lr(trainer: L.Trainer, lr: float | None, log_lrs: list[float]) -> None:
@@ -120,7 +196,6 @@ def _log_current_lr(trainer: L.Trainer, lr: float | None, log_lrs: list[float]) 
 def _build_epoch_metrics(
     total_loss: list[torch.Tensor],
     norm_loss: list[torch.Tensor],
-    sparsity_loss: list[torch.Tensor],
     lrs: list[float],
     current_epoch: int,
     include_loss_std: bool = False,
@@ -131,9 +206,8 @@ def _build_epoch_metrics(
 
     Parameters
     ----------
-    total_loss, norm_loss, sparsity_loss : list of torch.Tensor
-        Per-batch scalar losses logged during training. ``sparsity_loss`` may
-        be empty if sparsity regularisation was disabled.
+    total_loss, norm_loss : list of torch.Tensor
+        Per-batch scalar losses logged during training.
     lrs : list of float
         Per-batch learning rate of the volume optimiser.
     current_epoch : int
@@ -189,11 +263,6 @@ def _build_epoch_metrics(
             },
             "lr": lr_stats,
         }
-        if sparsity_loss:
-            ep_sparsity = [float(v) for v in sparsity_loss[start:end]]
-            epochs[key]["sparsity_loss"] = {
-                "mean": sum(ep_sparsity) / len(ep_sparsity) if ep_sparsity else None,
-            }
 
     return {
         "total_batches": len(total_loss),

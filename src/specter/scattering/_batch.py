@@ -1,0 +1,725 @@
+"""
+`Scattering`: exit waves from a batch of already-rotated potentials.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+
+import lightning as L
+import math
+
+import torch
+
+from ..constants import energy_to_wavelength, interaction_parameter
+from ..fft import fft2, ifft2
+from ..potential import apply_amplitude_contrast
+from ..progress import track
+from . import _kernels
+from ._kernels import (
+    bandlimit_mask,
+    fourier_crop_xy,
+    fourier_upsample_xy,
+    oversampled_exp,
+    frequency_grid,
+    fresnel_propagator,
+    phase_scale,
+)
+from specter.options import EwaldSphereSign, ScatteringModel
+
+
+class Scattering(L.LightningModule):
+    def __init__(
+        self,
+        nxy: int,
+        pixel_size: float,
+        voltage: float,
+        scattering_model: ScatteringModel = "multislice",
+        klim: float | None = None,
+        ews_curvature_sign: EwaldSphereSign = "negative",
+        nz: int | None = None,
+        alpha: float = 0.0,
+        uniform_absorption: float = 0.0,
+        progressbars: bool = True,
+        oversample: int = 1,
+        crop: bool = True,
+    ):
+        """
+        A scattering module to compute the 2D exitwave from a 3D scattering
+        potential. Various scattering modes are available, following the
+        multislice formalism of Kirkland [1]_, after Cowley & Moodie [2]_
+        and Ishizuka & Uyeda [3]_.
+
+        Parameters
+        ----------
+        nxy : int
+            Number of pixels in x and y dimensions, (nxy, nxy).
+        pixel_size : float
+            Pixel size in Å. Assumes dz equals pixel_size.
+        voltage : float
+            Electron beam accelerating voltage in kV. Typical values are 100,
+            120, 200, or 300 kV.
+        scattering_model : str, optional
+            Scattering model to use. Options: 'multislice', 'firstborn',
+            'projection', 'ctf' (in order of increasing approximations).
+            Default is 'multislice'.
+        klim : float, optional
+            Bandlimit parameter for Kirkland's FFT aliasing prevention.
+            Setting klim=0.66 prevents aliasing but reduces spatial frequency
+            content. Default is None (no bandlimiting).
+        uniform_absorption : float, optional
+            A spatially constant absorption potential in volts, applied on top
+            of whatever `V` carries. A uniform imaginary potential contributes
+            only a scalar ``exp(-sigma dz V_ab)`` to each slice's transmission,
+            so it is applied as one, never materialised: an embedding medium's
+            absorption costs nothing this way, where building the field would
+            cost a second volume and a complex copy of it -- 77 GiB on the
+            (4, 1642, 1024, 1024) potential a 512-pixel probe in thick ice
+            hands this class. Rytov and projection include the same exponential
+            attenuation; first Born and kinematic retain their respective
+            approximations, matching an explicit imaginary potential. The
+            CTF-only model rejects this term. Default 0.0.
+        ews_curvature_sign : str, optional
+            Ewald sphere curvature sign matching CryoSPARC's convention.
+            ``'negative'`` (default) or ``'positive'``. Affects multislice,
+            Rytov, and first Born models.
+        nz : int, optional
+            Number of slices in z dimension. Required for firstborn model.
+            Default is None.
+        alpha : float, optional
+            Amplitude contrast ratio. Default is 0.0.
+        progressbars : bool, optional
+            Whether to display progress bars during computation. Default is True.
+        oversample : int, optional
+            Run the multislice recursion on an xy grid this many times finer
+            than the volume's, and Fourier-crop the exit wave back. Each
+            slice is band-limited-interpolated onto the fine grid (no content
+            is added), so the only thing that changes is that the product of
+            the transmission function and the wave has room to exist: on the
+            volume's own grid that product reaches twice the Nyquist frequency
+            and wraps, and across thousands of slices the wrapped content
+            compounds. Measured against a 4x reference on a 6bdf particle at
+            1 A/px: 1 leaves 0.2% (thin ice) to 1.1% (2000 A of ice) of the
+            scattered power in error, rising to 1.9% at Nyquist; 2 is at the
+            float32 noise floor (3e-7), with no bandlimit needed. Costs about
+            3x the multislice time and no volume memory (slices are
+            interpolated a chunk at a time). Rytov and projection take their
+            one final exponential the same way (measured at the same 1e-3 to
+            1e-2 error on the volume grid, for one fine-grid exponential per
+            image); first Born and the CTF model are linear in the potential
+            and untouched, and kinematic's per-slice ``exp - 1`` harmonics
+            are hundreds of times smaller and left alone. Default 1.
+        crop : bool, optional
+            Crop the exit wave of the oversampled models back to the volume's
+            grid (default). The imagers pass False and form the image on the
+            propagation grid: the intensity ``|psi|^2`` has twice the wave's
+            bandwidth, and the cross terms between in-band and above-Nyquist
+            scattering are real content a pixel integrates, so cropping the
+            WAVE first loses them -- 1.2e-3 to 1.8e-2 of the image power per
+            shell in 2000 A of ice. First Born and kinematic return the
+            volume grid either way (nothing above Nyquist to keep); the
+            imager interpolates those before the transfer function.
+
+        References
+        ----------
+        .. [1] Kirkland, E. J. (2010). *Advanced computing in electron microscopy*
+           (2nd ed.). Springer. https://doi.org/10.1007/978-1-4419-6533-2
+        .. [2] Cowley, J. M., & Moodie, A. F. (1957). The scattering of electrons
+           by atoms and crystals. I. A new theoretical approach. *Acta
+           Crystallographica*, 10(10), 609–619.
+           https://doi.org/10.1107/S0365110X57002194
+        .. [3] Ishizuka, K., & Uyeda, N. (1977). A new theoretical and practical
+           approach to the multislice method. *Acta Crystallographica Section
+           A*, 33(5), 740–749. https://doi.org/10.1107/S0567739477001879
+        """
+        super().__init__()
+        if not isinstance(oversample, int) or oversample < 1:
+            raise ValueError(f"oversample={oversample!r} must be an integer >= 1")
+        self.oversample = oversample
+        self.crop = crop
+        self.nxy = nxy
+        self.nz = nz
+        self.pixel_size = pixel_size
+
+        # model params
+        self.voltage = voltage
+        self.wavelength = energy_to_wavelength(voltage)
+        self.sigma = interaction_parameter(voltage)
+        self.scattering_model = scattering_model
+        self.ews_curvature_sign = ews_curvature_sign
+        self.alpha = alpha
+        if scattering_model == "ctf" and uniform_absorption != 0.0:
+            raise ValueError(
+                "uniform_absorption is not supported by scattering_model='ctf'"
+            )
+        self.uniform_absorption = uniform_absorption
+        self.progressbars = progressbars
+
+        k = frequency_grid(nxy, pixel_size)
+        k2 = k**2
+
+        # Fresnel transfer function for multislice: one slice step, on the
+        # (possibly supersampled) propagation grid. The slice thickness stays
+        # the voxel size whatever the xy grid.
+        k_ms = k
+        if scattering_model == "multislice":
+            if oversample > 1:
+                k_ms = frequency_grid(nxy * oversample, pixel_size / oversample)
+            F = fresnel_propagator(k_ms**2, self.wavelength, pixel_size)
+            self.register_buffer("_F_step_real", F.real, persistent=False)
+            self.register_buffer("_F_step_imag", F.imag, persistent=False)
+
+        # Fresnel transfer function for first Born
+        if scattering_model in ("firstborn", "rytov", "kinematic"):
+            if nz is None:
+                raise ValueError(
+                    f"nz is required for scattering_model={scattering_model!r}."
+                )
+            # One propagator per slice, from that slice to the exit plane,
+            # built as one broadcast. Each slice's scalar is formed in Python
+            # double precision exactly as a per-slice
+            # `fresnel_propagator(k2, wavelength, pixel_size * (nz - i))`
+            # call forms it, so the stack is bitwise the per-slice one.
+            coef = torch.tensor(
+                [
+                    -1j * torch.pi * self.wavelength * (pixel_size * (nz - i))
+                    for i in range(nz)
+                ],
+                dtype=torch.complex64,
+            )
+            F = torch.exp(coef[:, None, None] * k2)
+            # Stored once, in traversal order, as the (Z, Y, X, 2) real view
+            # of the complex stack: `_propagator` reads it back with a
+            # zero-copy `view_as_complex`. The earlier layout held separate
+            # real and imaginary buffers AND a cached complex (and, for the
+            # negative sign, flipped) copy, twice the memory -- 2 GiB where
+            # 1 GiB does at a 512 box. Real rather than complex so that
+            # `Module.double()` and friends still convert it.
+            if ews_curvature_sign == "positive":
+                F = F.flip(0)
+            self.register_buffer(
+                "_F_traversal", torch.view_as_real(F), persistent=False
+            )
+
+        self.klim = klim
+        # `klim` is a fraction of the volume's Nyquist on every grid: the
+        # cutoff is a physical frequency, so supersampling must not move it.
+        # bandlimit_mask reads the Nyquist off the pixel size it is given,
+        # which is the coarse one here even when `k_ms` is the fine grid.
+        kmask = bandlimit_mask(k_ms, pixel_size, klim)
+        if isinstance(kmask, torch.Tensor):
+            self.register_buffer("kmask", kmask, persistent=False)
+        else:
+            self.kmask = kmask
+
+    def multislice(
+        self, V: torch.Tensor, *, absorption_potential: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Compute exit wave using multislice algorithm.
+
+        Iteratively propagates an electron wave through slices of the 3D
+        potential, accounting for both transmission through each slice and
+        Fresnel propagation between slices.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            3D potential volume with shape (B, Z, Y, X) where B is batch
+            size, Z is number of slices. Either real-valued, in which case
+            amplitude contrast (``self.alpha``) is applied to each slice
+            chunk as it is consumed, or already complex (absorptive), in
+            which case it is used as given.
+        absorption_potential : torch.Tensor, optional
+            Imaginary potential supplied as a real tensor, in volts, with the same shape,
+            dtype and device as real ``V``. When supplied, the two fields are
+            assembled into complex slices in bounded chunks, and ``alpha``
+            is not applied again.
+
+        Returns
+        -------
+        exitwave : torch.Tensor
+            Complex-valued 2D exit wave with shape (B, Y, X).
+
+        Notes
+        -----
+        The multislice algorithm alternates between:
+        1. Transmission: ψ * exp(iσV)
+        2. Propagation: FFT[ψ] * F * FFT⁻¹
+        where F is the Fresnel propagator and σ is the interaction parameter.
+
+        A real ``V`` is complexified one chunk at a time rather than whole:
+        ``V * (sqrt(1 - alpha^2) + 1j * alpha)`` is elementwise, so the
+        result is bitwise identical, but the whole-volume form holds a
+        complex64 copy of the entire padded volume for the duration of the
+        loop -- 4 GB for a 512-pixel box with ``pad_fft`` -- for a value
+        each slice consumes once.
+        """
+        if absorption_potential is not None:
+            if (
+                not V.is_floating_point()
+                or not absorption_potential.is_floating_point()
+                or V.shape != absorption_potential.shape
+                or V.dtype != absorption_potential.dtype
+                or V.device != absorption_potential.device
+            ):
+                raise ValueError(
+                    "elastic and absorption potentials must be real and share "
+                    "shape, dtype and device"
+                )
+        F = self._F_step_real + 1j * self._F_step_imag
+
+        # Fold the bandlimit into the propagator once, rather than once per
+        # slice. Bitwise-exact only because kmask is binary (0.0/1.0, see
+        # __init__), so the reassociation from (psi_k * F) * kmask to
+        # psi_k * (F * kmask) is exact; a soft/apodised mask would not be.
+        Fk = F * self.kmask
+
+        exitwave: torch.Tensor | None = None
+
+        # Iterate across z-planes of 3D potentials. The recursion is inherently
+        # sequential (each slice transmits the previous slice's wave), but the
+        # transmission functions themselves are independent, so they are
+        # evaluated a chunk at a time and consumed via unbind. This is purely a
+        # performance restructuring -- output and gradients are bitwise
+        # identical to the per-slice form. See _kernels._MULTISLICE_SLICE_CHUNK.
+        #
+        # A positive Ewald-sphere sign traverses the slices in reverse (the beam enters at the last slice). That is
+        # done by walking the chunks backwards and flipping each one as it is
+        # consumed, not by `torch.flip(V, dims=(1,))` up front: the whole-volume
+        # flip is a full copy of the padded volume (6 GB for three 512-pixel
+        # boxes), for a slice order the loop can produce for free.
+        chunk_size = _kernels._MULTISLICE_SLICE_CHUNK
+        chunks: Sequence[torch.Tensor] = V.split(chunk_size, dim=1)
+        absorption_chunks = (
+            absorption_potential.split(chunk_size, dim=1)
+            if absorption_potential is not None
+            else None
+        )
+        reverse = self.ews_curvature_sign == "positive"
+        if reverse:
+            chunks = chunks[::-1]
+            if absorption_chunks is not None:
+                absorption_chunks = absorption_chunks[::-1]
+        for i in track(
+            range(len(chunks)),
+            description="Multislicing",
+            transient=True,
+            disable=not (self.progressbars),
+        ):
+            # transmission functions for the whole chunk, in one kernel.
+            # .to() here rather than per slice keeps a volume that lives off
+            # the compute device streaming in bounded-size blocks.
+            chunk = chunks[i].to(self.device)
+            if absorption_chunks is not None:
+                chunk = torch.complex(chunk, absorption_chunks[i].to(self.device))
+            if reverse:
+                chunk = chunk.flip(1)
+            if not chunk.is_complex():
+                chunk = apply_amplitude_contrast(chunk, alpha=self.alpha)
+            # Interpolate BEFORE the exponential: the nonlinearity is what
+            # puts content above the volume's Nyquist, and the fine grid is
+            # there to hold it. Linear in the (complex) potential, so it
+            # commutes with the amplitude-contrast factor above.
+            chunk = fourier_upsample_xy(chunk, self.oversample)
+            t_chunk = torch.exp(1j * self.sigma * self.pixel_size * chunk)
+            if self.uniform_absorption:
+                # A constant imaginary potential factorises out of the
+                # exponential, so it is a scalar attenuation per slice rather
+                # than a field: exp(i sigma dz (V + i c)) = exp(i sigma dz V)
+                # exp(-sigma dz c).
+                t_chunk = t_chunk * math.exp(
+                    -self.sigma * self.pixel_size * self.uniform_absorption
+                )
+
+            for t in t_chunk.unbind(1):
+                # multiply with incident wave (unit incident wave on the first slice)
+                wv = t if exitwave is None else t * exitwave
+
+                # propagate wave to next slice, also applies Kirkland's 0.66 bandlimit
+                exitwave = ifft2(fft2(wv) * Fk)
+        assert exitwave is not None, "V must have at least one z-slice"
+        return fourier_crop_xy(exitwave, V.shape[-1]) if self.crop else exitwave
+
+    @property
+    def F_real(self) -> torch.Tensor:
+        """Real part of the propagator (stack, for the single-scatter models).
+
+        For firstborn/rytov/kinematic it is derived from the stored stack on
+        each access, in natural slice order (entry ``i`` propagates slice
+        ``i`` to the exit plane) whatever the traversal order.
+        """
+        return self._natural_propagator().real
+
+    @property
+    def F_imag(self) -> torch.Tensor:
+        """Imaginary part of the propagator; see :attr:`F_real`."""
+        return self._natural_propagator().imag
+
+    def _natural_propagator(self) -> torch.Tensor:
+        if self.scattering_model == "multislice":
+            return torch.complex(self._F_step_real, self._F_step_imag)
+        F = torch.view_as_complex(self._F_traversal)
+        return F.flip(0) if self.ews_curvature_sign == "positive" else F
+
+    def _propagator(self, V: torch.Tensor) -> torch.Tensor:
+        """
+        The complex first-Born propagator stack ``(Z, Y, X)`` on `V`'s device
+        and complex dtype, in slice order matching the traversal.
+
+        Stored flipped once at construction for ``ews_curvature_sign=
+        "positive"``, rather than flipping the *volume* -- a full copy of
+        ``V`` in forward and again in backward -- since flipping the constant
+        propagator is the same sum. On the buffer's own device and dtype this
+        is a zero-copy view of it; any other combination is converted once and
+        cached.
+        """
+        cdtype = torch.complex128 if V.dtype == torch.float64 else torch.complex64
+        F = torch.view_as_complex(self._F_traversal)
+        if F.device == V.device and F.dtype == cdtype:
+            self._propagator_cache = None
+            return F
+        key = (V.device, cdtype)
+        cached = getattr(self, "_propagator_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        F = F.to(device=V.device, dtype=cdtype)
+        self._propagator_cache = (key, F)
+        return F
+
+    def _fourier_slice_sum(
+        self, V: torch.Tensor, per_slice: Callable[[torch.Tensor], torch.Tensor] | None
+    ) -> torch.Tensor:
+        """
+        ``sum_z fft2(g(V_z)) * F_z`` over the slices, a z-chunk at a time.
+
+        The three single-scatter models differ only in ``g`` (identity, or
+        ``exp(i sigma dz V) - 1`` for kinematic) and in what multiplies the
+        result. Chunking bounds the working set to one chunk's complex
+        spectrum instead of the whole volume's: the unchunked form held
+        the complex volume, its spectrum and the product at once, 3 x 3.2 GB
+        for three 512-boxes, and that was most of a reconstruction step's
+        device memory. Autograd keeps only each chunk's propagator view.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            ``(B, Z, Y, X)``, real or complex.
+        per_slice : callable, optional
+            Applied to each chunk before the FFT. None means the identity.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B, Y, X)`` complex.
+        """
+        F = self._propagator(V)
+        B, nz, ny, nx = V.shape
+        chunk = max(1, _kernels._SLICE_SUM_CHUNK_ELEMENTS // (B * ny * nx))
+        acc: torch.Tensor | None = None
+        # `split`, not `V[:, z0:z1]`: a narrow slice's backward materialises
+        # a full-size zero gradient per chunk (the O(Z^2) trap 41e0125 took
+        # out of multislice), 17 ms and 1.6 GB per chunk at a 512 box, while
+        # split's backward is one concatenation.
+        for z0, block in zip(range(0, nz, chunk), V.split(chunk, dim=1)):
+            if per_slice is not None:
+                block = per_slice(block)
+            term = (fft2(block) * F[None, z0 : z0 + chunk]).sum(dim=1)
+            acc = term if acc is None else acc + term
+        assert acc is not None, "V must have at least one z-slice"
+        return acc
+
+    def rytov(self, V: torch.Tensor) -> torch.Tensor:
+        """
+        Compute exit wave using Rytov approximation.
+
+        Faster than multislice but less accurate for thick specimens.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            3D potential volume with shape (B, Z, Y, X). Real, in which
+            case the amplitude-contrast factor ``self.alpha`` is applied
+            (as a scalar on the slice sum, the model being linear in V);
+            or already complex (absorptive), used as given.
+
+        Returns
+        -------
+        exitwave : torch.Tensor
+            Complex-valued 2D exit wave with shape (B, Y, X).
+
+        Notes
+        -----
+        The Rytov approximation computes the exit wave as:
+
+        ψ = exp(iσ Σ_z [F(z) ★ V(z)])
+
+        where F(z) is the Fresnel propagator from slice z to the exit plane
+        and ★ denotes convolution (Fourier-domain multiplication).
+
+        This is the exponentiated Born series [1]_, [2]_, reducing to the
+        first Born approximation for small V. The sum over slices is taken in
+        Fourier space and inverse-transformed once (the inverse FFT is linear,
+        so it commutes with the sum), a z-chunk at a time; see
+        :meth:`_fourier_slice_sum`.
+
+        References
+        ----------
+        .. [1] Keller, J. B. (1969). Accuracy and validity of the Born and
+           Rytov approximations. *Journal of the Optical Society of America*,
+           59(8), 1003–1004. https://doi.org/10.1364/JOSA.59.001003
+        .. [2] Devaney, A. J. (1981). Inverse-scattering theory within the
+           Rytov approximation. *Optics Letters*, 6(8), 374–376.
+           https://doi.org/10.1364/OL.6.000374
+        """
+        scattered_k = self._fourier_slice_sum(V, None)
+        exitwave = oversampled_exp(
+            ifft2(self._phase_scale(V) * scattered_k)
+            - self.sigma * self.pixel_size * self.uniform_absorption * V.shape[1],
+            self.oversample,
+            self.crop,
+        )
+        return exitwave  # (B x X x Y)
+
+    def _phase_scale(self, V: torch.Tensor) -> complex:
+        """See :func:`phase_scale`."""
+        return phase_scale(V, self.sigma, self.pixel_size, self.alpha)
+
+    def firstborn(self, V: torch.Tensor) -> torch.Tensor:
+        """
+        Compute exit wave using first Born approximation.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            3D potential volume with shape (B, Z, Y, X), real (the
+            amplitude-contrast factor is applied here) or complex.
+
+        Returns
+        -------
+        exitwave : torch.Tensor
+            Complex-valued 2D scattered wave with shape (B, Y, X).
+
+        Notes
+        -----
+        The first Born approximation computes the scattered wave as:
+
+        ψ = 1 + iσ Σ_z [F(z) ★ V(z)]
+
+        Valid only for weak scatterers where multiple scattering is
+        negligible [1]_. Same slice sum as :meth:`rytov`, with the exponent
+        linearised.
+
+        References
+        ----------
+        .. [1] Born, M. (1926). Quantenmechanik der Stoßvorgänge. *Zeitschrift
+           für Physik*, 38(11–12), 803–827. https://doi.org/10.1007/BF01397184
+        """
+        scattered_k = self._fourier_slice_sum(V, None)
+        return (
+            1
+            + ifft2(self._phase_scale(V) * scattered_k)
+            - self.sigma * self.pixel_size * self.uniform_absorption * V.shape[1]
+        )
+
+    def kinematic(self, V: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the exit wave in the kinematic (single-scattering) approximation.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            3D potential volume with shape (B, Z, Y, X), real (the
+            amplitude-contrast factor is applied here) or complex.
+
+        Returns
+        -------
+        exitwave : torch.Tensor
+            Complex-valued 2D exit wave with shape (B, Y, X).
+
+        Notes
+        -----
+        ψ = 1 + Σ_z F⁻¹{ F[exp(iσΔz V_z) − 1] · F_z }
+
+        Each slice scatters once and propagates to the exit plane. Unlike
+        ``firstborn``, the per-slice amplitude ``exp(iσΔz V_z) − 1`` is kept
+        exact rather than linearised, so it stays valid for stronger
+        potentials as long as multiple scattering between slices is
+        negligible.
+        """
+        factor = self._phase_scale(V)
+
+        def transmit(block: torch.Tensor) -> torch.Tensor:
+            return (
+                torch.exp(
+                    factor * block
+                    - self.sigma * self.pixel_size * self.uniform_absorption
+                )
+                - 1
+            )
+
+        return 1 + ifft2(self._fourier_slice_sum(V, transmit))
+
+    def projection(self, V: torch.Tensor) -> torch.Tensor:
+        """
+        Compute exit wave using projection approximation.
+
+        Phase object approximation that projects the 3D potential onto a 2D
+        plane, ignoring Fresnel propagation effects.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            3D potential volume with shape (B, Z, Y, X). Real, in which case
+            the amplitude-contrast factor ``self.alpha`` is applied (as a
+            scalar on the projected potential, the model being linear in V);
+            or already complex (absorptive), used as given.
+
+        Returns
+        -------
+        exitwave : torch.Tensor
+            Complex-valued 2D exit wave with shape (B, Y, X).
+
+        Notes
+        -----
+        The exit wave is computed as:
+        ψ = exp(i σ Σ_z V(z))
+        This is valid only for thin specimens where propagation effects are negligible.
+
+        The real volume is summed over z before the complex amplitude-contrast
+        scalar is applied, rather than rotating a complex copy of the whole
+        volume first: at 512^3 that copy is 1 GiB of peak memory. The two
+        orderings agree to float rounding (~2e-7 relative).
+        """
+        V_sum = torch.sum(V, 1)
+        exitwave = oversampled_exp(
+            self._phase_scale(V) * V_sum
+            - self.sigma * self.pixel_size * self.uniform_absorption * V.shape[1],
+            self.oversample,
+            self.crop,
+        )
+        return exitwave
+
+    def ctf(self, V: torch.Tensor) -> torch.Tensor:
+        """
+        Compute projected potential for CTF-based imaging.
+
+        Returns the projected potential (not exit wave) for use with
+        contrast transfer function (CTF) imaging model.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            Real-valued 3D potential volume with shape (B, Z, Y, X).
+
+        Returns
+        -------
+        projection : torch.Tensor
+            Real-valued 2D projected potential with shape (B, Y, X).
+
+        Notes
+        -----
+        Computes: 2σ Σ_z V(z)
+        The factor of 2 accounts for the phase-contrast imaging relationship.
+        CTF is applied separately in the aberration module.
+        """
+        if self.uniform_absorption != 0.0:
+            raise ValueError(
+                "uniform_absorption is not supported by scattering_model='ctf'"
+            )
+        projection = 2 * self.sigma * self.pixel_size * torch.sum(V, 1)
+        return projection
+
+    def from_slice_sum(self, spectrum: torch.Tensor, nz: int) -> torch.Tensor:
+        """
+        The exit wave of a real volume, given its slice sum.
+
+        What :meth:`rytov`, :meth:`firstborn`, :meth:`projection` and
+        :meth:`ctf` compute once the volume has been reduced to one spectrum:
+        ``sum_z fft2(V_z) * F_z`` for the first two, ``fft2(sum_z V_z)`` for
+        the last two. `specter.scattering.surface_slice_sum` produces that
+        spectrum from the unposed volume.
+
+        Parameters
+        ----------
+        spectrum : torch.Tensor
+            ``(B, Y, X)`` complex, native FFT order.
+        nz : int
+            Depth of the volume in slices, for the uniform absorption.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B, Y, X)`` exit waves (projected potentials for ``"ctf"``).
+        """
+        model = self.scattering_model
+        real_volume = torch.empty(0)
+        absorbed = self.sigma * self.pixel_size * self.uniform_absorption * nz
+        if model == "rytov":
+            field = ifft2(self._phase_scale(real_volume) * spectrum)
+            return oversampled_exp(field - absorbed, self.oversample, self.crop)
+        if model == "firstborn":
+            return 1 + ifft2(self._phase_scale(real_volume) * spectrum) - absorbed
+        projected = ifft2(spectrum).real
+        if model == "projection":
+            return oversampled_exp(
+                self._phase_scale(real_volume) * projected - absorbed,
+                self.oversample,
+                self.crop,
+            )
+        if model == "ctf":
+            if self.uniform_absorption != 0.0:
+                raise ValueError(
+                    "uniform_absorption is not supported by scattering_model='ctf'"
+                )
+            return 2 * self.sigma * self.pixel_size * projected
+        raise ValueError(f"scattering_model={model!r} has no single slice sum")
+
+    def forward(
+        self, V: torch.Tensor, *, absorption_potential: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Perform scattering on a batch of 3D potentials.
+
+        V is batch of 3D real-valued potentials with shape (B x Z x X x Y), outputs
+        a batch of 2D exitwaves with shape (B x Y x X). The CTF scattering model
+        outputs projected potential instead of exitwave.
+
+        Note that the CTF model does not require computing the complex-valued
+        potentials since it is built into the aberration function.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            Batch of 3D potentials.
+        absorption_potential : torch.Tensor, optional
+            Separate imaginary potential in volts. Multislice consumes it in
+            bounded chunks; other models assemble the complex volume as usual.
+
+        Returns
+        -------
+        psi : torch.Tensor
+            Batch of 2D exitwaves / projected potentials.
+        """
+        if self.scattering_model == "multislice":
+            # amplitude contrast is applied per chunk inside multislice --
+            # see its docstring for why not here.
+            return self.multislice(V, absorption_potential=absorption_potential)
+        if absorption_potential is not None:
+            V = torch.complex(V, absorption_potential)
+        if self.scattering_model == "rytov":
+            # amplitude contrast folded into the slice sum's scalar (the
+            # model is linear in V), not materialised as a complex volume.
+            return self.rytov(V)
+        elif self.scattering_model == "projection":
+            # amplitude contrast applied to the projected potential, as for
+            # rytov; see `projection`.
+            return self.projection(V)
+        elif self.scattering_model == "firstborn":
+            return self.firstborn(V)
+        elif self.scattering_model == "kinematic":
+            return self.kinematic(V)
+        elif self.scattering_model == "ctf":
+            return self.ctf(V)
+        else:
+            raise ValueError(f"Unknown scattering_model: {self.scattering_model!r}")

@@ -1,0 +1,163 @@
+"""
+The enumerated option vocabularies, each spelled once.
+
+Every string-valued switch that a class, function or config field accepts
+is one of these ``Literal`` aliases, so the class that implements a choice,
+the config dataclass that exposes it and the CLI ``Choice`` built from that
+dataclass all agree on the spelling by construction. A config field may use
+a narrower ``Literal`` than the class it feeds when a command deliberately
+exposes a subset (``ParticleStackConfig.scattering_model`` omits the
+reconstruction-only ``rytov``); it must never use a wider one.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+#: Wave-propagation model, see :class:`specter.scattering.Scattering`.
+ScatteringModel = Literal[
+    "multislice", "rytov", "firstborn", "kinematic", "projection", "ctf"
+]
+
+#: Sign of the Ewald-sphere curvature, matching CryoSPARC's convention.
+EwaldSphereSign = Literal["negative", "positive"]
+
+#: Detector noise model. ``"none"`` (or ``None``) leaves the image noiseless.
+NoiseModel = Literal["poisson", "none"]
+
+#: Bundled detector MTF/DQE models, see :mod:`specter.detectors`.
+DetectorModel = Literal[
+    "none",
+    "perfect",
+    "k3_300kv",
+    "k3_200kv",
+    "k2_300kv",
+    "falcon4i_300kv",
+    "falcon4i_200kv",
+    "falcon3ec_300kv",
+]
+
+#: Amorphous-ice generator: the bundled ``IceBank`` library, a
+#: ``RandomIcemaker``, or no ice.
+IceModel = Literal["gd", "random", "none"]
+
+#: Optimiser for ``GradientSKIcemaker.optimize``.
+IceOptimizer = Literal["lbfgs", "adam"]
+
+#: Atomic scattering-factor parameterization for structures with bond
+#: topology (``shtyrov``) or without (``kirkland``, ``lobato``).
+ScatteringFactors = Literal["kirkland", "lobato", "shtyrov"]
+
+#: What :func:`specter.potential.build_atomic_potential_kernel` can sample:
+#: the three above plus the per-element Peng ``c4322`` factors Shtyrov
+#: typing falls back to.
+KernelParameterization = Literal["kirkland", "lobato", "shtyrov", "peng"]
+
+#: How ``PotentialBuilder.forward`` rasterizes atoms.
+PotentialMethod = Literal["analytic", "2d", "3d"]
+
+#: Convolution backend for kernel-based potentials; ``"auto"`` picks by size.
+ConvBackend = Literal["fftconvolve", "conv3d", "auto"]
+
+#: Boundary handling of a kernel convolution: zero-padded or wrapped.
+ConvBoundary = Literal["linear", "periodic"]
+
+#: Output size of :func:`specter.fft.fftconvolve`, as in ``scipy.signal``.
+ConvMode = Literal["full", "same", "valid"]
+
+#: ``torch.nn.functional.pad`` modes accepted for XY padding.
+PadMode = Literal["constant", "reflect", "replicate", "circular"]
+
+#: Aberration image-formation model: ``|CTF(psi)|^2`` or the linearised CTF.
+AberrationModel = Literal["nonlinear", "linear"]
+
+#: How the imaginary part of the potential is obtained. ``"alpha"`` scales the
+#: real potential by a fitted amplitude-contrast ratio; ``"inelastic_mfp"``
+#: derives it per material from a measured inelastic mean free path. See
+#: `potential.inelastic_absorption_potential` for why the second is preferred
+#: wherever a mean free path is known.
+AbsorptionModel = Literal["alpha", "inelastic_mfp"]
+
+#: Where the radiation-damage envelope acts. ``"transfer_function"`` filters
+#: the whole image, solvent included; ``"specimen"`` damages the specimen's
+#: potential before the solvent is added, so the ice keeps its structure (see
+#: `potential.apply_dose_damage`).
+DoseEnvelopeTarget = Literal["transfer_function", "specimen"]
+
+#: How partial temporal coherence (Cc) is modelled: as the incoherent sum
+#: over the focal spread, or as an envelope on the transfer function.
+TemporalCoherence = Literal["integrated", "envelope"]
+
+#: Whether a volume is rotated in real or Fourier space.
+RotateMode = Literal["real", "fourier"]
+
+#: How a pose is applied to a volume before it is scattered: rotate the volume
+#: (trilinear in real or Fourier space), or sample its transform on the posed
+#: Ewald surface with no interpolation (`specter.scattering.surface_slice_sum`;
+#: single-scatter models and an undressed template only).
+PoseMode = Literal["real", "fourier", "surface"]
+
+#: How a point group is averaged: exactly through the volume's own transform
+#: (`specter.symmetries.symmetrize_exact`), or by rotating the volume with
+#: interpolation in real or Fourier space.
+SymmetryMode = Literal["exact", "real", "fourier"]
+
+#: Where the rotation centre of an even-sized grid sits.
+GridOrigin = Literal["relion", "center"]
+
+#: Coordinate-grid convention for even-sized k-space and real-space grids.
+GridConvention = Literal["relion", "torch"]
+
+#: ``torch.nn.functional.grid_sample`` padding modes.
+GridSamplePadding = Literal["zeros", "border", "reflection"]
+
+#: Organic membrane shape generator, see :mod:`specter.specimen.membrane`.
+ShapeBackend = Literal["spherical_harmonics", "swept_spline"]
+
+#: Which edge of the frame a carbon-film hole is placed against.
+CarbonEdgeSide = Literal["random", "left", "right", "top", "bottom"]
+
+#: Axis a tilt series is tilted about.
+TiltAxis = Literal["x", "y"]
+
+#: What an observed image's values mean, for a reconstruction: electron
+#: counts per pixel, or a stack normalised to zero mean and unit variance (a
+#: CryoSPARC/RELION particle stack) that is converted back to counts from the
+#: dose.
+ImageUnits = Literal["normalized", "counts"]
+
+#: Learning-rate scheduler for a reconstruction, by ``torch.optim`` name.
+Scheduler = Literal[
+    "LambdaLR", "OneCycleLR", "CosineAnnealingWarmRestarts", "MultiplicativeLR"
+]
+
+__all__ = [
+    "AberrationModel",
+    "AbsorptionModel",
+    "DoseEnvelopeTarget",
+    "TemporalCoherence",
+    "CarbonEdgeSide",
+    "ConvBackend",
+    "ConvBoundary",
+    "ConvMode",
+    "DetectorModel",
+    "EwaldSphereSign",
+    "GridConvention",
+    "GridOrigin",
+    "GridSamplePadding",
+    "ImageUnits",
+    "IceModel",
+    "IceOptimizer",
+    "KernelParameterization",
+    "NoiseModel",
+    "PadMode",
+    "PotentialMethod",
+    "PoseMode",
+    "RotateMode",
+    "SymmetryMode",
+    "ScatteringFactors",
+    "ScatteringModel",
+    "Scheduler",
+    "ShapeBackend",
+    "TiltAxis",
+]

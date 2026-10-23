@@ -10,62 +10,105 @@ exact, and available via Newton projection without a mesh or a KD-tree
 mesh-vertex-normal lookup). Orientation composes the same two-step
 placement both CTS and polnet use: align a canonical axis to the local
 normal, then apply a free random spin around that same axis.
+
+References
+----------
+.. [1] Purnell, C., Heebner, J., Swulius, M. T., Hylton, R., Kabonick, S.,
+   Grillo, M., Grigoryev, S., Heberle, F., Waxham, M. N., & Swulius, M. T.
+   (2023). Rapid synthesis of cryo-ET data for training deep learning models.
+   *bioRxiv*. https://doi.org/10.1101/2023.04.28.538636
+   (CTS source: https://github.com/carsonpurnell/cryotomosim_CTS)
+.. [2] Martinez-Sanchez, A., Lamm, L., Jasnin, M., & Phelippeau, H. (2024).
+   Simulating the cellular context in synthetic datasets for cryo-electron
+   tomography. *IEEE Transactions on Medical Imaging*, 43(11), 3742–3754.
+   https://doi.org/10.1109/TMI.2024.3398401
+   (polnet source: https://github.com/anmartinezs/polnet)
 """
 
 from __future__ import annotations
 
 import math
 
-import roma
 import torch
 
+from ...rotations import rotation_aligning
 from ._field import MembraneField
 
 
 def _project_to_surface(
     field: MembraneField, points_xyz: torch.Tensor, iterations: int
 ) -> torch.Tensor:
-    """Newton-project points onto ``field``'s zero level set."""
+    """
+    Newton-project points onto ``field``'s zero level set.
+
+    Each step is a one-dimensional Newton step along the unit normal ``n``:
+    the point moves by ``phi / s``, where ``s`` is the slope of ``phi``
+    along ``n``, clamped below at 1. The slope is not 1 everywhere. A field
+    from ``_signed_distance_transform`` is ``dist_out - dist_in``, which
+    leaves no voxel centre with ``|phi|`` below one spacing, so across the
+    cell that straddles the surface ``phi`` changes by two spacings over
+    one and ``s ~= 2``. A step of ``phi`` there overshoots by the distance
+    it set out to cover, and the point oscillates about the surface at
+    constant amplitude instead of converging; on an 8 A grid only ~2% of
+    candidates ended within ``phi_tolerance_angstrom``. The clamp keeps a
+    step no longer than ``|phi|``, which bounds the distance to the surface
+    in a distance field, so where ``s < 1`` (near the medial axis, or in a
+    smooth-min blend) the step is the plain ``phi`` it would otherwise be.
+    """
+    eps = 0.5 * field.spacing_angstrom
     x = points_xyz.clone()
     for _ in range(iterations):
         phi_val = field.sample(x)
-        grad = field.gradient(x)
-        x = x - phi_val.unsqueeze(-1) * grad
+        normal = field.gradient(x)
+        slope = (field.sample(x + eps * normal) - field.sample(x - eps * normal)) / (
+            2.0 * eps
+        )
+        x = x - (phi_val / slope.clamp_min(1.0)).unsqueeze(-1) * normal
     return x
+
+
+def _pairwise_distances(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Exact Euclidean distances between the rows of ``a`` and ``b``."""
+    return torch.linalg.norm(a[:, None, :] - b[None, :, :], dim=-1)
 
 
 def sample_surface_sites(
     field: MembraneField,
     n_sites: int,
-    min_spacing_a: float,
+    min_spacing_angstrom: float,
     max_attempts: int | None = None,
     projection_iterations: int = 8,
-    phi_tolerance_a: float = 1.0,
+    phi_tolerance_angstrom: float = 1.0,
     seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Sample well-spaced points on a membrane's mid-surface.
 
     Draws random candidate points within ``field``'s working grid,
-    Newton-projects each onto the zero level set (gradient descent on
-    ``phi``, which converges quickly since ``|grad(phi)| ~= 1`` near the
-    surface), then greedily accepts candidates that land close enough to the
-    surface and are not within ``min_spacing_a`` of any already-accepted
-    site (self-avoiding-walk style, not a true blue-noise Poisson-disc
-    sampler).
+    Newton-projects each onto the zero level set along the local normal
+    (see ``_project_to_surface``), then greedily accepts candidates that
+    land close enough to the surface and are not within
+    ``min_spacing_angstrom`` of any already-accepted site
+    (self-avoiding-walk style, not a true blue-noise Poisson-disc sampler).
+    About 96-99% of candidates converge onto the surface, on working grids
+    from 1 to 8 A and on both shape backends, so the default budget of 20
+    draws per site is spent on the spacing test rather than on failed
+    projections. Measured on a 110 A vesicle at 40 A spacing, whose random
+    sequential adsorption limit is about 66 sites: 50 sites always filled,
+    60 came back as 54-60, and no budget reaches the limit itself.
 
     Parameters
     ----------
     field : MembraneField
     n_sites : int
         Target number of sites.
-    min_spacing_a : float
-        Minimum center-to-center spacing between accepted sites, Angstrom.
+    min_spacing_angstrom : float
+        Minimum center-to-center spacing between accepted sites, Å.
     max_attempts : int, optional
         Maximum candidate draws before giving up. Default ``20 * n_sites``.
     projection_iterations : int, optional
         Newton projection steps per candidate. Default 8.
-    phi_tolerance_a : float, optional
+    phi_tolerance_angstrom : float, optional
         Maximum ``|phi|`` after projection for a candidate to be accepted as
         genuinely on the surface. Default 1.0.
     seed : int, optional
@@ -90,45 +133,60 @@ def sample_surface_sites(
     device = field.phi.device
     nz, ny, nx = field.phi.shape
     extent = (
-        torch.tensor([nx, ny, nz], dtype=torch.float32, device=device) * field.spacing_a
+        torch.tensor([nx, ny, nz], dtype=torch.float32, device=device)
+        * field.spacing_angstrom
     )
     origin = field.origin_xyz.to(device)
 
-    accepted_sites: list[torch.Tensor] = []
-    accepted_normals: list[torch.Tensor] = []
+    # Candidates are screened on the host, one transfer per batch: a
+    # per-candidate `bool(valid_mask[i])` and spacing test is a device sync
+    # each, and re-stacking every accepted site per test is O(n^2). The
+    # accepted sites live in one preallocated host buffer, and the normals
+    # are taken in one batched gradient call once the sites are known.
+    accepted = torch.empty((n_sites, 3), dtype=field.phi.dtype)
+    n_accepted = 0
 
     attempts = 0
-    while len(accepted_sites) < n_sites and attempts < max_attempts:
+    while n_accepted < n_sites and attempts < max_attempts:
         batch = min(64, max_attempts - attempts)
+        attempts += batch
         candidates = (
             origin + torch.rand((batch, 3), generator=generator).to(device) * extent
         )
         projected = _project_to_surface(field, candidates, projection_iterations)
         phi_residual = field.sample(projected).abs()
-        valid_mask = phi_residual < phi_tolerance_a
+        valid = (phi_residual < phi_tolerance_angstrom).cpu()
+        if not bool(valid.any()):
+            continue
+        cand = projected.detach().cpu()[valid]
 
-        for i in range(batch):
-            attempts += 1
-            if len(accepted_sites) >= n_sites:
+        # A candidate is rejected by any site accepted before this batch,
+        # or by an earlier candidate of this batch accepted ahead of it.
+        if n_accepted:
+            d_prev = _pairwise_distances(cand, accepted[:n_accepted])
+            clear = (d_prev >= min_spacing_angstrom).all(dim=1).tolist()
+        else:
+            clear = [True] * len(cand)
+        d_within = _pairwise_distances(cand, cand).tolist()
+        taken: list[int] = []
+        for i in range(len(cand)):
+            if n_accepted >= n_sites:
                 break
-            if not bool(valid_mask[i]):
+            if not clear[i]:
                 continue
-            candidate_site = projected[i]
-            if accepted_sites:
-                existing = torch.stack(accepted_sites)
-                dists = torch.linalg.norm(existing - candidate_site, dim=-1)
-                if bool((dists < min_spacing_a).any()):
-                    continue
-            normal = field.gradient(candidate_site.unsqueeze(0))[0]
-            accepted_sites.append(candidate_site)
-            accepted_normals.append(normal)
+            if any(d_within[i][j] < min_spacing_angstrom for j in taken):
+                continue
+            taken.append(i)
+            accepted[n_accepted] = cand[i]
+            n_accepted += 1
 
-    if not accepted_sites:
+    if n_accepted == 0:
         return (
             torch.zeros((0, 3), device=device, dtype=field.phi.dtype),
             torch.zeros((0, 3), device=device, dtype=field.phi.dtype),
         )
-    return torch.stack(accepted_sites), torch.stack(accepted_normals)
+    sites = accepted[:n_accepted].to(device)
+    return sites, field.gradient(sites)
 
 
 def orientation_for_normal(
@@ -159,44 +217,13 @@ def orientation_for_normal(
     return _orientation_for_normal_and_angle(normal_xyz, theta)
 
 
-def _rotation_aligning(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Rotation matrix R such that ``R @ a`` (both normalized) equals ``b``."""
-    device = a.device
-    dtype = a.dtype
-    a = a / a.norm().clamp_min(1e-8)
-    b = b / b.norm().clamp_min(1e-8)
-
-    cos_angle = torch.clamp((a * b).sum(), -1.0, 1.0)
-    axis = torch.linalg.cross(a, b)
-    axis_norm = axis.norm()
-
-    if float(axis_norm) < 1e-6:
-        if float(cos_angle) > 0:
-            return torch.eye(3, device=device, dtype=dtype)
-        # a and b are antiparallel -- rotate 180 degrees about any axis
-        # perpendicular to a.
-        perp = torch.linalg.cross(
-            a, torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype)
-        )
-        if float(perp.norm()) < 1e-6:
-            perp = torch.linalg.cross(
-                a, torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype)
-            )
-        perp = perp / perp.norm()
-        return roma.rotvec_to_rotmat(perp * math.pi)
-
-    axis = axis / axis_norm
-    angle = torch.arccos(cos_angle)
-    return roma.rotvec_to_rotmat(axis * angle)
-
-
 def _orientation_for_normal_and_angle(
     normal_xyz: torch.Tensor, theta: float
 ) -> torch.Tensor:
     device = normal_xyz.device
     dtype = normal_xyz.dtype
     z_hat = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
-    r_align = _rotation_aligning(z_hat, normal_xyz)
+    r_align = rotation_aligning(z_hat, normal_xyz)
 
     cos_t, sin_t = math.cos(theta), math.sin(theta)
     r_spin = torch.tensor(
@@ -248,7 +275,7 @@ def align_principal_axis_to_z(coordinates: torch.Tensor) -> torch.Tensor:
     z_hat = torch.tensor(
         [0.0, 0.0, 1.0], device=coordinates.device, dtype=coordinates.dtype
     )
-    rotation = _rotation_aligning(principal_axis, z_hat)
+    rotation = rotation_aligning(principal_axis, z_hat)
     return centered @ rotation.T
 
 

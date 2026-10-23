@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from specter.settings import Propagation
 
 NXY = NZ = 16
 N_PARTICLES = 4
@@ -69,16 +70,16 @@ def _build_model(problem, lr_R):
         {k: v.clone() for k, v in problem["ctf"].items()},
         VOLTAGE,
         DOSE,
-        alpha=0.0,
         scale=problem["scale"].clone(),
-        scattering_model="rytov",
-        aberration_model="holography",
         lr=0.1,
         lr_R=lr_R,
         symmetry=None,
-        sparsity=0,
-        rotate_mode="real",
-        ews_curvature_sign="negative",
+        propagation=Propagation(
+            alpha=0.0,
+            scattering_model="rytov",
+            rotate_mode="real",
+            ews_curvature_sign="negative",
+        ),
     )
 
 
@@ -195,9 +196,9 @@ def test_reconstructor_multi_gpu_ddp_matches_single_gpu(tmp_path: Path):
         "rot_final"
     ].norm()
     assert V_relerr < 1e-3, f"V mismatch between single- and multi-GPU: {V_relerr}"
-    assert (
-        rot_relerr < 1e-3
-    ), f"rotations mismatch between single- and multi-GPU: {rot_relerr}"
+    assert rot_relerr < 1e-3, (
+        f"rotations mismatch between single- and multi-GPU: {rot_relerr}"
+    )
 
     # Logged metrics: multi-GPU's rank-0-saved log_norm_loss/log_total_loss
     # should be the *gathered* (mean-across-ranks) value, not just rank 0's

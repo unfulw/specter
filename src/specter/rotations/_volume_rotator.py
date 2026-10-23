@@ -1,12 +1,28 @@
+"""
+`VolumeRotator`: samples rotated slices or whole rotated volumes from a
+cached grid, with a checkpointed backward for volumes that require
+gradients.
+"""
+
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Literal, Sequence
 
 import lightning as L
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from ..fft import fft3, ifft3
+from ._volume import (
+    _isotropic_half_widths,
+    _translation_per_axis,
+    apply_fourier_translation,
+    fourier_origin_displacement,
+    rotation_sampling_grid,
+    split_affine_translation,
+)
+from specter.options import GridOrigin, GridSamplePadding, RotateMode
 
 
 def _normalize_slice_indices(
@@ -71,19 +87,107 @@ def _build_roi_query_points(
     return torch.stack([x_pix, y_pix, z_pix], dim=-1)  # (K, ny_roi, nx_roi, 3)
 
 
-def _prepare_volume_for_grid_sample(V: torch.Tensor, batch_size: int) -> torch.Tensor:
+def _prepare_volume_for_grid_sample(V: torch.Tensor, batchsize: int) -> torch.Tensor:
     """Normalize a (Z,Y,X) / (B,Z,Y,X) / (B,1,Z,Y,X) volume to (B,1,Z,Y,X)."""
     if V.ndim == 3:
-        return V.unsqueeze(0).unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
+        return V.unsqueeze(0).unsqueeze(0).expand(batchsize, -1, -1, -1, -1)
     elif V.ndim == 4:  # (B, Z, Y, X)
         return V.unsqueeze(1)
     else:  # (B, 1, Z, Y, X)
         return V
 
 
+def _windowed_grid_sample(
+    V: torch.Tensor,
+    grid: torch.Tensor,
+    nz: int,
+    ny: int,
+    nx: int,
+    align_corners: bool,
+    padding_mode: GridSamplePadding,
+    device: torch.device,
+    margin: int,
+) -> torch.Tensor:
+    """
+    Interpolate `grid` against `V` without moving the whole of `V` to `device`.
+
+    `grid` (already fully computed, normalized sample coordinates into `V`,
+    shape (B, K, ny_roi, nx_roi, 3)) is a rigid rotation of an axis-aligned
+    box, so it is itself a rotated ("slanted") box in `V`'s coordinate frame
+    -- not axis-aligned, so it can't be sliced directly. Instead this takes
+    the smallest axis-aligned bounding box that CONTAINS it (padded by
+    `margin` px so bilinear's 1px neighbor footprint never reaches the
+    block's own artificial edge), transfers only that small block to
+    `device`, and runs grid_sample there. Wherever the box is clipped to
+    V's true edges (rather than the query's own extent), padding_mode's
+    behaviour is reproduced exactly, since the block's edge then coincides
+    with the real volume edge.
+
+    Parameters
+    ----------
+    V : torch.Tensor
+        (Z,Y,X) / (B,Z,Y,X) / (B,1,Z,Y,X), on any device (typically CPU).
+    grid : torch.Tensor
+        Normalized grid_sample-convention coordinates into `V`, shape
+        (B, K, ny_roi, nx_roi, 3), on `V`'s device.
+    margin : int
+        Extra padding (px) around the query's exact pixel-space bounding
+        box. 2 is generous headroom for bilinear interpolation; validated
+        exact (vs. a full-volume-on-GPU reference) to ~1e-4 absolute error
+        (float32 round-off from the extra normalize/renormalize step).
+
+    Returns
+    -------
+    torch.Tensor
+        (B, K, ny_roi, nx_roi), on `device`.
+    """
+
+    def unnorm(g: torch.Tensor, size: int) -> torch.Tensor:
+        return (g + 1) * (size - 1) / 2 if align_corners else ((g + 1) * size - 1) / 2
+
+    x_pix = unnorm(grid[..., 0], nx)
+    y_pix = unnorm(grid[..., 1], ny)
+    z_pix = unnorm(grid[..., 2], nz)
+
+    x0, x1 = int(x_pix.min().floor()) - margin, int(x_pix.max().ceil()) + margin + 1
+    y0, y1 = int(y_pix.min().floor()) - margin, int(y_pix.max().ceil()) + margin + 1
+    z0, z1 = int(z_pix.min().floor()) - margin, int(z_pix.max().ceil()) + margin + 1
+    x0c, x1c = max(x0, 0), min(x1, nx)
+    y0c, y1c = max(y0, 0), min(y1, ny)
+    z0c, z1c = max(z0, 0), min(z1, nz)
+
+    B, K, ny_roi, nx_roi = grid.shape[:4]
+    if x1c <= x0c or y1c <= y0c or z1c <= z0c:
+        # Every query point in this batch falls outside V entirely (e.g. an
+        # extreme-tilt Z-chunk at the sweep's edge) -- padding_mode="zeros"
+        # semantics, the only mode this degenerate case can reach exactly.
+        return torch.zeros(B, K, ny_roi, nx_roi, device=device, dtype=V.dtype)
+
+    block = V[..., z0c:z1c, y0c:y1c, x0c:x1c].to(device, non_blocking=True)
+    bz, by, bx = block.shape[-3:]
+
+    def renorm(pix: torch.Tensor, offset: int, size: int) -> torch.Tensor:
+        local = pix - offset
+        return (
+            (2 * local / (size - 1) - 1)
+            if align_corners
+            else ((2 * local + 1) / size - 1)
+        )
+
+    grid_local = torch.stack(
+        [renorm(x_pix, x0c, bx), renorm(y_pix, y0c, by), renorm(z_pix, z0c, bz)], dim=-1
+    ).to(device)
+
+    V_in = _prepare_volume_for_grid_sample(block, B)
+    slices_roi = F.grid_sample(
+        V_in, grid_local, align_corners=align_corners, padding_mode=padding_mode
+    )
+    return slices_roi[:, 0]
+
+
 class VolumeRotator(L.LightningModule):
     """
-    3D volume rotator with cached base grid and RELION / PyTorch center conventions.
+    3D volume rotator with RELION / PyTorch center conventions.
     """
 
     def __init__(
@@ -91,17 +195,20 @@ class VolumeRotator(L.LightningModule):
         nz: int,
         ny: int,
         nx: int,
-        origin: str = "relion",
+        origin: GridOrigin = "relion",
         align_corners: bool = False,
-        padding_mode: str = "border",
-        mode: str = "real",
-        init_base_grid=True,
+        padding_mode: GridSamplePadding = "border",
+        mode: RotateMode = "real",
     ):
         """
-        Initialize a 3D VolumeRotator with cached base grid and rotation center.
+        Initialize a 3D VolumeRotator with a cached rotation center.
 
         This class supports rotating 3D volumes in either real space or Fourier space.
-        The base grid and rotation center are cached as buffers for efficiency.
+        The rotation center is cached as a buffer; the sampling grid itself is
+        built per call by :func:`~specter.rotations.affine_sampling_grid` --
+        one broadcast write, so there is no persistent identity grid (which
+        was ``(nz, ny, nx, 3)`` float32, 1.6 GB at 512^3, and a buffer that
+        then had to be excluded from checkpoints).
 
         Parameters
         ----------
@@ -132,8 +239,6 @@ class VolumeRotator(L.LightningModule):
 
         Attributes
         ----------
-        base_grid : torch.Tensor (buffer)
-            Identity sampling grid for the volume, used to construct per-batch grids.
         center : torch.Tensor (buffer)
             The voxel coordinates of the rotation center.
         """
@@ -181,42 +286,66 @@ class VolumeRotator(L.LightningModule):
                     2 * (cz + 0.5) / nz - 1,
                 ]
             )
-        self.register_buffer("center", center.view(1, 1, 3))
+        self.register_buffer("center", center.view(1, 1, 3), persistent=False)
 
-        if init_base_grid:
-            self._build_base_grid()
-
-        # -------------------------------
-        # Precompute XY grid for slice sampling
-        # -------------------------------
-        y = torch.arange(ny)
-        x = torch.arange(nx)
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        xy_grid = torch.stack([xx, yy], dim=-1).float()  # (Y, X, 2)
-        self.register_buffer("xy_grid", xy_grid)  # buffer, reused for all slice calls
+        # The spectrum's DC term always lands at n // 2 under fftshift, so the
+        # Fourier path rotates about the RELION centre whatever `origin` is.
+        if self.align_corners:
+            center_dc = torch.tensor(
+                [
+                    2 * (nx // 2) / (nx - 1) - 1,
+                    2 * (ny // 2) / (ny - 1) - 1,
+                    2 * (nz // 2) / (nz - 1) - 1,
+                ]
+            )
+        else:
+            center_dc = torch.tensor(
+                [
+                    2 * (nx // 2 + 0.5) / nx - 1,
+                    2 * (ny // 2 + 0.5) / ny - 1,
+                    2 * (nz // 2 + 0.5) / nz - 1,
+                ]
+            )
+        self.register_buffer("center_dc", center_dc.view(1, 1, 3), persistent=False)
 
     # ------------------------------------------------------------------
     # Core grid construction
     # ------------------------------------------------------------------
-    def _build_base_grid(self) -> None:
-        """
-        Build base grid.
-        """
-        eye = torch.eye(3, 4).unsqueeze(0)  # (1, 3, 4)
-        base_grid = F.affine_grid(
-            eye, [1, 1, self.nz, self.ny, self.nx], align_corners=self.align_corners
-        )
-        self.register_buffer("base_grid", base_grid)
-
     def _isotropic_scale(
         self, device: str | torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        """Per-axis scale factors mapping normalized [-1,1] deltas to isotropic pixel-like units."""
+        """
+        Per-axis factors mapping normalized [-1, 1] deltas to voxels.
+
+        Only `sample_rotated_slices` uses these. It builds its query points in
+        voxels and divides by these factors to reach normalized coordinates,
+        so they must be the exact half-widths of the ``grid_sample``
+        convention in use -- ``n / 2`` under ``align_corners=False``,
+        ``(n - 1) / 2`` under True (see
+        :func:`~specter.rotations._volume._isotropic_half_widths`) -- or every
+        sampled slice is magnified by their ratio. Unlike a pure rotation's
+        conjugation, this factor does not cancel on a cube.
+        """
         return torch.tensor(
-            [(self.nx - 1) / 2, (self.ny - 1) / 2, (self.nz - 1) / 2],
+            _isotropic_half_widths(self.nz, self.ny, self.nx, self.align_corners),
             device=device,
             dtype=dtype,
         ).view(1, 1, 3)
+
+    def _translation_per_axis(
+        self, t: torch.Tensor, align_corners: bool | None = None
+    ) -> torch.Tensor:
+        """
+        Re-express an x-normalised translation on each axis's own scale.
+
+        See :func:`~specter.rotations._volume._translation_per_axis`. A cube
+        is returned unchanged, bit for bit. `align_corners` defaults to the
+        rotator's own; the Fourier path passes False, the phase ramp's fixed
+        convention.
+        """
+        if align_corners is None:
+            align_corners = self.align_corners
+        return _translation_per_axis(t, self.nz, self.ny, self.nx, align_corners)
 
     def _rotate_normalized_grid(
         self,
@@ -224,6 +353,7 @@ class VolumeRotator(L.LightningModule):
         R: torch.Tensor,
         t: torch.Tensor,
         scale: torch.Tensor,
+        origin: GridOrigin | None = None,
     ) -> torch.Tensor:
         """
         Apply the isotropic rotate-and-translate transform to normalized
@@ -251,10 +381,11 @@ class VolumeRotator(L.LightningModule):
         torch.Tensor
             Rotated normalized sampling coordinates, shape (B, N, 3).
         """
-        if self.origin == "relion":
-            grid = (grid - self.center) * scale
+        t = self._translation_per_axis(t)
+        if (origin or self.origin) == "relion":
+            grid = (grid - self.center_dc) * scale
             grid = grid @ R.transpose(1, 2)
-            grid = (grid / scale) + self.center
+            grid = (grid / scale) + self.center_dc
             grid = grid + t.unsqueeze(1)
         else:
             grid = grid * scale
@@ -262,52 +393,89 @@ class VolumeRotator(L.LightningModule):
             grid = (grid / scale) + t.unsqueeze(1)
         return grid
 
-    def _build_grid(self, theta: torch.Tensor) -> torch.Tensor:
+    def _build_grid(
+        self,
+        theta: torch.Tensor,
+        origin: str | None = None,
+        domain: Literal["real", "fourier"] = "real",
+    ) -> torch.Tensor:
         """
-        Build a sampling grid from cached base grid and affine parameters.
+        Build a sampling grid from the affine parameters.
 
         theta: (B, 3, 4)
         Returns: (B, Z, Y, X, 3)
+
+        Delegates to :func:`~specter.rotations.rotation_sampling_grid`, the
+        construction :func:`~specter.rotations.rotate_volume` also uses, so
+        the functional and module forms cannot drift apart. The chain
+        `_rotate_normalized_grid` applies to an identity grid (recentre,
+        rescale, rotate, unscale, uncentre, translate) is affine in that
+        grid, so it is collapsed into one (B, 3, 4) matrix and evaluated in
+        a single broadcast write.
         """
-        B = theta.shape[0]
-        R = theta[..., :3]  # (B, 3, 3)
-        t = theta[..., 3]  # (B, 3)
-
-        if not hasattr(self, "base_grid"):
-            self._build_base_grid()
-        grid = self.base_grid.expand(B, -1, -1, -1, -1)
-        grid = grid.view(B, -1, 3)
-
-        scale = self._isotropic_scale(theta.device, theta.dtype)
-        grid = self._rotate_normalized_grid(grid, R, t, scale)
-
-        grid = grid.view(B, self.nz, self.ny, self.nx, 3)
-        return grid
+        resolved = origin or self.origin
+        if resolved not in ("relion", "center"):
+            raise ValueError(f"Unknown origin: {resolved}.")
+        return rotation_sampling_grid(
+            theta,
+            self.nz,
+            self.ny,
+            self.nx,
+            "relion" if resolved == "relion" else "center",
+            self.align_corners,
+            domain,
+        )
 
     # ------------------------------------------------------------------
     # Real-space rotation
     # ------------------------------------------------------------------
-    def rotate_real(self, V: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    def rotate_real(
+        self,
+        V: torch.Tensor,
+        theta: torch.Tensor,
+        origin: str | None = None,
+        domain: Literal["real", "fourier"] = "real",
+    ) -> torch.Tensor:
         """
         Rotate a volume in real space.
         V: (Z, Y, X)
         theta: (B, 3, 4)
+        origin: overrides self.origin for this call; used by `rotate_fourier`,
+            whose spectrum must always be rotated about the DC term.
+        domain: "fourier" when `V` is one part of an fftshifted spectrum, as
+            `rotate_fourier` passes it; see
+            :func:`~specter.rotations.rotation_sampling_grid`.
         Returns: (B, Z, Y, X)
         """
         B = theta.shape[0]
-        grid = self._build_grid(theta)
 
-        V = V.unsqueeze(0).unsqueeze(1)  # (1, 1, Z, Y, X)
-        V = V.expand(B, 1, self.nz, self.ny, self.nx)
+        def sample(vol: torch.Tensor, theta_b: torch.Tensor) -> torch.Tensor:
+            grid = self._build_grid(theta_b, origin=origin, domain=domain)
+            vin = vol[None, None].expand(theta_b.shape[0], 1, self.nz, self.ny, self.nx)
+            return F.grid_sample(
+                vin,
+                grid,
+                align_corners=self.align_corners,
+                padding_mode=self.padding_mode,
+            )[:, 0]
 
-        V_rot = F.grid_sample(
-            V,
-            grid,
-            align_corners=self.align_corners,
-            padding_mode=self.padding_mode,
-        )
-
-        return V_rot.squeeze(1)  # (B, Z, Y, X)
+        if torch.is_grad_enabled() and V.requires_grad:
+            # Training (a reconstruction): the sampling grid is three floats
+            # per voxel per image, 1.6 GB at a 512 box, and grid_sample's
+            # backward needs it, so a batch of three kept 4.8 GB of grids
+            # alive from the forward to the backward. Recomputing each
+            # image's grid in the backward (one broadcast write) and
+            # sampling one image at a time took a reconstruction step's peak
+            # from 16 to 10 GiB for ~5% more time. The values are the same:
+            # grid_sample is per-voxel, so batching changes no arithmetic.
+            return torch.cat(
+                [
+                    checkpoint(sample, V, theta[b : b + 1], use_reentrant=False)
+                    for b in range(B)
+                ],
+                dim=0,
+            )
+        return sample(V, theta)  # (B, Z, Y, X)
 
     # ------------------------------------------------------------------
     # Fourier-space rotation
@@ -315,13 +483,33 @@ class VolumeRotator(L.LightningModule):
     def rotate_fourier(self, V: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         """
         Rotate a volume in Fourier space via real/imag decomposition.
+
+        Any translation carried by `theta` is applied as a phase ramp rather than
+        by resampling the spectrum, which would modulate the density instead of
+        moving it. `self.origin` is folded into the same ramp: the rotation itself
+        is always centred on the spectrum's DC term at ``n // 2``.
         """
         V_f = fft3(V, shift=True)  # complex, (Z, Y, X)
 
-        V_f_rot_real = self.rotate_real(V_f.real, theta)
-        V_f_rot_imag = self.rotate_real(V_f.imag, theta)
+        theta_rot, displacement = split_affine_translation(theta)
+        # x-normalised, like `rotate_real`'s translation; see there. The phase
+        # ramp reads n / 2 voxels per normalised unit whatever align_corners is.
+        displacement = self._translation_per_axis(displacement, align_corners=False)
+        if self.origin == "center":
+            displacement = displacement + fourier_origin_displacement(
+                theta, self.nz, self.ny, self.nx
+            )
 
-        V_f_rot = torch.complex(V_f_rot_real, V_f_rot_imag)
+        V_f_rot_real = self.rotate_real(
+            V_f.real, theta_rot, origin="relion", domain="fourier"
+        )
+        V_f_rot_imag = self.rotate_real(
+            V_f.imag, theta_rot, origin="relion", domain="fourier"
+        )
+
+        V_f_rot = apply_fourier_translation(
+            torch.complex(V_f_rot_real, V_f_rot_imag), displacement
+        )
         V_rot = ifft3(V_f_rot, shift=True)
 
         return V_rot.real  # (B, Z, Y, X)
@@ -357,7 +545,9 @@ class VolumeRotator(L.LightningModule):
         slice_indices: torch.Tensor | Sequence[int] | int,
         roi_center: tuple[int, int] | None = None,
         roi_size: tuple[int, int] | None = None,
-        padding_mode: str | None = None,
+        padding_mode: GridSamplePadding | None = None,
+        device: str | torch.device | None = None,
+        window_margin: int = 2,
     ) -> torch.Tensor:
         """
         Sample multiple Z-slices from a rotated volume, restricted to a ROI in XY.
@@ -366,9 +556,12 @@ class VolumeRotator(L.LightningModule):
         Parameters
         ----------
         V : (Z,Y,X) torch.Tensor
-            Input 3D volume.
+            Input 3D volume. May live on a different device than `device`
+            below (e.g. CPU, to avoid holding a huge volume in GPU memory)
+            -- see `device`.
         theta : (B,3,4) torch.Tensor
-            Affine rotation matrix.
+            Affine rotation matrix. May be on any device; internally moved
+            to `V`'s device for the (cheap) grid construction.
         slice_indices : (K,) or list or int
             One or more slice indices along Z of the rotated volume, relative to the center.
         roi_center : tuple (cy, cx)
@@ -379,26 +572,49 @@ class VolumeRotator(L.LightningModule):
             Defaults to full volume size.
         padding_mode : str
             Passed to grid_sample. Defaults to self.padding_mode.
+        device : str or torch.device, optional
+            Device the returned slices should live on. Defaults to `V`'s own
+            device (original behaviour: grid_sample runs directly against
+            `V` wherever it is). When given and different from `V`'s device,
+            the interpolation itself still runs on `device` -- but rather
+            than transferring the whole of `V` there first, only the small
+            axis-aligned bounding box the rotated query actually touches is
+            sliced out of `V` and transferred (see `_windowed_grid_sample`).
+            This keeps `device` memory bounded by the query's own geometry
+            (ROI size x `slice_indices` extent), never by `V`'s total size --
+            validated flat at ~25-30MB from a 66MB volume up to a 67GB one,
+            vs. a whole-volume transfer's memory scaling linearly with `V`
+            and eventually OOMing. Use this whenever `V` is deliberately kept off the
+            compute device -- e.g. `imaging.TiltSeries` falls back to this
+            automatically (see its `place`) when its volume doesn't fit on
+            the GPU.
+        window_margin : int, optional
+            Only used when `device` triggers the windowed path above: extra
+            padding (px) around the query's exact pixel-space bounding box,
+            for bilinear interpolation's 1px neighbor footprint. Default 2.
 
         Returns
         -------
         slices_roi : (B, K, ny_roi, nx_roi) torch.Tensor
-            Interpolated 2D slices of the rotated volume, cropped to ROI.
+            Interpolated 2D slices of the rotated volume, cropped to ROI, on
+            `device` (or `V`'s own device if `device` is None).
         """
         if padding_mode is None:
             padding_mode = self.padding_mode
 
         ny, nx = self.ny, self.nx
         B = theta.shape[0]
-        dtype, device = V.dtype, V.device
+        dtype = V.dtype
+        theta = theta.to(V.device)
+        target_device = torch.device(device) if device is not None else V.device
 
-        slice_indices = _normalize_slice_indices(slice_indices, device)
+        slice_indices = _normalize_slice_indices(slice_indices, V.device)
         K = slice_indices.shape[0]
         roi_center, roi_size = _resolve_roi(roi_center, roi_size, ny, nx)
         ny_roi, nx_roi = roi_size
 
         points_pix = _build_roi_query_points(
-            slice_indices, roi_center, roi_size, ny, nx, device, dtype
+            slice_indices, roi_center, roi_size, ny, nx, V.device, dtype
         )  # (K, ny_roi, nx_roi, 3)
         points_pix_flat = (
             points_pix.unsqueeze(0).expand(B, -1, -1, -1, -1).reshape(B, -1, 3)
@@ -409,11 +625,11 @@ class VolumeRotator(L.LightningModule):
         # -------------------------------
         R = theta[..., :3]  # (B, 3, 3)
         t = theta[..., 3]  # (B, 3) normalized
-        scale = self._isotropic_scale(device, dtype)
+        scale = self._isotropic_scale(V.device, dtype)
 
         if self.origin == "relion":
             # Normalize points to [-1, 1] relative to V center
-            points_norm = points_pix_flat / scale + self.center
+            points_norm = points_pix_flat / scale + self.center.to(V.device, dtype)
         else:
             # PyTorch center convention
             points_norm = points_pix_flat / scale
@@ -424,10 +640,21 @@ class VolumeRotator(L.LightningModule):
         # -------------------------------
         # Sample volume
         # -------------------------------
-        V_in = _prepare_volume_for_grid_sample(V, B)
+        if target_device == V.device:
+            V_in = _prepare_volume_for_grid_sample(V, B)
+            slices_roi = F.grid_sample(
+                V_in, grid, align_corners=self.align_corners, padding_mode=padding_mode
+            )
+            return slices_roi[:, 0]  # (B, K, ny_roi, nx_roi)
 
-        slices_roi = F.grid_sample(
-            V_in, grid, align_corners=self.align_corners, padding_mode=padding_mode
+        return _windowed_grid_sample(
+            V,
+            grid,
+            self.nz,
+            ny,
+            nx,
+            self.align_corners,
+            padding_mode,
+            target_device,
+            window_margin,
         )
-
-        return slices_roi[:, 0]  # (B, K, ny_roi, nx_roi)

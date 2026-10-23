@@ -2,6 +2,7 @@
 Tests for potential volume construction.
 """
 
+import logging
 import warnings
 from importlib import resources
 
@@ -17,11 +18,15 @@ from specter.atom import (
 from specter.potential import (
     GemmiPotentialBuilder,
     PotentialBuilder,
+    build_atomic_potential_kernel,
     build_potential_volume_analytic_scatter_kirkland,
     build_potential_volume_analytic_scatter_lobato,
     build_potential_volume_fftconvolve_3d,
+    potential_from_deltas,
     recommended_rcut,
 )
+from specter.fft import fftconvolve, spatial_convolve3d_same
+from specter.potential._builders import _deltas_backend
 
 
 # A small cluster of 5 carbon atoms (Z=6) spread over ~6 Å.
@@ -101,7 +106,7 @@ def test_potential_builder_shtyrov_species_smoke():
     # deliberately unmatched to exercise the fallback path.
     atom_species = ["O(HH)", "C(unmatched)", None]
 
-    with pytest.warns(UserWarning, match="falling back"):
+    with pytest.warns(UserWarning, match="fall back to"):
         pb = PotentialBuilder(
             32,
             1.0,
@@ -126,6 +131,59 @@ def test_potential_builder_shtyrov_species_smoke():
     )
     volume_kirkland = pb_kirkland.forward(coords)
     assert not torch.allclose(volume, volume_kirkland)
+
+
+def test_species_group_ids_select_what_a_string_comparison_selects():
+    """`forward`'s cached per-atom species rows pick exactly the atoms a
+    per-group string comparison picks, follow `.to()`, and are not state."""
+    atomic_numbers = torch.tensor([8, 6, 8, 26, 8, 7], dtype=torch.long)
+    atom_species = ["O(HH)", "C(unmatched)", "O(HH)", None, "O(C)", "N(unmatched)"]
+    with pytest.warns(UserWarning, match="fall back to"):
+        pb = PotentialBuilder(
+            16,
+            1.0,
+            atomic_numbers,
+            parameterization="shtyrov",
+            atom_species=atom_species,
+            progressbars=False,
+        )
+    assert pb.shtyrov_groups is not None
+    for i, (kind, key) in enumerate(pb.shtyrov_groups):
+        if kind == "species":
+            expected = torch.tensor([s == key for s in atom_species])
+            assert torch.equal(pb._species_group_ids == i, expected)
+    assert "_species_group_ids" in dict(pb.named_buffers())
+    assert "_species_group_ids" not in pb.state_dict()
+    if torch.cuda.is_available():
+        assert pb.to("cuda")._species_group_ids.device.type == "cuda"
+
+
+def test_shtyrov_3d_renders_each_atom_once_when_its_element_also_falls_back():
+    """
+    An element with both matched and unmatched atoms gets a species group and
+    a Peng fallback group; each atom must land in exactly one of them. The
+    fallback used to select every atom of its element, so the matched atom was
+    rendered twice (as Shtyrov and again as Peng).
+    """
+    coords = torch.tensor([[[-10.0, 0.0, 0.0], [10.0, 0.0, 0.0]]])
+    z = torch.tensor([8, 8], dtype=torch.long)
+
+    def total(idx: list[int], species: list[str | None]) -> float:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pb = PotentialBuilder(
+                48,
+                1.0,
+                z[idx],
+                parameterization="shtyrov",
+                atom_species=[species[i] for i in idx],
+                progressbars=False,
+            )
+        return float(pb(coords[:, idx], method="3d").sum())
+
+    species = ["O(HH)", "O(unmatched)"]
+    both = total([0, 1], species)
+    assert both == pytest.approx(total([0], species) + total([1], species), rel=1e-5)
 
 
 def test_shtyrov_species_potential_matches_analytic_closed_form():
@@ -156,8 +214,8 @@ def test_shtyrov_species_potential_matches_analytic_closed_form():
     P = table["O(HH)"].double()
     a, b = P[:, 0], P[:, 1]
 
-    a0 = 0.529  # Bohr radius, [Å]
-    e = 14.4  # electron charge, [V·Å]
+    a0 = 0.529177  # Bohr radius, [Å], CODATA
+    e = 14.399645  # electron charge, [V·Å], CODATA
     c1 = 2 * torch.pi * e * a0
 
     def independent_reference(r: float) -> float:
@@ -315,9 +373,9 @@ def test_shtyrov_species_with_zero_b_coefficient_is_finite(species):
     species_path = resources.files("specter.atom_data").joinpath("params_cat.json")
     with resources.as_file(species_path) as fpath:
         table = load_shtyrov_species_parameters(str(fpath))
-    assert any(
-        b == 0.0 for b in table[species][:, 1].tolist()
-    ), f"expected {species} to have a b_i=0 term; bundled data may have changed"
+    assert any(b == 0.0 for b in table[species][:, 1].tolist()), (
+        f"expected {species} to have a b_i=0 term; bundled data may have changed"
+    )
 
     r_xyz = radial_grid_3d(20, 0.5, convention="torch")
     potential = shtyrov_atomic_potential_3d_by_species(species, r_xyz, table)
@@ -427,7 +485,7 @@ def test_potential_builder_analytic_matches_gemmi_multi_atom(tmp_path):
     )
     coords = coords - coords.mean(dim=0, keepdim=True)
 
-    with pytest.warns(UserWarning, match="falling back"):
+    with pytest.warns(UserWarning, match="fall back to"):
         pb = PotentialBuilder(
             n,
             dx,
@@ -436,7 +494,7 @@ def test_potential_builder_analytic_matches_gemmi_multi_atom(tmp_path):
             atom_species=atom_species,
             progressbars=False,
         )
-    vol_ours = pb.forward(coords, method="analytic")
+    volume_ours = pb.forward(coords, method="analytic")
 
     scat_coeffs = []
     for sp, z in zip(atom_species, atomic_numbers.tolist()):
@@ -455,23 +513,37 @@ def test_potential_builder_analytic_matches_gemmi_multi_atom(tmp_path):
     _write_multi_atom_shtyrov_mmcif(mmcif_path, elements, coords.tolist(), scat_coeffs)
 
     gpb = GemmiPotentialBuilder(n_xyz=n, dx=dx, b_factor=0.0)
-    vol_gemmi = gpb.build_potential_from_custom_mmcif(mmcif_path)
+    volume_gemmi = gpb.build_potential_from_custom_mmcif(mmcif_path)
 
-    corr = torch.corrcoef(torch.stack([vol_ours.flatten(), vol_gemmi.flatten()]))[0, 1]
+    corr = torch.corrcoef(torch.stack([volume_ours.flatten(), volume_gemmi.flatten()]))[
+        0, 1
+    ]
     assert corr.item() > 0.97, f"correlation too low: {corr.item()}"
 
-    total_ours = (vol_ours.sum() * dx**3).item()
-    total_gemmi = (vol_gemmi.sum() * dx**3).item()
+    total_ours = (volume_ours.sum() * dx**3).item()
+    total_gemmi = (volume_gemmi.sum() * dx**3).item()
     assert abs(total_ours - total_gemmi) / abs(total_gemmi) < 0.1, (
         f"total integrated potential differs too much: ours={total_ours}, "
         f"gemmi={total_gemmi}"
     )
 
 
-def test_potential_builder_analytic_gradient_matches_finite_difference():
+@pytest.mark.parametrize(
+    ("parameterization", "atomic_numbers", "atom_species", "eps"),
+    [
+        ("shtyrov", [8, 6], ["O(HH)", None], 1e-3),
+        ("kirkland", [16, 6], None, 1e-2),
+        ("lobato", [16, 6], None, 1e-2),
+    ],
+    ids=["shtyrov", "kirkland", "lobato"],
+)
+def test_potential_builder_analytic_gradient_matches_finite_difference(
+    parameterization, atomic_numbers, atom_species, eps
+):
     """
     forward(method="analytic") must be differentiable w.r.t. coordinates,
-    and the gradient must match a central finite-difference estimate.
+    and the gradient must be finite and match a central finite-difference
+    estimate.
 
     Uses a random-weighted sum as the loss, not a bare .sum(): the plain
     volume sum is (by design, since build_potential_volume_analytic_scatter
@@ -479,17 +551,25 @@ def test_potential_builder_analytic_gradient_matches_finite_difference():
     potential, which is intentionally near-invariant to atom position — its
     gradient is correctly near-zero, which isn't a useful differentiability
     check. A weighted sum breaks that symmetry and actually depends on
-    position.
+    position. (Kirkland/Lobato's shell-average is only an approximation, not
+    exact, so a bare sum isn't perfectly position-invariant there either --
+    but a weighted sum gives a robust, clearly nonzero gradient regardless.)
+
+    For Kirkland/Lobato this is also the regression test for a NaN-gradient
+    bug: yukawa_shell_average/plain_exp_shell_average's far/near torch.where
+    branches were each evaluated everywhere (not just where selected), and
+    the unselected branch could overflow to inf for out-of-domain inputs,
+    corrupting the gradient via 0*inf=nan even though the forward value was
+    finite and correct.
     """
-    atomic_numbers = torch.tensor([8, 6], dtype=torch.long)
-    atom_species = ["O(HH)", None]
+    atomic_numbers = torch.tensor(atomic_numbers, dtype=torch.long)
     coords = torch.tensor([[0.3, -0.2, 0.1], [3.1, 0.0, 0.0]])
 
     pb = PotentialBuilder(
         32,
         1.0,
         atomic_numbers,
-        parameterization="shtyrov",
+        parameterization=parameterization,
         atom_species=atom_species,
         progressbars=False,
     )
@@ -502,9 +582,9 @@ def test_potential_builder_analytic_gradient_matches_finite_difference():
 
     c = coords.clone().requires_grad_(True)
     total_potential(c).backward()
+    assert torch.isfinite(c.grad).all(), f"non-finite gradient: {c.grad}"
     analytic_grad = c.grad[0, 0].item()
 
-    eps = 1e-3
     plus = coords.clone()
     plus[0, 0] += eps
     minus = coords.clone()
@@ -514,30 +594,51 @@ def test_potential_builder_analytic_gradient_matches_finite_difference():
     assert analytic_grad == pytest.approx(fd_grad, rel=1e-2)
 
 
-def test_potential_builder_analytic_handles_out_of_bounds_atom():
+@pytest.mark.parametrize(
+    ("parameterization", "atom_species"),
+    [
+        ("shtyrov", ["O(HH)", "O(HH)"]),
+        ("kirkland", None),
+        ("lobato", None),
+    ],
+    ids=["shtyrov", "kirkland", "lobato"],
+)
+def test_potential_builder_analytic_handles_out_of_bounds_atom(
+    parameterization, atom_species
+):
     """
     An atom placed (partially or fully) outside the grid should be clipped,
     not crash — matching soft_voxelize_coordinates' existing behavior for
-    the '2d'/'3d' methods.
+    the '2d'/'3d' methods, for every parameterization's analytic path.
     """
     atomic_numbers = torch.tensor([8, 8], dtype=torch.long)
-    atom_species = ["O(HH)", "O(HH)"]
     coords = torch.tensor([[0.0, 0.0, 0.0], [1000.0, 1000.0, 1000.0]])
 
     pb = PotentialBuilder(
         16,
         1.0,
         atomic_numbers,
-        parameterization="shtyrov",
+        parameterization=parameterization,
         atom_species=atom_species,
         progressbars=False,
     )
-    vol = pb.forward(coords, method="analytic")
-    assert torch.isfinite(vol).all()
-    assert vol.sum() > 0
+    volume = pb.forward(coords, method="analytic")
+    assert torch.isfinite(volume).all()
+    assert volume.sum() > 0
 
 
-def test_potential_builder_analytic_robust_to_subvoxel_position():
+@pytest.mark.parametrize(
+    ("parameterization", "atom_species", "total_spread_tol", "exact_total"),
+    [
+        ("shtyrov", ["O(HH)"], 2e-3, True),
+        ("kirkland", None, 0.2, False),
+        ("lobato", None, 0.2, False),
+    ],
+    ids=["shtyrov", "kirkland", "lobato"],
+)
+def test_potential_builder_analytic_robust_to_subvoxel_position(
+    parameterization, atom_species, total_spread_tol, exact_total
+):
     """
     Regression test for the point-sampling aliasing bug: before
     build_potential_volume_analytic_scatter switched to exact erf-based
@@ -545,41 +646,58 @@ def test_potential_builder_analytic_robust_to_subvoxel_position():
     peak value by ~26x (1012 -> 38.6) purely from where it landed relative
     to the grid, with no physical meaning. With proper voxel-averaging:
       - the total integrated potential (sum * dx^3) must stay constant
-        regardless of sub-voxel position (matches the analytic total
-        c1 * sum(a_i), since voxel-averaging exactly conserves the
-        integral under translation);
+        regardless of sub-voxel position (for Shtyrov/Peng's pure-Gaussian
+        erf treatment it matches the analytic total c1 * sum(a_i) to 1e-3,
+        since voxel-averaging exactly conserves the integral under
+        translation);
       - the peak value should vary only mildly with position, not swing
         by an order of magnitude.
+
+    Kirkland/Lobato's Yukawa terms use a sphere-of-equal-volume
+    shell-average -- a bounded *approximation*, not an exact integral, so
+    the total is only approximately invariant (~2-20% per the derivation's
+    Monte Carlo validation, confirmed empirically at ~11%), hence the
+    per-parameterization spread tolerance. The key regression guard is that
+    neither the total nor the peak blows up or swings by orders of magnitude
+    the way naive point-sampling does.
     """
     atomic_numbers = torch.tensor([8], dtype=torch.long)
-    atom_species = ["O(HH)"]
     n, dx = 16, 1.0
 
     pb = PotentialBuilder(
         n,
         dx,
         atomic_numbers,
-        parameterization="shtyrov",
+        parameterization=parameterization,
         atom_species=atom_species,
         progressbars=False,
     )
 
-    a0 = 0.529
-    e = 14.4
-    c1 = 2 * torch.pi * e * a0
-    a_coefs, _ = pb._get_analytic_atom_coefficients()
-    expected_total = (c1 * a_coefs[0].sum()).item()
-
-    peaks = []
+    totals, peaks = [], []
     for offset in [0.0, 0.1, 0.25, 0.5]:
         coords = torch.tensor([[offset, 0.0, 0.0]])
-        vol = pb.forward(coords, method="analytic")
-        total = (vol.sum() * dx**3).item()
-        assert total == pytest.approx(
-            expected_total, rel=1e-3
-        ), f"total at offset={offset} is {total}, expected {expected_total}"
-        peaks.append(vol.max().item())
+        volume = pb.forward(coords, method="analytic")
+        assert torch.isfinite(volume).all()
+        totals.append((volume.sum() * dx**3).item())
+        peaks.append(volume.max().item())
 
+    if exact_total:
+        a0 = 0.529177  # CODATA
+        e = 14.399645  # CODATA
+        c1 = 2 * torch.pi * e * a0
+        a_coefs, _ = pb._get_analytic_atom_coefficients()
+        expected_total = (c1 * a_coefs[0].sum()).item()
+        for offset, total in zip([0.0, 0.1, 0.25, 0.5], totals):
+            assert total == pytest.approx(expected_total, rel=1e-3), (
+                f"total at offset={offset} is {total}, expected {expected_total}"
+            )
+
+    total_spread = (max(totals) - min(totals)) / (sum(totals) / len(totals))
+    assert total_spread < total_spread_tol, (
+        f"total integral varies by {total_spread * 100:.1f}% across sub-voxel "
+        f"positions ({totals}) -- should stay within the "
+        f"{total_spread_tol * 100:.1f}% bound for {parameterization}"
+    )
     assert max(peaks) / min(peaks) < 3.0, (
         f"peak varies by {max(peaks) / min(peaks):.1f}x across sub-voxel "
         f"positions ({peaks}) -- should be a mild, smooth variation, not "
@@ -613,123 +731,20 @@ def test_potential_builder_analytic_matches_3d_splat(parameterization):
     pb = PotentialBuilder(
         n, dx, atomic_numbers, parameterization=parameterization, progressbars=False
     )
-    vol_analytic = pb.forward(coords, method="analytic")
-    vol_3d = pb.forward(coords, method="3d")
+    volume_analytic = pb.forward(coords, method="analytic")
+    volume_3d = pb.forward(coords, method="3d")
 
-    total_analytic = (vol_analytic.sum() * dx**3).item()
-    total_3d = (vol_3d.sum() * dx**3).item()
+    total_analytic = (volume_analytic.sum() * dx**3).item()
+    total_3d = (volume_3d.sum() * dx**3).item()
     assert abs(total_analytic - total_3d) / abs(total_3d) < 0.1, (
         f"total integrated potential differs too much: analytic={total_analytic}, "
         f"3d={total_3d}"
     )
 
-    corr = torch.corrcoef(torch.stack([vol_analytic.flatten(), vol_3d.flatten()]))[0, 1]
+    corr = torch.corrcoef(
+        torch.stack([volume_analytic.flatten(), volume_3d.flatten()])
+    )[0, 1]
     assert corr.item() > 0.9, f"correlation too low: {corr.item()}"
-
-
-@pytest.mark.parametrize("parameterization", ["kirkland", "lobato"])
-def test_potential_builder_analytic_gradient_matches_finite_difference_kl(
-    parameterization,
-):
-    """
-    forward(method="analytic") for Kirkland/Lobato must be differentiable
-    w.r.t. coordinates, matching a central finite-difference estimate.
-
-    Regression test for the NaN-gradient bug found and fixed this session:
-    yukawa_shell_average/plain_exp_shell_average's far/near torch.where
-    branches were each evaluated everywhere (not just where selected), and
-    the unselected branch could overflow to inf for out-of-domain inputs,
-    corrupting the gradient via 0*inf=nan even though the forward value was
-    finite and correct. Uses a random-weighted sum as the loss, not a bare
-    .sum(), following the same reasoning as the Shtyrov analytic gradient
-    test (Kirkland/Lobato's shell-average is only an approximation, not
-    exact, so a bare sum isn't perfectly position-invariant here either --
-    but a weighted sum gives a robust, clearly nonzero gradient regardless).
-    """
-    atomic_numbers = torch.tensor([16, 6], dtype=torch.long)
-    coords = torch.tensor([[0.3, -0.2, 0.1], [3.1, 0.0, 0.0]])
-
-    pb = PotentialBuilder(
-        32, 1.0, atomic_numbers, parameterization=parameterization, progressbars=False
-    )
-
-    torch.manual_seed(0)
-    weight = torch.randn(32, 32, 32)
-
-    def total_potential(c):
-        return (pb.forward(c, method="analytic") * weight).sum()
-
-    c = coords.clone().requires_grad_(True)
-    total_potential(c).backward()
-    assert torch.isfinite(c.grad).all(), f"non-finite gradient: {c.grad}"
-    analytic_grad = c.grad[0, 0].item()
-
-    eps = 1e-2
-    plus = coords.clone()
-    plus[0, 0] += eps
-    minus = coords.clone()
-    minus[0, 0] -= eps
-    fd_grad = (total_potential(plus).item() - total_potential(minus).item()) / (2 * eps)
-
-    assert analytic_grad == pytest.approx(fd_grad, rel=1e-2)
-
-
-@pytest.mark.parametrize("parameterization", ["kirkland", "lobato"])
-def test_potential_builder_analytic_handles_out_of_bounds_atom_kl(parameterization):
-    """
-    An atom placed (partially or fully) outside the grid should be clipped,
-    not crash, for Kirkland/Lobato's analytic path too.
-    """
-    atomic_numbers = torch.tensor([8, 8], dtype=torch.long)
-    coords = torch.tensor([[0.0, 0.0, 0.0], [1000.0, 1000.0, 1000.0]])
-
-    pb = PotentialBuilder(
-        16, 1.0, atomic_numbers, parameterization=parameterization, progressbars=False
-    )
-    vol = pb.forward(coords, method="analytic")
-    assert torch.isfinite(vol).all()
-    assert vol.sum() > 0
-
-
-@pytest.mark.parametrize("parameterization", ["kirkland", "lobato"])
-def test_potential_builder_analytic_robust_to_subvoxel_position_kl(parameterization):
-    """
-    Sub-voxel robustness for Kirkland/Lobato's analytic path. Unlike
-    Shtyrov/Peng's pure-Gaussian erf treatment (exact voxel average, total
-    integral exactly invariant under translation), Kirkland/Lobato's Yukawa
-    terms use a sphere-of-equal-volume shell-average -- a bounded
-    *approximation*, not an exact integral, so the total is only
-    approximately invariant (~2-20% per the derivation's Monte Carlo
-    validation, confirmed empirically here at ~11%). The key regression
-    guard is that neither the total nor the peak blows up or swings by
-    orders of magnitude the way naive point-sampling does.
-    """
-    atomic_numbers = torch.tensor([8], dtype=torch.long)
-    n, dx = 16, 1.0
-
-    pb = PotentialBuilder(
-        n, dx, atomic_numbers, parameterization=parameterization, progressbars=False
-    )
-
-    totals, peaks = [], []
-    for offset in [0.0, 0.1, 0.25, 0.5]:
-        coords = torch.tensor([[offset, 0.0, 0.0]])
-        vol = pb.forward(coords, method="analytic")
-        assert torch.isfinite(vol).all()
-        totals.append((vol.sum() * dx**3).item())
-        peaks.append(vol.max().item())
-
-    total_spread = (max(totals) - min(totals)) / (sum(totals) / len(totals))
-    assert total_spread < 0.2, (
-        f"total integral varies by {total_spread * 100:.1f}% across sub-voxel "
-        f"positions ({totals}) -- should stay within the shell-average "
-        "approximation's known ~20% worst-case bound"
-    )
-    assert max(peaks) / min(peaks) < 3.0, (
-        f"peak varies by {max(peaks) / min(peaks):.1f}x across sub-voxel "
-        f"positions ({peaks}) -- should be a mild, smooth variation, not "
-        "an aliasing-driven blow-up"
-    )
 
 
 def test_kirkland_lobato_analytic_no_overflow_for_heavy_elements():
@@ -754,12 +769,14 @@ def test_kirkland_lobato_analytic_no_overflow_for_heavy_elements():
             build_potential_volume_analytic_scatter_lobato,
         ):
             coords = torch.tensor([[0.3, 0.1, -0.2]], requires_grad=True)
-            vol = fn(atomic_numbers, coords, (n, n, n), dx)
-            assert torch.isfinite(vol).all(), f"{fn.__name__} Z={z}: non-finite volume"
-            vol.sum().backward()
-            assert (
-                coords.grad is not None and torch.isfinite(coords.grad).all()
-            ), f"{fn.__name__} Z={z}: non-finite gradient"
+            volume = fn(atomic_numbers, coords, (n, n, n), dx)
+            assert torch.isfinite(volume).all(), (
+                f"{fn.__name__} Z={z}: non-finite volume"
+            )
+            volume.sum().backward()
+            assert coords.grad is not None and torch.isfinite(coords.grad).all(), (
+                f"{fn.__name__} Z={z}: non-finite gradient"
+            )
 
 
 def test_potential_builder_shtyrov_peng_only_analytic():
@@ -778,9 +795,9 @@ def test_potential_builder_shtyrov_peng_only_analytic():
     pb_none = PotentialBuilder(
         n, dx, atomic_numbers, parameterization="shtyrov", progressbars=False
     )
-    vol_none = pb_none.forward(coords, method="analytic")
+    volume_none = pb_none.forward(coords, method="analytic")
 
-    with pytest.warns(UserWarning, match="falling back"):
+    with pytest.warns(UserWarning, match="fall back to"):
         pb_list = PotentialBuilder(
             n,
             dx,
@@ -789,10 +806,10 @@ def test_potential_builder_shtyrov_peng_only_analytic():
             atom_species=[None] * len(atomic_numbers),
             progressbars=False,
         )
-    vol_list = pb_list.forward(coords, method="analytic")
+    volume_list = pb_list.forward(coords, method="analytic")
 
-    assert torch.isfinite(vol_none).all()
-    assert torch.allclose(vol_none, vol_list)
+    assert torch.isfinite(volume_none).all()
+    assert torch.allclose(volume_none, volume_list)
 
 
 @pytest.mark.parametrize("parameterization", ["kirkland", "lobato"])
@@ -822,6 +839,12 @@ def test_recommended_rcut_shtyrov_species_and_peng_fallback():
     recommended_rcut for parameterization="shtyrov" should use the species
     table for matched atoms and the per-element Peng table as a fallback
     for unmatched/None species, taking the max across all atoms present.
+
+    The exact O(HH) value also pins the mixed-sign-Gaussian-term bug found
+    while building the table: O(HH) has two negative-amplitude terms that
+    decay slower than its positive ones, so a naive bisection assuming the
+    captured-integral fraction is monotonic in radius converged on 0.6 A
+    (~17.5% too much total potential); the corrected entry is 3.6 A.
     """
     atomic_numbers = torch.tensor([8, 6], dtype=torch.long)
 
@@ -833,21 +856,6 @@ def test_recommended_rcut_shtyrov_species_and_peng_fallback():
     # atom_species=None entirely -> every atom uses the Peng table.
     r_no_species = recommended_rcut(atomic_numbers, "shtyrov", atom_species=None)
     assert r_no_species < 3.0  # O and C are both fast-decaying in Peng's table
-
-
-def test_recommended_rcut_handles_shtyrov_mixed_sign_species():
-    """
-    Regression test for the mixed-sign-Gaussian-term bug found while
-    building this table: Shtyrov's O(HH) has two negative-amplitude terms
-    (a=-0.60, b=64.2 and a=-0.15, b=121.4) that decay slower than its
-    positive terms, so a naive bisection assuming the captured-integral
-    fraction is monotonic in radius converges on a radius far too small
-    (found: 0.6A, giving ~17.5% too much total potential in practice).
-    The corrected, monotonicity-robust table entry must be large enough
-    to actually be safe.
-    """
-    r = recommended_rcut(torch.tensor([8]), "shtyrov", atom_species=["O(HH)"])
-    assert r >= 3.5
 
 
 def test_potential_builder_default_rcut_is_auto_detected():
@@ -898,9 +906,9 @@ def test_potential_builder_defaults_to_shtyrov_analytic():
         warnings.simplefilter("error")
         pb = PotentialBuilder(16, 1.0, atomic_numbers, progressbars=False)
         assert pb.parameterization == "shtyrov"
-        vol = pb.forward(coords)  # no explicit method
-    assert torch.isfinite(vol).all()
-    assert vol.sum() > 0
+        volume = pb.forward(coords)  # no explicit method
+    assert torch.isfinite(volume).all()
+    assert volume.sum() > 0
 
 
 def test_potential_builder_analytic_rejects_periodic():
@@ -917,5 +925,581 @@ def test_potential_builder_analytic_rejects_periodic():
     with pytest.raises(ValueError, match="periodic"):
         pb.forward(coords, method="analytic")
     # '3d' should still work fine with periodic=True.
-    vol = pb.forward(coords, method="3d")
-    assert torch.isfinite(vol).all()
+    volume = pb.forward(coords, method="3d")
+    assert torch.isfinite(volume).all()
+
+
+@pytest.mark.parametrize("parameterization", ["kirkland", "lobato"])
+def test_potential_builder_kernels_match_standalone_builder(parameterization):
+    """
+    PotentialBuilder's per-element kernels are the standalone helper's output.
+
+    The ice and gold-bead generators call `build_atomic_potential_kernel`
+    directly for their single fixed species, while PotentialBuilder assembles
+    a stack of them for a structure. Both used to construct the kernel with
+    their own copy of the supersample -> sample -> bin recipe; this pins them
+    to one implementation so they cannot silently diverge again.
+    """
+    atomic_numbers = torch.tensor([6, 7, 8, 16])
+    pb = PotentialBuilder(
+        32, 1.0, atomic_numbers, parameterization=parameterization, progressbars=False
+    )
+    for i, z in enumerate(pb.unique_elements.tolist()):
+        direct = build_atomic_potential_kernel(
+            1.0, parameterization=parameterization, atomic_number=int(z)
+        )
+        assert torch.equal(pb.atomic_potentials_3d[i], direct), (
+            f"{parameterization} Z={int(z)} kernel differs between "
+            "PotentialBuilder and build_atomic_potential_kernel"
+        )
+
+
+@pytest.mark.parametrize("dx", [1.0, 1.5])
+def test_conv_backends_agree_including_even_kernels(dx):
+    """
+    'fftconvolve' and 'conv3d' must produce the same potential.
+
+    conv3d used to be F.conv3d(padding="same"), which pads asymmetrically
+    relative to fftconvolve's centered crop whenever the kernel has an even
+    number of voxels -- shifting the potential half a voxel off the
+    coordinates it was built from. dx=1.5 gives a 4-voxel kernel and used to
+    disagree by ~3.5 (against a signal max of ~4.3); dx=1.0 gives a 5-voxel
+    kernel and always agreed. Even kernels occur for 20 of the 36 pixel sizes
+    between 0.5 and 4.0 A, so this is the common case, not the exotic one.
+    """
+    torch.manual_seed(0)
+    atomic_numbers = torch.tensor([6, 7, 8, 8, 7, 6])
+    coords = (torch.rand(6, 3) - 0.5) * 20
+
+    out = {}
+    for backend in ("fftconvolve", "conv3d"):
+        pb = PotentialBuilder(
+            24,
+            dx,
+            atomic_numbers,
+            parameterization="kirkland",
+            conv_backend=backend,
+            progressbars=False,
+        )
+        out[backend] = pb(coords, method="3d")
+
+    torch.testing.assert_close(out["fftconvolve"], out["conv3d"], atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("backend", ["fftconvolve", "conv3d"])
+@pytest.mark.parametrize("chunk_slices", [3, 7, 40])
+@pytest.mark.parametrize("ksize", [3, 5, 9])
+def test_periodic_deltas_chunking_matches_whole_canvas(
+    monkeypatch, backend, chunk_slices, ksize
+):
+    """
+    ``boundary='periodic'`` must not depend on how the canvas is chunked, and
+    must survive ``out=deltas``.
+
+    Over `_DELTAS_FFT_MAX_VOXELS` the periodic path convolves a z-chunk at a
+    time, each chunk taking a halo of real neighbouring context that wraps at
+    the faces. ``IceBank.generate_big_ice`` passes ``out=deltas`` to avoid a
+    second canvas, so that halo reads slices the *previous* chunk has already
+    overwritten with potential -- and, once a chunk is shorter than the
+    kernel's forward reach, slices the FIRST chunks overwrote. Both were
+    convolved a second time, at values two orders of magnitude above real
+    ice. In the shipped configuration this corrupted 4 slices of a 2000-slice
+    solvate (384 px, 1 Å); with a short chunk it is far more. The reference
+    is the whole-canvas rolled-kernel transform, which no chunking touches.
+
+    Odd kernels only: specter's own are always odd
+    (``compute_supersampling_parameters``), and for an even kernel the two
+    branches sit a voxel apart -- a pre-existing convention gap, unrelated
+    to chunking.
+    """
+    from specter.potential import _builders
+
+    torch.manual_seed(0)
+    nz, ny, nx = 60, 12, 12
+    deltas = torch.rand(2, nz, ny, nx)
+    kernel = torch.rand(ksize, ksize, ksize)
+
+    monkeypatch.setattr(_builders, "_DELTAS_FFT_MAX_VOXELS", 10**12)
+    reference = potential_from_deltas(
+        deltas.clone(), kernel, backend="fftconvolve", boundary="periodic"
+    )
+
+    monkeypatch.setattr(_builders, "_DELTAS_FFT_MAX_VOXELS", ny * nx * chunk_slices)
+    for out_is_deltas in (False, True):
+        work = deltas.clone()
+        got = potential_from_deltas(
+            work,
+            kernel,
+            backend=backend,
+            boundary="periodic",
+            out=work if out_is_deltas else None,
+        )
+        torch.testing.assert_close(got, reference, atol=1e-4, rtol=1e-4)
+
+
+def test_periodic_deltas_auto_backend_keeps_fft_on_a_large_canvas():
+    """
+    A canvas past `_DELTAS_FFT_MAX_VOXELS` must not drop the FFT under
+    ``boundary='periodic'``: that path chunks, so the cap sizes the chunk
+    rather than deciding the backend. Falling back to a direct convolution
+    over the whole canvas cost 2x on the ice a thick-ice particle stack
+    builds (2000 x 384 x 384 with the 5^3 water kernel: 168 ms vs 84).
+    ``'linear'`` has no such loop and still falls back.
+    """
+    from specter.potential._builders import _DELTAS_FFT_MAX_VOXELS, _deltas_backend
+
+    kernel = torch.ones(5, 5, 5)
+    big = torch.empty(0).new_empty((1, _DELTAS_FFT_MAX_VOXELS * 2, 1, 1))
+
+    assert _deltas_backend(big, kernel, "periodic") == "fftconvolve"
+    assert _deltas_backend(big, kernel, "linear") == "conv3d"
+    # A kernel small enough to convolve directly still goes direct either way.
+    assert _deltas_backend(big, torch.ones(3, 3, 3), "periodic") == "conv3d"
+
+
+@pytest.mark.parametrize("dx", [1.0, 1.5])
+def test_2d_and_3d_methods_agree_on_density_position(dx):
+    """
+    method='2d' must place density at the same in-plane position as '3d'.
+
+    '2d' is a projection approximation, so the two differ in value -- but not
+    in *where* the density sits. Its convolution used to be
+    F.conv2d(padding="same"), which pads asymmetrically for an even-sized
+    kernel, offsetting the whole projected potential half a voxel from the
+    coordinates it was built from. dx=1.5 gives a 4-voxel kernel and used to
+    land a full pixel off by this measure; dx=1.0 gives 5 voxels and always
+    agreed.
+    """
+    torch.manual_seed(0)
+    atomic_numbers = torch.tensor([6, 7, 8, 8, 7, 6])
+    coords = (torch.rand(6, 3) - 0.5) * 20
+    pb = PotentialBuilder(
+        24, dx, atomic_numbers, parameterization="kirkland", progressbars=False
+    )
+
+    proj_2d = pb(coords, method="2d").sum(0)
+    proj_3d = pb(coords, method="3d").sum(0)
+
+    def centroid(m):
+        return torch.nonzero(m > 0.5 * m.max()).float().mean(0)
+
+    assert torch.allclose(centroid(proj_2d), centroid(proj_3d), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# The lazily-built analytic coefficient cache must follow the module's device
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_analytic_coefs_cache_follows_device():
+    """
+    A builder used on CPU and then moved to GPU must keep working.
+
+    `_analytic_coefs` is a plain attribute, not a registered buffer, so
+    `nn.Module.to()` cannot migrate it. Without an explicit device check the
+    second call returns CPU coefficients and dies inside `forward`. Anything
+    that rebuilds the potential every forward pass -- notably
+    `Specimen.from_atoms` -- hits this on every GPU run.
+    """
+    torch.manual_seed(0)
+    coords = torch.randn(50, 3) * 5.0
+    atomic_numbers = torch.full((50,), 6, dtype=torch.long)
+
+    builder = PotentialBuilder(32, 2.0, atomic_numbers, progressbars=False)
+    on_cpu = builder(coords)
+    assert builder._analytic_coefs is not None  # populated by the first call
+
+    builder = builder.to("cuda")
+    on_gpu = builder(coords.to("cuda"))
+
+    assert builder._analytic_coefs[0].device.type == "cuda"
+    assert torch.allclose(on_cpu, on_gpu.cpu(), atol=1e-4)
+
+
+def test_potential_kernel_cache_is_transparent_and_isolated():
+    """
+    Reusing a cached potential kernel is invisible to callers.
+
+    Specimen assembly builds one `PotentialBuilder` per species, so the same few
+    kernels get rebuilt dozens of times -- measured 321 builds of 29 distinct
+    kernels on the default tomogram config. The cache keys on everything a
+    kernel depends on (`dx`, parameterization, element/species), so two builders
+    that agree on those must produce identical stacks.
+
+    Also pins that the cache hands back a COPY: a caller that mutates its own
+    `atomic_potentials_3d` (or moves it to a device) must not corrupt the entry
+    every later builder reads.
+    """
+    import torch
+
+    from specter.potential import PotentialBuilder
+    from specter.potential._potential_builder import _KERNEL_CACHE
+
+    znums = torch.tensor([6, 7, 8, 16] * 10)
+    kwargs = dict(
+        n_xyz=24,
+        dx=2.0,
+        atomic_numbers=znums,
+        progressbars=False,
+        parameterization="kirkland",
+    )
+
+    _KERNEL_CACHE.clear()
+    first = PotentialBuilder(**kwargs)
+    assert len(_KERNEL_CACHE) == 4, "one entry per unique element"
+    cold = first.atomic_potentials_3d.clone()
+
+    second = PotentialBuilder(**kwargs)
+    assert torch.equal(second.atomic_potentials_3d, cold)
+
+    # Mutating a builder's own stack must not reach through to the cache.
+    second.atomic_potentials_3d.zero_()
+    third = PotentialBuilder(**kwargs)
+    assert torch.equal(third.atomic_potentials_3d, cold)
+
+    # A different voxel size is a different kernel, not a cache hit.
+    other = PotentialBuilder(**{**kwargs, "dx": 1.0})
+    assert len(_KERNEL_CACHE) == 8
+    assert not torch.equal(other.atomic_potentials_3d, cold)
+
+
+def test_potential_kernel_cache_separates_parameterizations():
+    """
+    Kernels for the same element under different parameterizations stay distinct.
+
+    The cheapest way to get this cache wrong is to key it on the element alone,
+    which would silently serve Kirkland kernels to a Lobato builder -- a physics
+    error that no shape or dtype check would catch.
+    """
+    import torch
+
+    from specter.potential import PotentialBuilder
+    from specter.potential._potential_builder import _KERNEL_CACHE
+
+    znums = torch.tensor([6, 8])
+    _KERNEL_CACHE.clear()
+    kirkland = PotentialBuilder(
+        n_xyz=24,
+        dx=2.0,
+        atomic_numbers=znums,
+        progressbars=False,
+        parameterization="kirkland",
+    ).atomic_potentials_3d.clone()
+    lobato = PotentialBuilder(
+        n_xyz=24,
+        dx=2.0,
+        atomic_numbers=znums,
+        progressbars=False,
+        parameterization="lobato",
+    ).atomic_potentials_3d.clone()
+
+    assert not torch.allclose(kirkland, lobato)
+
+
+def _shtyrov_builder_with_fallback():
+    """A PotentialBuilder whose atoms all miss the Shtyrov species table."""
+    return PotentialBuilder(
+        16,
+        1.0,
+        torch.tensor([6, 7], dtype=torch.long),
+        parameterization="shtyrov",
+        atom_species=["C(unmatched)", "N(unmatched)"],
+        progressbars=False,
+    )
+
+
+def test_peng_fallback_reported_once_per_builder():
+    """
+    One builder reports its Peng fallback once, not once per code path.
+
+    The voxelized-kernel path (_get_3d_shtyrov_species_potentials) and the
+    analytic-coefficient path (_get_analytic_atom_coefficients) each derive
+    the fallback from the same builder's same atom set, and a default
+    shtyrov+analytic render runs both -- so every rendered species used to
+    produce an identical pair of warnings.
+    """
+    with pytest.warns(UserWarning, match="fall back to") as caught:
+        pb = _shtyrov_builder_with_fallback()
+        pb.forward(torch.tensor([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]]))
+    assert len([w for w in caught if "fall back to" in str(w.message)]) == 1
+
+
+def test_peng_fallback_warns_once_per_process_across_builders():
+    """
+    A run rendering many species reports the fallback once, not per species.
+
+    A 27-species tomogram emitted 54 of these. The counts differ per
+    structure but the finding and its remedy do not, so the per-structure
+    detail moves to a DEBUG log record and the warning is process-level.
+    """
+    with pytest.warns(UserWarning, match="fall back to"):
+        _shtyrov_builder_with_fallback()
+
+    # "always" defeats the interpreter's own dedup, which keys on the message
+    # text and so would not have collapsed these anyway (each names its own
+    # atom count). Anything caught here is a genuine second warning.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            _shtyrov_builder_with_fallback()
+    assert [w for w in caught if "fall back to" in str(w.message)] == []
+
+
+def test_peng_fallback_detail_still_available_at_debug(caplog):
+    """
+    Suppressing the repeats must not lose the per-structure counts.
+
+    They are logged at DEBUG rather than INFO on purpose: a caller who set
+    INFO to follow a tomogram's section timings is asking for progress, not
+    for a line per rendered species.
+    """
+    with caplog.at_level(logging.DEBUG, logger="specter.potential._potential_builder"):
+        with pytest.warns(UserWarning, match="fall back to"):
+            _shtyrov_builder_with_fallback()
+
+    detail = [r for r in caplog.records if "no matching Shtyrov species" in r.message]
+    assert len(detail) == 1
+    assert detail[0].levelno == logging.DEBUG
+    assert "2 atom(s)" in detail[0].getMessage()
+    assert "'C'" in detail[0].getMessage() and "'N'" in detail[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# Per-atom B-factors (PotentialBuilder(b_factors=...))
+# ---------------------------------------------------------------------------
+
+
+def _oxygen_builder(n=24, dx=1.0, b_factors=None, **kwargs):
+    """A one-oxygen Shtyrov builder, optionally B-factor damped."""
+    return PotentialBuilder(
+        n,
+        dx,
+        torch.tensor([8], dtype=torch.long),
+        parameterization="shtyrov",
+        atom_species=["O(HH)"],
+        progressbars=False,
+        b_factors=b_factors,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("bfactor", [10.0, 30.0, 80.0])
+def test_bfactor_conserves_the_integrated_potential(bfactor):
+    """
+    A Debye-Waller factor redistributes potential, it does not remove any.
+
+    `exp(-B k^2 / 4)` is 1 at k=0, so the k=0 component -- the integral over
+    all space -- is untouched no matter how large B is. The analytic total
+    `c1 * sum(a_i)` is therefore the same target the B=0 path is checked
+    against in `test_potential_builder_analytic_robust_to_subvoxel_position`.
+
+    This is also the end-to-end check on `recommended_rcut`'s B-factor
+    padding: the tabled radii were derived at B=0, and a window left too
+    narrow for the broadened tail shows up here as a deficit in the total
+    rather than as anything visible in the volume.
+    """
+    n, dx = 40, 1.0
+    b = torch.tensor([bfactor])
+    pb = _oxygen_builder(n=n, dx=dx, b_factors=b)
+
+    a_coefs, _ = pb._get_analytic_atom_coefficients()
+    c1 = 2 * torch.pi * 14.399645 * 0.529177  # 2 pi e a0, CODATA
+    expected_total = (c1 * a_coefs[0].sum()).item()
+
+    volume = pb.forward(torch.tensor([[0.0, 0.0, 0.0]]), method="analytic")
+    total = (volume.sum() * dx**3).item()
+
+    assert total == pytest.approx(expected_total, rel=5e-3), (
+        f"B={bfactor} lost {100 * (1 - total / expected_total):.2f}% of the "
+        "integrated potential -- the local window is too narrow for the "
+        "broadened tail"
+    )
+
+
+def test_bfactor_widens_the_auto_selected_rcut():
+    """The auto `rcut` must grow with B, or the tail above is truncated."""
+    static = _oxygen_builder()
+    damped = _oxygen_builder(b_factors=torch.tensor([40.0]))
+
+    assert damped.rcut > static.rcut
+    # 3 sigma of the B-factor's own Gaussian, sqrt(B / (8 pi^2)).
+    assert damped.rcut == pytest.approx(
+        static.rcut + 3.0 * (40.0 / (8 * torch.pi**2)) ** 0.5, rel=1e-6
+    )
+
+
+def test_bfactor_matches_numerical_quadrature():
+    """
+    Check the damped voxel average against brute-force integration.
+
+    `b_i -> b_i + B` is exact rather than approximate, so the closed form
+    must agree with a direct numerical average of the Gaussian sum over one
+    voxel's volume -- an independent reference, not a rearrangement of the
+    same expression.
+    """
+    dx, B = 1.0, 25.0
+    pb = _oxygen_builder(n=16, dx=dx, b_factors=torch.tensor([B]))
+    a_coefs, b_coefs = pb._get_analytic_atom_coefficients()
+    a, b = a_coefs[0].double(), b_coefs[0].double() + B
+    c1 = 2 * torch.pi * 14.399645 * 0.529177  # 2 pi e a0, CODATA
+
+    volume = pb.forward(torch.tensor([[0.0, 0.0, 0.0]]), method="analytic")
+
+    # Midpoint quadrature over the voxel at the atom's own position and over
+    # one a voxel away, where the profile is steepest. Second-order, so the
+    # residual is the quadrature's own: it falls 1.6e-4 -> 4.0e-5 -> 1.0e-5
+    # as m goes 41 -> 81 -> 161, converging on the closed form.
+    m = 121
+    u = (torch.arange(m, dtype=torch.float64) + 0.5) / m * dx - dx / 2
+    for offset, index in (((0.0, 0.0, 0.0), (8, 8, 8)), ((1.0, 0.0, 0.0), (8, 8, 9))):
+        off = torch.tensor(offset, dtype=torch.float64)
+        grid = torch.stack(torch.meshgrid(u, u, u, indexing="ij"), dim=-1) + off
+        r2 = grid.pow(2).sum(-1).reshape(-1, 1)
+        v = (a * (4 * torch.pi / b) ** 1.5 * torch.exp(-4 * torch.pi**2 * r2 / b)).sum(
+            -1
+        )
+        expected = c1 * v.mean().item()
+        assert volume[index].item() == pytest.approx(expected, rel=1e-4)
+
+
+def test_uniform_bfactor_reproduces_the_fourier_envelope():
+    """
+    A uniform B here is the same multiply as `Aberration(bfactor=...)`.
+
+    This is why the argument is per-atom and why applying both double-counts:
+    a Debye-Waller factor multiplies each Gaussian's Fourier amplitude by
+    `exp(-B k^2 / 4)`, exactly what `aberrations._envelopes.b_envelope`
+    applies to the whole transfer function.
+
+    Checked at a fine voxel size on purpose. The identity is continuous, and
+    the discrepancy is sampling of the sharp static potential rather than
+    anything about B: on this structure it falls 14% -> 5.2% -> 1.8% as dx
+    goes 1.0 -> 0.5 -> 0.35 A.
+    """
+    n, dx, B = 48, 0.35, 20.0
+    coords = torch.tensor([[0.0, 0.0, 0.0], [2.4, -1.1, 0.7], [-1.9, 2.2, -0.4]])
+    znum = torch.tensor([8, 6, 7], dtype=torch.long)
+    species = ["O(HH)", "C(HHHC)", "N(HHC)"]
+    kwargs = dict(
+        n_xyz=n,
+        dx=dx,
+        atomic_numbers=znum,
+        parameterization="shtyrov",
+        atom_species=species,
+        progressbars=False,
+    )
+    b_factors = torch.full((3,), B)
+    # One rcut for both, so only the B-factor differs between the volumes.
+    rcut = PotentialBuilder(**kwargs, b_factors=b_factors).rcut
+
+    static = PotentialBuilder(**kwargs, rcut=rcut).forward(coords, method="analytic")
+    damped = PotentialBuilder(**kwargs, rcut=rcut, b_factors=b_factors).forward(
+        coords, method="analytic"
+    )
+
+    k = torch.fft.fftfreq(n, d=dx)
+    k2 = k[:, None, None] ** 2 + k[None, :, None] ** 2 + k[None, None, :] ** 2
+    enveloped = torch.fft.ifftn(torch.fft.fftn(static) * torch.exp(-B * k2 / 4)).real
+
+    rel = (damped - enveloped).abs().max() / damped.abs().max()
+    assert rel < 0.03, f"uniform B differs from the k-space envelope by {rel:.3f}"
+
+
+def test_per_atom_bfactor_damps_atoms_independently():
+    """
+    The one thing an envelope cannot express: spatial variation.
+
+    Two chemically identical atoms given different B-factors must render
+    differently -- a floppy loop blurred more than a rigid core. A uniform
+    envelope applied to the whole volume can only scale both alike.
+    """
+    n, dx = 32, 1.0
+    coords = torch.tensor([[-6.0, 0.0, 0.0], [6.0, 0.0, 0.0]])
+    pb = PotentialBuilder(
+        n,
+        dx,
+        torch.tensor([8, 8], dtype=torch.long),
+        parameterization="shtyrov",
+        atom_species=["O(HH)", "O(HH)"],
+        progressbars=False,
+        b_factors=torch.tensor([0.0, 60.0]),
+    )
+    volume = pb.forward(coords, method="analytic")
+
+    half = n // 2
+    sharp, blurred = volume[:, :, :half], volume[:, :, half:]
+    # Same atom, same total, very different peak.
+    assert sharp.sum().item() == pytest.approx(blurred.sum().item(), rel=5e-3)
+    assert sharp.max() > 3 * blurred.max()
+
+
+@pytest.mark.parametrize(
+    "kwargs, forward_kwargs",
+    [
+        ({"parameterization": "kirkland"}, {"method": "analytic"}),
+        ({"parameterization": "lobato"}, {"method": "analytic"}),
+        ({"parameterization": "shtyrov"}, {"method": "3d"}),
+        ({"parameterization": "shtyrov"}, {"method": "2d"}),
+    ],
+)
+def test_bfactor_is_refused_rather_than_dropped(kwargs, forward_kwargs):
+    """
+    Backends that cannot apply a per-atom B must raise, not ignore it.
+
+    Kirkland and Lobato carry Lorentzian terms, whose convolution with a
+    Gaussian is a Voigt profile with no closed form to voxel-average; the
+    '2d'/'3d' methods share one precomputed kernel per element group, which a
+    per-atom width breaks by construction. Silently dropping the damping
+    would return a perfectly plausible volume at the wrong resolution.
+    """
+    pb = PotentialBuilder(
+        16,
+        1.0,
+        torch.tensor([6, 8], dtype=torch.long),
+        progressbars=False,
+        b_factors=torch.tensor([10.0, 20.0]),
+        **kwargs,
+    )
+    with pytest.raises(NotImplementedError, match="b_factors"):
+        pb.forward(torch.zeros(2, 3), **forward_kwargs)
+
+
+def test_bfactor_rejects_a_mismatched_or_negative_column():
+    """A B-factor list is indexed positionally against the atoms."""
+    znum = torch.tensor([6, 8], dtype=torch.long)
+    with pytest.raises(ValueError, match="entries for"):
+        PotentialBuilder(16, 1.0, znum, progressbars=False, b_factors=torch.zeros(5))
+    with pytest.raises(ValueError, match="non-negative"):
+        PotentialBuilder(
+            16, 1.0, znum, progressbars=False, b_factors=torch.tensor([-1.0, 0.0])
+        )
+
+
+# ---------------------------------------------------------------------------
+# potential_from_deltas backends
+# ---------------------------------------------------------------------------
+
+
+def test_potential_from_deltas_auto_backend_selection():
+    small = torch.zeros(1, 16, 16, 16)
+    assert _deltas_backend(small, torch.zeros(3, 3, 3)) == "conv3d"
+    assert _deltas_backend(small, torch.zeros(4, 4, 4)) == "conv3d"
+    assert _deltas_backend(small, torch.zeros(5, 5, 5)) == "fftconvolve"
+    # a volume too large for the FFT's complex copies (stride-0 expand, no memory)
+    huge = torch.zeros(1).expand(1, 700, 700, 700)
+    assert _deltas_backend(huge, torch.zeros(8, 8, 8)) == "conv3d"
+
+
+@pytest.mark.parametrize("k", [3, 8])
+def test_potential_from_deltas_backends_agree(k):
+    torch.manual_seed(0)
+    deltas = (torch.rand(2, 20, 18, 22) < 0.05).float()
+    kernel = torch.rand(k, k, k)
+    a = potential_from_deltas(deltas, kernel, backend="conv3d")
+    b = potential_from_deltas(deltas, kernel, backend="fftconvolve")
+    c = potential_from_deltas(deltas, kernel, backend="auto")
+    assert torch.allclose(a, b, atol=1e-4, rtol=0)
+    assert torch.equal(c, a if k == 3 else b)
+    assert torch.allclose(a[0], fftconvolve(deltas[0], kernel, mode="same"), atol=1e-4)
+    assert torch.equal(a, spatial_convolve3d_same(deltas, kernel))

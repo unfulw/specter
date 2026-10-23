@@ -1,0 +1,41 @@
+# Canonical default config for `specter build ice`.
+# Any field can be overridden on the command line, e.g.:
+#   specter build ice --config configs/ice.toml --n_configs 16
+
+# Full field docs: docs/user-guide/ice-cache.md.
+
+# This command is expensive by design: each configuration is a full
+# GradientSKIcemaker optimisation, tens of minutes at the geometry below.
+# Specter already ships a library (20 configurations, 256 A cells at 1 A/voxel)
+# in ice_data/ice_cache, which every simulation uses by default -- generate your
+# own only for a different cell size or voxel size, or more independent
+# configurations than the bundled library holds.
+
+[library]
+n_configs = 8
+n = 256            # voxels per side; the cubic cell measures n * dx Angstrom
+dx = 1.0           # A/voxel -- match the pixel size of the simulations this is for
+seed_start = 0     # i-th config uses seed_start + i, and is named after its seed.
+                   # Raise this past an existing library's highest seed to extend
+                   # that library instead of regenerating it.
+
+# A step ceiling, not a step count: a run whose loss plateaus stops early. The
+# recipe itself (S(k) target, ML-BOP weight and its -0.413 eV/atom energy
+# target) is fixed -- those are measured properties of real amorphous ice, and a
+# library mixing recipes would have IceBank drawing from several phases of ice
+# interchangeably.
+[optimisation]
+n_steps = 250
+
+[compute]
+device = "cuda"    # cpu | cuda | cuda:0 | 0,1,2,3 -- naming several GPUs shards the
+                   # library across them, one worker process per device
+
+# Point a simulation config's `ice_cache_dir` at this directory to use the
+# result. Never write into ice_data/ice_cache -- that library ships with the
+# package.
+[output]
+output_dir = "ice"
+overwrite = false      # false skips configs already present, so an interrupted
+                       # run resumes where it left off
+diagnostics = false    # save energy and S(k) figures for the finished library

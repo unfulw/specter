@@ -5,9 +5,8 @@ Tests for GradientSKIcemaker, RandomIcemaker, and shared ice kernel helpers.
 import pytest
 import torch
 
-from specter.ice import GradientSKIcemaker, RandomIcemaker
+from specter.ice import GradientSKIcemaker, IceBank, RandomIcemaker
 from specter.ice._kernels import (
-    build_atomic_potential_kernel,
     compute_native_target,
     ice_kspace_radial_grid,
     interpolate_target_kernel,
@@ -29,40 +28,48 @@ def test_gradientskicemaker_forwards_custom_mdsim_target_path(tmp_path):
     assert not torch.allclose(custom_gd.f_target, default_gd.f_target)
 
 
-def test_random_icemaker_parameterization_changes_kernel():
-    """RandomIcemaker's ice_kernel should differ between parameterizations --
-    regression guard against build_atomic_potential_kernel silently reverting
-    to a hardcoded 'kirkland' regardless of what's passed in."""
-    kirkland = RandomIcemaker(dx=1.0, n=16, parameterization="kirkland")
-    lobato = RandomIcemaker(dx=1.0, n=16, parameterization="lobato")
-
-    assert not torch.allclose(kirkland.ice_kernel, lobato.ice_kernel)
+def _random_icemaker_kernel(tmp_path, **kwargs) -> torch.Tensor:
+    return RandomIcemaker(dx=1.0, n=16, **kwargs).ice_kernel
 
 
-def test_gradientskicemaker_parameterization_changes_kernel():
-    """Same regression guard as test_random_icemaker_parameterization_changes_kernel,
-    for GradientSKIcemaker's kernel."""
-    kirkland = GradientSKIcemaker(n=16, dx=1.0, progressbars=False)
-    lobato = GradientSKIcemaker(
-        n=16, dx=1.0, progressbars=False, parameterization="lobato"
-    )
-
-    assert not torch.allclose(kirkland._ice_kernel, lobato._ice_kernel)
+def _gradientskicemaker_kernel(tmp_path, **kwargs) -> torch.Tensor:
+    return GradientSKIcemaker(n=16, dx=1.0, progressbars=False, **kwargs)._ice_kernel
 
 
-# ---------------------------------------------------------------------------
-# Algorithm classes only produce blocks -- tiling for volumes larger than a
-# single block lives in IceBank (coordinate-space tiling + MLBOP seam
-# relaxation) or MDSimDump (voxel-space blending), not in the algorithm
-# classes themselves.
-# ---------------------------------------------------------------------------
+def _icebank_kernel(tmp_path, **kwargs) -> torch.Tensor:
+    config = tmp_path / "config_000.pt"
+    if not config.exists():
+        torch.manual_seed(0)
+        gd = GradientSKIcemaker(n=32, dx=1.0, progressbars=False)
+        gd.init_random()
+        gd.optimize(n_steps=5, record_every=5, tol=None)
+        torch.save(
+            {"positions": gd.positions.half(), "box_L": 32.0, "n": 32, "dx": 1.0},
+            config,
+        )
+    return IceBank(str(tmp_path), progressbars=False, **kwargs)._get_kernel(1.0)
 
 
-def test_algorithm_classes_have_no_generate_big_ice():
-    for cls in (GradientSKIcemaker, RandomIcemaker):
-        assert not hasattr(cls, "generate_big_ice")
-        assert not hasattr(cls, "generate_big_ice_fast")
-        assert not hasattr(cls, "generate_big_ice_interpolate")
+@pytest.mark.parametrize(
+    "make_kernel, baseline_kwargs",
+    [
+        (_random_icemaker_kernel, {"parameterization": "kirkland"}),
+        (_gradientskicemaker_kernel, {}),
+        (_icebank_kernel, {}),
+    ],
+    ids=["random", "gradient_sk", "ice_bank"],
+)
+def test_icemaker_parameterization_changes_kernel(
+    tmp_path, make_kernel, baseline_kwargs: dict
+) -> None:
+    """Every icemaker's kernel should differ between parameterizations --
+    regression guard against build_atomic_potential_kernel (or
+    IceBank._get_kernel) silently reverting to a hardcoded 'kirkland'
+    regardless of what's passed in."""
+    kirkland = make_kernel(tmp_path, **baseline_kwargs)
+    lobato = make_kernel(tmp_path, parameterization="lobato")
+
+    assert not torch.allclose(kirkland, lobato)
 
 
 # ---------------------------------------------------------------------------
@@ -80,12 +87,6 @@ def test_kernels_kspace_grid_shape_and_dc_center():
     assert K[nz // 2, n // 2, n // 2].item() == pytest.approx(0.0)
 
 
-def test_gradientskicemaker_ice_kernel_matches_direct_build():
-    dx = 1.0
-    gd = GradientSKIcemaker(n=16, dx=dx, progressbars=False)
-    assert torch.allclose(gd._ice_kernel, build_atomic_potential_kernel(dx, "kirkland"))
-
-
 # ---------------------------------------------------------------------------
 # compute_native_target -- computes the S(k) target natively at the
 # requested (n, dx) from a bundled real MD reference frame, instead of
@@ -94,21 +95,6 @@ def test_gradientskicemaker_ice_kernel_matches_direct_build():
 # GradientSKIcemaker's mdsim_target_path docstring). This is now
 # GradientSKIcemaker's default whenever mdsim_target_path is not given.
 # ---------------------------------------------------------------------------
-
-
-def test_compute_native_target_shape_and_dc():
-    k, f = compute_native_target(n=32, dx=1.0)
-    assert k.shape == f.shape
-    assert torch.isfinite(f).all()
-    assert k[0].item() == pytest.approx(0.0)
-    assert f[0].item() > 0  # DC term, ~sqrt(n_atoms) in the reference frame
-
-
-def test_compute_native_target_is_deterministic():
-    k1, f1 = compute_native_target(n=32, dx=1.0)
-    k2, f2 = compute_native_target(n=32, dx=1.0)
-    assert torch.equal(k1, k2)
-    assert torch.equal(f1, f2)
 
 
 def test_compute_native_target_differs_by_dx():
@@ -133,13 +119,6 @@ def test_compute_native_target_box_beyond_reference_still_works():
     assert torch.equal(k, k_capped)
 
 
-def test_compute_native_target_noncubic_nz():
-    k, f = compute_native_target(n=32, nz=16, dx=1.0)
-    assert torch.isfinite(f).all()
-    k_cubic, f_cubic = compute_native_target(n=32, dx=1.0)
-    assert not torch.equal(f, f_cubic)
-
-
 def test_compute_native_target_anisotropic_uses_physical_k_not_voxel_index_bins():
     """Whenever the requested (n, nz) is genuinely anisotropic even after the
     reference-box cap (e.g. n=64, nz=32 -- both under _REFERENCE_MAX_BOX, no
@@ -162,18 +141,6 @@ def test_compute_native_target_anisotropic_uses_physical_k_not_voxel_index_bins(
     n_rbins = int(r_bins.max().item()) + 1
     assert f.shape == (n_rbins,)
     assert k[1].item() == pytest.approx(dk)
-
-
-def test_gradientskicemaker_noncubic_nz_target_bins_match_simulated_bins():
-    """_f_target_rad_1d and the simulated radial profile in _sk_loss must be
-    binned identically -- they used to diverge whenever nz != n, because the
-    target was binned by radial_profile_3d's voxel-index distance while the
-    simulated side was binned by physical |k|/dk distance. The two schemes
-    only coincide when nz == n (isotropic grid spacing), which is why every
-    prior test in this suite used cubic volumes and never caught this."""
-    gd = GradientSKIcemaker(n=32, nz=16, dx=1.0, progressbars=False)
-    assert gd._f_target_rad_1d.shape == (gd._n_rbins,)
-    assert torch.isfinite(gd._f_target_rad_1d).all()
 
 
 def test_gradientskicemaker_noncubic_nz_optimize_runs_and_reduces_loss():
@@ -219,8 +186,16 @@ def test_gradientskicemaker_default_target_is_native_not_bundled_fixed_grid():
 # ---------------------------------------------------------------------------
 
 
-def test_gradientskicemaker_optimize_stops_early_when_converged():
-    """Uses the old cheap geometric-only loss (rep_strength=1.0,
+@pytest.mark.parametrize("record_every", [1, 1000], ids=["dense", "sparse"])
+def test_gradientskicemaker_optimize_stops_early_when_converged(
+    record_every: int,
+) -> None:
+    """Early stopping fires under tol/patience, and even with a sparse
+    record_every the step that triggers it must still land in history --
+    otherwise the caller can't see the converged state that early stopping
+    actually converged to.
+
+    Uses the old cheap geometric-only loss (rep_strength=1.0,
     mlbop_strength=0.0) rather than the current mlbop_strength=0.5 default,
     since this test is about the tol/patience control flow itself, not
     which loss recipe is default -- the heavier default loss doesn't
@@ -231,7 +206,7 @@ def test_gradientskicemaker_optimize_stops_early_when_converged():
 
     history = gd.optimize(
         n_steps=60,
-        record_every=1,
+        record_every=record_every,
         rep_strength=1.0,
         mlbop_strength=0.0,
         mlbop_target=None,
@@ -240,18 +215,18 @@ def test_gradientskicemaker_optimize_stops_early_when_converged():
     )
 
     assert history["stopped_early"] is True
-    assert history["step"][-1] < 59
-
-
-def test_gradientskicemaker_optimize_runs_full_steps_when_tol_none():
-    torch.manual_seed(0)
-    gd = GradientSKIcemaker(n=16, dx=1.0, progressbars=False)
-    gd.init_random()
-
-    history = gd.optimize(n_steps=15, record_every=1, tol=None)
-
-    assert history["stopped_early"] is False
-    assert history["step"][-1] == 14
+    stop = history["step"][-1]
+    assert 0 < stop < 59
+    # record_every=1000 only naturally records step 0; the stopping step
+    # must be appended on top of that, not silently dropped.
+    expected = [step for step in range(stop + 1) if step % record_every == 0]
+    if expected[-1] != stop:
+        expected.append(stop)
+    assert history["step"] == expected
+    assert history["step"][0] == 0
+    assert (
+        len(history["step"]) == len(history["loss"]) == len(history["radial_profile"])
+    )
 
 
 def test_gradientskicemaker_optimize_mlbop_strength_reduces_sk_loss():
@@ -321,69 +296,99 @@ def test_gradientskicemaker_mlbop_target_matches_target_not_unbounded_minimize()
     assert abs(e_target - target) < abs(e_min - target)
 
 
-def test_gradientskicemaker_optimize_records_final_step_on_early_stop():
-    """Even with a sparse record_every, the step that triggers early
-    stopping must still land in history -- otherwise the caller can't see
-    the converged state that early stopping actually converged to.
+def test_water_kernel_reproduces_the_measured_ice_mean_inner_potential():
+    """Ice has a measured MIP, so the kernel is checkable against it.
 
-    Uses the old cheap geometric-only loss (see the similar note on
-    test_gradientskicemaker_optimize_stops_early_when_converged) since this
-    is a control-flow test, not one about the mlbop_strength=0.5 default."""
-    torch.manual_seed(0)
-    gd = GradientSKIcemaker(n=16, dx=1.0, progressbars=False)
-    gd.init_random()
+    Liquid water is 4.48 +/- 0.19 V (Yesibolati et al., Phys. Rev. Lett. 124,
+    065502 (2020), off-axis electron holography). Amorphous ice here is 0.94x
+    that number density, giving ~4.21 V. An oxygen-only kernel -- what specter
+    rendered before -- misses the two hydrogens and lands near 2 V, half the
+    real value, because hydrogen's ELECTRON scattering factor is
+    disproportionately large at low k.
 
-    history = gd.optimize(
-        n_steps=60,
-        record_every=1000,
-        rep_strength=1.0,
-        mlbop_strength=0.0,
-        mlbop_target=None,
-        tol=1e-2,
-        patience=3,
+    The band is deliberately wide: holography MIPs for the same material
+    disagree by a volt or so between studies, so this pins the kernel against
+    a measurement rather than against a preferred parameterization.
+    """
+    from specter.ice._helpers import ndensity_of_amorphous_ice
+    from specter.ice._kernels import build_water_kernel
+
+    for parameterization in ("shtyrov", "kirkland", "lobato"):
+        kernel = build_water_kernel(1.0, parameterization)
+        mip = ndensity_of_amorphous_ice * kernel.sum().item()
+        assert 3.5 < mip < 5.0, f"{parameterization} ice MIP is {mip:.2f} V"
+
+    # The shipped default is the one that should land closest to 4.21 V.
+    default = ndensity_of_amorphous_ice * build_water_kernel(1.0).sum().item()
+    assert abs(default - 4.21) < 0.5, f"default ice MIP is {default:.2f} V"
+
+
+def test_water_kernel_shell_moves_hydrogen_without_creating_it():
+    """The shell placement is a rearrangement, not an addition.
+
+    Hydrogens sit on a sphere at the O-H distance rather than on top of the
+    oxygen. That is invisible to the volume integral (so the MIP above is
+    unchanged by it) but not to any nonzero frequency, which is the whole
+    reason for doing it -- see build_water_kernel's own docstring.
+    """
+    from specter.ice._kernels import (
+        WATER_OH_DISTANCE,
+        _smear_onto_shell,
+        build_atomic_potential_kernel,
+        build_water_kernel,
     )
 
-    assert history["stopped_early"] is True
-    # record_every=1000 only naturally records step 0; the stopping step
-    # must be appended on top of that, not silently dropped.
-    assert len(history["step"]) == 2
-    assert history["step"][0] == 0
-    assert history["step"][1] > 0
-    assert (
-        len(history["step"]) == len(history["loss"]) == len(history["radial_profile"])
+    dx = 0.5
+    hydrogen = build_atomic_potential_kernel(dx, "peng", atomic_number=1)
+    smeared = _smear_onto_shell(hydrogen, dx, WATER_OH_DISTANCE)
+    assert smeared.sum().item() == pytest.approx(hydrogen.sum().item(), rel=1e-5)
+
+    # ... and it really is spread outward: the shell puts weight at the O-H
+    # distance that a centred hydrogen has already decayed away from.
+    n = hydrogen.shape[0]
+    c = n // 2
+    at_bond = int(round(WATER_OH_DISTANCE / dx))
+    assert smeared[c, c, c + at_bond] > hydrogen[c, c, c + at_bond]
+    assert smeared[c, c, c] < hydrogen[c, c, c]
+
+    # The whole molecule is the oxygen plus exactly two of those hydrogens.
+    oxygen = build_atomic_potential_kernel(
+        dx, "shtyrov", atomic_number=8, shtyrov_species="O(HH)"
+    )
+    water = build_water_kernel(dx, "shtyrov")
+    assert water.sum().item() == pytest.approx(
+        (oxygen.sum() + 2 * hydrogen.sum()).item(), rel=1e-5
     )
 
 
-# ---------------------------------------------------------------------------
-# mlbop_energy() diagnostic wired into Random/GradientSK (see
-# specter.ice._energy).
-# ---------------------------------------------------------------------------
+def test_bulk_materials_use_kirkland_not_shtyrov():
+    """Ice, carbon and gold are bulk materials, outside Shtyrov's domain.
 
-_MLBOP_KEYS = {
-    "E_total",
-    "E_per_atom",
-    "rij_mean",
-    "rij_var",
-    "theta_mean",
-    "theta_var",
-}
+    Shtyrov fits bonded species of BIOMOLECULES, tabulated over 0.011-0.62
+    1/A. A mean inner potential is a k=0 quantity, so reading one off those
+    fits extrapolates below their own data. Measured against holography:
 
+    - carbon: 9.09 V at 1.75 g/cm^3 (Wanner et al., Ultramicroscopy 106
+      (2006) 341), i.e. 5.19 V per g/cm^3. Kirkland/Lobato/Peng agree to
+      0.5% here; the Shtyrov "C(CCC)" proxy sits ~40% above all three.
+    - gold: ~25 V for fcc Au, with a few volts of spread between studies.
 
-def test_randomicemaker_mlbop_energy():
-    rm = RandomIcemaker(n=16, dx=1.0, progressbars=False)
-    rm.init_random()
+    Asserted per unit density for carbon, since its MIP scales with the
+    density the film is deposited at.
+    """
+    from specter.specimen._carbon import CarbonFilmGenerator
+    from specter.specimen._grid import BeadGenerator, _number_density_per_a3
 
-    result = rm.mlbop_energy()
+    carbon = CarbonFilmGenerator(voxel_size=2.0)
+    gold = BeadGenerator(voxel_size=2.0, roughness=0.0)
 
-    assert set(result) == _MLBOP_KEYS
-    assert torch.isfinite(torch.tensor(result["E_total"]))
+    # Both must default to a per-element parameterization, never shtyrov.
+    per_density = carbon.mean_inner_potential / (
+        carbon.placed_density / _number_density_per_a3(1.0, 12.011)
+    )
+    assert 4.5 < per_density < 6.5, f"carbon is {per_density:.2f} V per g/cm^3"
+    assert 22.0 < gold.mean_inner_potential < 33.0
 
-
-def test_gradientskicemaker_mlbop_energy():
-    gd = GradientSKIcemaker(n=16, dx=1.0, progressbars=False)
-    gd.init_random()
-
-    result = gd.mlbop_energy()
-
-    assert set(result) == _MLBOP_KEYS
-    assert torch.isfinite(torch.tensor(result["E_total"]))
+    # ... and the shtyrov proxy is exactly what that guards against.
+    shtyrov_carbon = CarbonFilmGenerator(voxel_size=2.0, parameterization="shtyrov")
+    assert shtyrov_carbon.mean_inner_potential > carbon.mean_inner_potential

@@ -6,13 +6,19 @@ import pytest
 import torch
 
 from specter.arrays import soft_voxelize_coordinates
-from specter.ice import GradientSKIcemaker, IceBank, RandomIcemaker
-from specter.ice._bank import (
+from specter.ice import GradientSKIcemaker, IceBank
+from specter.ice import (
     blend_ice_into_volume,
     build_ice_cache,
-    random_rotation_matrix,
+    build_one_ice_config,
+    default_ice_cache_dir,
 )
+from specter.ice._library import decode_positions, encode_positions
+from specter.ice import ice_config_filename
+from specter.rotations import random_rotation_matrix_from_generator
 from specter.ice._helpers import ndensity_of_amorphous_ice
+import math
+from specter.potential import potential_occupancy
 
 
 def _make_cache_config(tmp_path, name, n, dx, seed=0, n_steps=5):
@@ -29,9 +35,11 @@ def _make_cache_config(tmp_path, name, n, dx, seed=0, n_steps=5):
     return path
 
 
-def test_random_rotation_matrix_is_proper_rotation():
-    torch.manual_seed(0)
-    R = random_rotation_matrix()
+def test_random_rotation_matrix_from_generator_is_proper_and_reproducible():
+    g = torch.Generator().manual_seed(0)
+    R = random_rotation_matrix_from_generator(g)
+    g2 = torch.Generator().manual_seed(0)
+    assert torch.equal(R, random_rotation_matrix_from_generator(g2))
     assert R.shape == (3, 3)
     assert torch.allclose(R @ R.T, torch.eye(3), atol=1e-5)
     assert torch.det(R).item() == pytest.approx(1.0, abs=1e-5)
@@ -42,41 +50,22 @@ def test_icebank_raises_on_empty_dir(tmp_path):
         IceBank(str(tmp_path))
 
 
-def test_icebank_basic_extraction_shape_and_finite(tmp_path):
+@pytest.mark.parametrize(
+    "n, nz, batchsize, expected_shape",
+    [(16, None, 3, (3, 16, 16, 16)), (16, 8, 1, (1, 8, 16, 16))],
+    ids=["cubic_batched", "noncubic"],
+)
+def test_icebank_extraction_shape_and_finite(
+    tmp_path, n: int, nz: int | None, batchsize: int, expected_shape: tuple
+) -> None:
     _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
     cache = IceBank(str(tmp_path), progressbars=False)
     assert len(cache) == 1
 
     torch.manual_seed(1)
-    ice = cache.generate_ice(n=16, dx=1.0, batchsize=3)
-    assert ice.shape == (3, 16, 16, 16)
+    ice = cache.generate_ice(n=n, nz=nz, dx=1.0, batchsize=batchsize)
+    assert ice.shape == expected_shape
     assert torch.isfinite(ice).all()
-
-
-def test_icebank_parameterization_changes_kernel(tmp_path):
-    """Regression guard: IceBank._get_kernel should honor `parameterization`,
-    not silently fall back to a hardcoded 'kirkland'."""
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    kirkland = IceBank(str(tmp_path), progressbars=False)
-    lobato = IceBank(str(tmp_path), progressbars=False, parameterization="lobato")
-
-    assert not torch.allclose(kirkland._get_kernel(1.0), lobato._get_kernel(1.0))
-
-
-def test_icebank_generate_ice_deltas_shape(tmp_path):
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    cache = IceBank(str(tmp_path), progressbars=False)
-
-    deltas = cache.generate_ice_deltas(n=16, dx=1.0, batchsize=2)
-    assert deltas.shape == (2, 16, 16, 16)
-
-
-def test_icebank_noncubic_request(tmp_path):
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    cache = IceBank(str(tmp_path), progressbars=False)
-
-    ice = cache.generate_ice(n=16, nz=8, dx=1.0, batchsize=1)
-    assert ice.shape == (1, 8, 16, 16)
 
 
 def test_icebank_raises_for_oversized_request(tmp_path):
@@ -89,8 +78,7 @@ def test_icebank_raises_for_oversized_request(tmp_path):
 
 def test_icebank_mlbop_energy_matches_source_quality(tmp_path):
     """A crop's local structure should be inherited from its source, not
-    degraded by the extraction itself -- same story validated at production
-    scale in dev/ice/seam_relax_256_*.py (crop vs source E_per_atom differ
+    degraded by the extraction itself (crop vs source E_per_atom differ
     only by a gentle edge-truncation effect)."""
     torch.manual_seed(42)
     gd = GradientSKIcemaker(n=32, dx=1.0, progressbars=False)
@@ -195,15 +183,24 @@ def test_icebank_deterministic_filtering_with_mixed_config_sizes(tmp_path):
         assert ice.shape == (1, 24, 24, 24)
 
 
-def test_icebank_generate_big_ice_shape_and_finite(tmp_path):
+@pytest.mark.parametrize(
+    "n, relax_steps, seed",
+    [(64, 20, 1), (32, 10, 0)],
+    ids=["tiled_2x2x2", "single_tile"],
+)
+def test_icebank_generate_big_ice_shape_and_finite(
+    tmp_path, n: int, relax_steps: int, seed: int
+) -> None:
     """A request larger than the single cached config (32^3) must tile
-    (here 2x2x2 of 32A tiles -> 64^3) rather than raise."""
+    (here 2x2x2 of 32A tiles -> 64^3) rather than raise; the degenerate
+    case, a 'big' request that only needs a 1x1x1 tile grid (no seams at
+    all), should still work without error."""
     _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
     cache = IceBank(str(tmp_path), progressbars=False)
 
-    torch.manual_seed(1)
-    ice = cache.generate_big_ice(n=64, dx=1.0, batchsize=1, relax_steps=20)
-    assert ice.shape == (1, 64, 64, 64)
+    torch.manual_seed(seed)
+    ice = cache.generate_big_ice(n=n, dx=1.0, batchsize=1, relax_steps=relax_steps)
+    assert ice.shape == (1, n, n, n)
     assert torch.isfinite(ice).all()
 
 
@@ -218,30 +215,21 @@ def test_icebank_generate_big_ice_deltas_noncubic_and_batched(tmp_path):
     assert deltas.shape == (2, 48, 64, 64)
 
 
-def test_icebank_generate_big_ice_deltas_streamed_splat_matches_monolithic(tmp_path):
+@pytest.mark.parametrize(
+    "n, seed", [(64, 9), (48, 11)], ids=["exact_multiple", "overflow"]
+)
+def test_icebank_generate_big_ice_deltas_streamed_splat_matches_monolithic(
+    tmp_path, n: int, seed: int
+) -> None:
     """When relax_steps=0, generate_big_ice_deltas splats each tile into
     the output volume as soon as it's drawn (bounding peak memory to a
     single tile's atom count) instead of gathering every tile's atoms into
     one tensor before voxelizing. Splatting is linear/accumulating, so the
     streamed result must exactly match voxelizing the same (post-`keep`)
-    positions in one monolithic call."""
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    cache = IceBank(str(tmp_path), progressbars=False)
+    positions in one monolithic call.
 
-    torch.manual_seed(9)
-    streamed = cache.generate_big_ice_deltas(n=64, dx=1.0, batchsize=1, relax_steps=0)
-    reference = soft_voxelize_coordinates(
-        cache.positions, grid_shape=(64, 64, 64), voxel_size=1.0, periodic=True
-    )
-    assert torch.allclose(streamed[0], reference, atol=1e-5)
-
-
-def test_icebank_generate_big_ice_streamed_splat_matches_trimmed_monolithic_with_overflow(
-    tmp_path,
-):
-    """Same invariant as the test above, but at a request size (48, with a
-    32 A tile) that is NOT an exact multiple of the tile size -- unlike
-    n=64 above, every edge tile's own footprint here genuinely overhangs
+    The `overflow` case (48, with a 32 A tile) is NOT an exact multiple of
+    the tile size, so every edge tile's own footprint genuinely overhangs
     the true requested box, exercising the per-tile overflow-discard fix
     in _place_tiles (a prior version of this splat call used an
     unconditional periodic wrap that pulled far-outside overflow atoms
@@ -251,10 +239,10 @@ def test_icebank_generate_big_ice_streamed_splat_matches_trimmed_monolithic_with
     _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
     cache = IceBank(str(tmp_path), progressbars=False)
 
-    torch.manual_seed(11)
-    streamed = cache.generate_big_ice_deltas(n=48, dx=1.0, batchsize=1, relax_steps=0)
+    torch.manual_seed(seed)
+    streamed = cache.generate_big_ice_deltas(n=n, dx=1.0, batchsize=1, relax_steps=0)
     reference = soft_voxelize_coordinates(
-        cache.positions, grid_shape=(48, 48, 48), voxel_size=1.0, periodic=True
+        cache.positions, grid_shape=(n, n, n), voxel_size=1.0, periodic=True
     )
     assert torch.allclose(streamed[0], reference, atol=1e-5)
 
@@ -267,9 +255,8 @@ def test_icebank_generate_big_ice_deltas_request_smaller_than_tile_matches_densi
     for a 24 A request) used to have its single tile's full-box atom set
     wrapped almost entirely into the small destination grid via an
     unconditional periodic index wrap in _place_tiles, inflating density
-    by roughly (tile / request)^3 -- ~(64/24)^3 ~= 19x was observed before
-    the fix, for a smaller-scale repro of the ~5.6x measured at production
-    scale in dev/ice/analytic_tile_insertion_benchmark.py. Splatted mass
+    by roughly (tile / request)^3 -- ~(64/24)^3 ~= 19x here, ~5.6x at
+    production scale. Splatted mass
     (deltas.sum()) approximates atom count for a trilinear splat, so this
     checks it against the expected bulk-water atom count directly."""
     torch.manual_seed(5)
@@ -291,9 +278,8 @@ def test_icebank_generate_big_ice_deltas_request_smaller_than_tile_matches_densi
 
 def test_icebank_generate_big_ice_relaxation_improves_energy(tmp_path):
     """The core value proposition: naive tile concatenation (relax_steps=0)
-    should be measurably worse than the same tiling with seam relaxation
-    -- same story as dev/ice/seam_relax_256_assemble.py's naive-vs-relaxed
-    comparison, just at a much smaller/faster scale for a unit test."""
+    should be measurably worse than the same tiling with seam relaxation,
+    at a small, fast scale."""
     _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0, n_steps=10)
     cache = IceBank(str(tmp_path), progressbars=False)
 
@@ -311,30 +297,22 @@ def test_icebank_generate_big_ice_relaxation_improves_energy(tmp_path):
     )
 
 
-def test_icebank_generate_big_ice_request_fitting_single_tile(tmp_path):
-    """Degenerate case: a 'big' request that only needs a 1x1x1 tile grid
-    (no seams at all) should still work without error."""
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    cache = IceBank(str(tmp_path), progressbars=False)
+def test_build_ice_cache_names_configs_by_seed(tmp_path):
+    """Cache entries are named after the seed that generated them, not their
+    position in the batch, so a second run at a higher seed_start EXTENDS a
+    library instead of overwriting the first run's configs.
 
-    torch.manual_seed(0)
-    ice = cache.generate_big_ice(n=32, dx=1.0, batchsize=1, relax_steps=10)
-    assert ice.shape == (1, 32, 32, 32)
-    assert torch.isfinite(ice).all()
-
-
-def test_build_ice_cache_writes_loadable_configs(tmp_path):
-    """Smoke test: build_ice_cache() is a slower, single-process alternative
-    to dev/ice/generate_ice_cache_worker.py (see its own docstring) for
-    generating cache entries -- check its output round-trips through
-    IceBank at a tiny, fast scale, not that it converges well."""
+    Also a smoke test that build_ice_cache() -- a slower, single-process
+    alternative to `specter build ice` (see its own docstring) -- writes
+    entries that round-trip through IceBank at a tiny, fast scale, not that
+    it converges well."""
     torch.manual_seed(0)
     build_ice_cache(
         str(tmp_path),
-        num_configs=2,
+        n_configs=2,
         n=8,
         dx=1.0,
-        n_steps=3,
+        n_steps=2,
         device="cpu",
         seed_start=0,
         progressbars=False,
@@ -351,145 +329,394 @@ def test_build_ice_cache_writes_loadable_configs(tmp_path):
     assert ice.shape == (1, 8, 8, 8)
     assert torch.isfinite(ice).all()
 
+    build_ice_cache(
+        str(tmp_path),
+        n_configs=2,
+        n=8,
+        n_steps=2,
+        device="cpu",
+        seed_start=2,
+        progressbars=False,
+    )
 
-def test_blend_ice_into_volume_random_icemaker_noncubic_nxy_nz():
-    """
-    blend_ice_into_volume's docstring states that a RandomIcemaker's own
-    fixed (n, dx, nz) "must already match V" -- it has no tiling support,
-    unlike IceBank. Regression test for a real bug found in
-    demo-scripts/generate_micrograph.py and the matching notebook: both
-    constructed RandomIcemaker with n=config.num_pixels (the separate,
-    usually much smaller, particle-potential resolution) instead of
-    n=config.micrograph_size, and relied on RandomIcemaker's nz defaulting
-    to n (a cube) instead of the actual, generally much smaller nz derived
-    from ice_thickness -- causing a broadcasting RuntimeError (and, once
-    n was fixed but nz still defaulted to a cube, a large spurious CUDA
-    OOM from allocating a needlessly cubic ice volume). This test builds
-    V and the RandomIcemaker with genuinely different, non-cube (nz, nxy)
-    to guard against a similar mismatch being reintroduced.
-    """
-    nz, nxy = 6, 16
-    V = torch.zeros(1, nz, nxy, nxy)
-    icemaker = RandomIcemaker(dx=1.0, n=nxy, nz=nz, progressbars=False)
-
-    result = blend_ice_into_volume(V, icemaker, pixel_size=1.0)
-    assert result.shape == (1, nz, nxy, nxy)
-    assert torch.isfinite(result).all()
+    assert sorted(p.name for p in tmp_path.glob("*.pt")) == [
+        ice_config_filename(seed) for seed in range(4)
+    ]
+    assert len(IceBank(str(tmp_path), progressbars=False)) == 4
 
 
-def test_insert_analytic_ice_leaves_occupied_region_untouched(tmp_path):
-    """The whole point of insert_analytic_ice: pre-existing (occupied)
-    voxels must be exactly preserved, both because they fail the
-    per-voxel mask test and because a coarse-fully-occupied tile is
-    skipped before any ice is even drawn for it."""
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
+def test_fixed_point_encoding_round_trips_within_half_a_grid_step():
+    """encode/decode_positions must be accurate to half the grid spacing, and
+    that spacing must be uniform across the box -- the whole point of
+    fixed-point over float16, whose precision degrades with distance from the
+    origin (0.0625 A across the outer octave of a 256 A cell)."""
+    box_L = 256.0
+    torch.manual_seed(0)
+    pos = (torch.rand(200_000, 3) - 0.5) * box_L
+
+    decoded = decode_positions(encode_positions(pos, box_L), box_L)
+    spacing = box_L / 2 / 32767
+    err = (decoded - pos).abs()
+    assert err.max() <= spacing / 2 * 1.001  # allow float32 decode rounding
+    assert decoded.dtype == torch.float32
+
+    # Uniform, not magnitude-dependent: the worst error near the box face is
+    # no worse than near the centre. float16 fails this by ~8x.
+    r = pos.abs().max(dim=1).values
+    inner = err[r < box_L / 8].max()
+    outer = err[r > box_L / 2 * 0.9].max()
+    assert outer <= inner * 1.5, f"inner {inner:.2e} vs outer {outer:.2e}"
+
+    # And it beats raw float16 storage, the format it replaced.
+    f16_err = (pos.half().float() - pos).abs().max()
+    assert err.max() < f16_err / 8
+
+
+def test_icebank_reads_both_coordinate_encodings(tmp_path):
+    """A cache directory may hold configs written before the fixed-point
+    encoding existed (the bundled ice-data/ice_cache) alongside newer ones.
+    IceBank must serve both, keyed on `coord_encoding` rather than dtype."""
+    n, dx = 8, 1.0
+    torch.manual_seed(0)
+    gd = GradientSKIcemaker(n=n, dx=dx, progressbars=False)
+    gd.init_random()
+    gd.optimize(n_steps=2, record_every=2, tol=None)
+    pos, box_L = gd.positions, n * dx
+
+    # Old format: raw float16, no coord_encoding key.
+    torch.save(
+        {"positions": pos.half(), "box_L": box_L, "n": n, "dx": dx},
+        tmp_path / "config_000.pt",
+    )
+    # New format: fixed-point indices, tagged.
+    torch.save(
+        {
+            "positions": encode_positions(pos, box_L),
+            "box_L": box_L,
+            "n": n,
+            "dx": dx,
+            "coord_encoding": "int16_fixed",
+        },
+        tmp_path / "config_001.pt",
+    )
+
     cache = IceBank(str(tmp_path), progressbars=False)
+    assert len(cache) == 2
+    for config in cache._configs:
+        assert config["positions"].dtype == torch.float32
+        assert config["positions"].abs().max() <= box_L / 2 * 1.001
+    # The fixed-point entry decodes closer to the original than the float16 one.
+    err_f16 = (cache._configs[0]["positions"] - pos).abs().max()
+    err_fixed = (cache._configs[1]["positions"] - pos).abs().max()
+    assert err_fixed < err_f16
 
-    volume = torch.zeros(20, 24, 24)
-    volume[4:16, 4:20, 4:20] = 5.0
-    occupied = volume.clone()
+    assert cache.generate_ice(n=n, dx=dx, batchsize=1).shape == (1, n, n, n)
+
+
+def test_build_one_ice_config_writes_fixed_point_coordinates(tmp_path):
+    """Newly generated configs use the fixed-point encoding and say so, so
+    _load_config doesn't have to guess."""
+    path = tmp_path / "config_000.pt"
+    build_one_ice_config(
+        str(path), n=8, dx=1.0, n_steps=2, device="cpu", progressbars=False
+    )
+
+    raw = torch.load(path, weights_only=False)
+    assert raw["positions"].dtype == torch.int16
+    assert raw["coord_encoding"] == "int16_fixed"
+    # Timing metadata is recorded for cost estimation, under the same keys the
+    # bundled library uses.
+    assert raw["wall_time"] > 0
+    assert raw["n_steps_actual"] == 2
+
+
+def test_bundled_ice_data_resolves_inside_the_package():
+    """The bundled cache and MD reference data must be found through the
+    import system, not by walking up from __file__ to a repository root.
+
+    Regression guard for a real packaging bug: the data used to live at
+    `<repo>/ice-data/` and be located as dirname(dirname(dirname(__file__))),
+    which resolves to the repo root only for an editable install from a
+    checkout. Installed as a wheel it pointed inside the virtualenv's lib/,
+    so `ice_model="gd"` AND GradientSKIcemaker's default S(k) target were
+    both unreachable."""
+    from pathlib import Path
+
+    import specter
+    from specter.ice_data import bundled_ice_data
+
+    package_root = Path(specter.__file__).parent
+
+    cache = Path(default_ice_cache_dir())
+    assert cache.is_dir()
+    assert package_root in cache.parents, (
+        f"{cache} is outside the installed package at {package_root} -- it will "
+        "not be found in a wheel install"
+    )
+    assert sorted(cache.glob("*.pt")), "bundled cache has no configs"
+
+    # Every file GradientSKIcemaker needs by default, likewise inside the package.
+    for name in (
+        "lda_80k_frame799_full_coords.pt",
+        "mdsim_f_radial_avg_400x400x400_0.25A.pt",
+    ):
+        path = bundled_ice_data(name)
+        assert path.is_file(), f"{name} missing from specter.ice_data"
+        assert package_root in path.parents
+
+
+def test_built_wheel_contains_bundled_scientific_data(tmp_path):
+    """Check the distributable itself, regardless of how its data globs are written."""
+    import shutil
+    import subprocess
+    import sys
+    import zipfile
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    for name in ("pyproject.toml", "README.md"):
+        shutil.copy2(repo / name, checkout / name)
+    shutil.copytree(
+        repo / "src",
+        checkout / "src",
+        ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"),
+    )
+    built = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from setuptools.build_meta import build_wheel; build_wheel('dist')",
+        ],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+    )
+    assert built.returncode == 0, built.stdout + built.stderr
+    wheels = list((checkout / "dist").glob("*.whl"))
+    assert len(wheels) == 1
+
+    package = repo / "src" / "specter"
+    required = {
+        "specter/" + str(path.relative_to(package))
+        for pattern in (
+            "atom_data/*.txt",
+            "atom_data/*.json",
+            "ice_data/*.pt",
+            "ice_data/ice_cache/*.pt",
+            "ice_data/ice_cache/manifest.json",
+        )
+        for path in package.glob(pattern)
+    }
+    assert "specter/atom_data/params_cat.json" in required
+    assert "specter/ice_data/ice_cache/manifest.json" in required
+    with zipfile.ZipFile(wheels[0]) as wheel:
+        missing = required - set(wheel.namelist())
+    assert not missing, f"Scientific data missing from wheel: {sorted(missing)}"
+
+
+def _blend_reference(V, icemaker, pixel_size):
+    """
+    The whole-volume blend expression, verbatim.
+
+    `V + ice * (1 - potential_occupancy(V))` holds five tensors the size of
+    the whole canvas at once -- V, ice, the weight, the product and the sum.
+    At `micrograph_size` that is 5 x 33.6 GB, and it was most of why a
+    4096-pixel micrograph peaked at 237 GB of RSS. The shipped version
+    weights and multiplies one z-slab at a time and accumulates in place;
+    this asserts the two agree.
+    """
+    from specter.potential import potential_occupancy
+
+    ice = icemaker.generate_ice(batchsize=V.shape[0]).to(V.device)
+    return V + ice * (1.0 - potential_occupancy(V, pixel_size)).clamp(0.0, 1.0)
+
+
+@pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.parametrize("nz,n", [(16, 24), (17, 24), (33, 16)])
+def test_blend_ice_slabwise_matches_whole_volume_expression(nz, n, inplace):
+    """
+    Slab-wise in-place blending reproduces the whole-volume expression.
+
+    This is now also the test of the blur's HALO. The occupancy estimator
+    coarse-grains over 2 A, so it reads past whatever slab it is handed;
+    the shipped loop widens each slab by the kernel's reach and discards
+    the margin. Drop that and every chunk boundary becomes an edge the
+    blur sees, which prints into the ice as a seam -- and shows up here as
+    a mismatch against the unchunked expression.
+
+    Non-dividing `nz` is covered because the slab loop's last chunk is
+    short, and because the first and last slabs are the ones whose halo is
+    truncated by the volume itself.
+
+    The non-cubic (nz != n) cases also pin that a RandomIcemaker's fixed
+    (n, dx, nz) must match V exactly (it has no tiling support): the
+    micrograph pipeline once built its RandomIcemaker with the particle
+    resolution instead of `micrograph_size` and a cubic default nz instead
+    of the ice-thickness nz, giving a broadcasting RuntimeError and, once n
+    was fixed, a spurious CUDA OOM from a needlessly cubic ice volume.
+    """
+    from specter.ice import RandomIcemaker
+    from specter.ice import blend_ice_into_volume
 
     torch.manual_seed(0)
-    out = cache.insert_analytic_ice(volume, dx=1.0, tile_extent=12.0, rcut=3.0)
-
-    assert out is volume  # modified (and returned) in place
-    assert torch.equal(out[4:16, 4:20, 4:20], occupied[4:16, 4:20, 4:20])
-
-
-def test_insert_analytic_ice_fills_free_region_at_expected_density(tmp_path):
-    """Free voxels should pick up a nonzero, finite potential whose overall
-    density is in the right ballpark for bulk amorphous ice -- same
-    expected-density check style as the crop-atom-count regression tests
-    above, just carried through to the final analytically-evaluated
-    potential rather than a raw atom count."""
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    cache = IceBank(str(tmp_path), progressbars=False)
-
-    volume = torch.zeros(20, 24, 24)
-    # blend_ice_into_volume's masking convention is `V < threshold * V.max()`
-    # -- an all-zero V has V.max() == 0, so nothing is ever "below threshold"
-    # and no ice would ever be added, matching the existing convolve path's
-    # own behaviour on an all-zero V. A single high "occupied" corner voxel
-    # establishes a realistic V.max() (as any real specimen volume already
-    # has, from particle/crowding density) without meaningfully shrinking
-    # the free region under test.
-    volume[0, 0, 0] = 10.0
-    free_mask = volume == 0
-
+    maker = RandomIcemaker(n=n, dx=2.0, nz=nz)
     torch.manual_seed(1)
-    out = cache.insert_analytic_ice(volume, dx=1.0, tile_extent=12.0, rcut=3.0)
+    V0 = torch.rand(1, nz, n, n) * 3.0
 
-    assert torch.isfinite(out).all()
-    assert (out[free_mask] > 0).all()
-    # A lone oxygen atom's own peak potential is a fixed, dx-independent
-    # physical quantity (~11-12 V at dx=1 Å per the Kirkland kernel/analytic
-    # cross-check used to validate this feature) -- bulk water's per-voxel
-    # mean should sit well under that (heavily overlapping, partially
-    # cancelling neighbor tails), and well above zero.
-    assert 0.5 < out[free_mask].mean().item() < 11.0
+    torch.manual_seed(7)
+    want = _blend_reference(V0.clone(), maker, 2.0)
 
+    torch.manual_seed(7)
+    V = V0.clone()
+    got = blend_ice_into_volume(V, maker, 2.0, inplace=inplace)
 
-def test_insert_analytic_ice_skips_fully_occupied_volume(tmp_path):
-    """A volume that's already fully occupied (coarse mask all-full) must
-    come back completely unmodified -- every tile gets skipped before any
-    crop is drawn."""
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    cache = IceBank(str(tmp_path), progressbars=False)
-
-    volume = torch.full((20, 24, 24), 5.0)
-    original = volume.clone()
-
-    torch.manual_seed(2)
-    out = cache.insert_analytic_ice(volume, dx=1.0, tile_extent=12.0, rcut=3.0)
-    assert torch.equal(out, original)
+    # Not bit-exact: a separable conv over a slab-plus-halo and over the
+    # whole volume are the same function but not the same kernel launch.
+    torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+    if inplace:
+        assert got.data_ptr() == V.data_ptr(), "inplace must write through to V"
+    else:
+        assert torch.equal(V, V0), "inplace=False must leave the input untouched"
 
 
-@pytest.mark.parametrize("parameterization", ["kirkland", "lobato", "shtyrov"])
-def test_insert_analytic_ice_every_parameterization(tmp_path, parameterization):
-    """Smoke test: every parameterization IceBank supports for the
-    splat/convolve kernel must also work through the analytic dispatch in
-    _ice_analytic_potential."""
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    cache = IceBank(
-        str(tmp_path), parameterization=parameterization, progressbars=False
+# ---------------------------------------------------------------------------
+# device placement and slab-wise blending
+# ---------------------------------------------------------------------------
+
+
+def test_ice_bank_crop_stays_on_bank_device():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    bank = IceBank().to(device)
+    torch.manual_seed(0)
+    ice = bank.generate_ice(n=24, dx=1.0, nz=24)
+    assert ice.device.type == device
+    assert bank.positions is not None and bank.positions.device.type == device
+    assert math.isfinite(bank.mlbop_energy()["E_per_atom"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a device for the host-canvas path"
+)
+def test_host_volume_blend_matches_whole_canvas_blend():
+    """
+    A host-resident volume blended slab by slab on the device equals the
+    whole-canvas blend of the same draws, to float noise, including at the
+    z ends where the slab path wraps its context.
+    """
+    dev = torch.device("cuda")
+    n, nz, dx = 96, 70, 1.0
+    bank = IceBank(device=dev, progressbars=False)
+    V0 = torch.zeros(1, nz, n, n)
+    g = torch.Generator().manual_seed(1)
+    for _ in range(8):
+        c = (torch.rand(3, generator=g) * torch.tensor([nz, n, n])).long()
+        zs, ys, xs = [slice(max(0, int(ci) - 8), int(ci) + 8) for ci in c]
+        V0[0, zs, ys, xs] += 10.0
+
+    # Reference: the whole-canvas path, forced by putting V on the device.
+    gen = torch.Generator().manual_seed(7)
+    ice = bank.generate_big_ice(
+        n=n, dx=dx, nz=nz, batchsize=1, device=dev, generator=gen
     )
+    ref = V0.to(dev) + ice * (1 - potential_occupancy(V0.to(dev), dx)).clamp(0, 1)
 
-    volume = torch.zeros(16, 16, 16)
-    volume[0, 0, 0] = 10.0  # establish a realistic V.max() > 0 -- see note above
-    torch.manual_seed(3)
-    out = cache.insert_analytic_ice(volume, dx=1.0, tile_extent=10.0, rcut=3.0)
-    assert torch.isfinite(out).all()
-    assert (out > 0).any()
+    # Slab path: V on the host, bank on the device, same draws, and a slab
+    # small enough that the volume spans several.
+    from specter.ice import _blend as blend_mod
+
+    torch.manual_seed(0)
+    new = V0.clone()
+    gen2 = torch.Generator().manual_seed(7)
+    real = bank.big_ice_positions
+
+    def seeded_positions(*a, **kw):
+        kw["generator"] = gen2
+        return real(*a, **kw)
+
+    bank.big_ice_positions = seeded_positions  # type: ignore[method-assign]
+    blend_mod._blend_ice_slabwise(new, bank, dx, slab_voxels=n * n * 16)
+    assert new.device.type == "cpu"
+    diff = new.to(dev) - ref
+    assert float(diff.abs().max()) < 1e-3 * float(ice.abs().max())
+    # Plane means agree at both z ends (the wrapped context).
+    pm = (new.to(dev) - ref).mean(dim=(0, 2, 3))
+    assert float(pm.abs().max()) < 1e-4 * float(ice.mean())
+
+    # And the public entry point routes a host V to this path.
+    bank.big_ice_positions = real  # type: ignore[method-assign]
+    out = blend_ice_into_volume(V0.clone(), bank, dx, inplace=True)
+    assert out.device.type == "cpu"
+    assert float((out - V0).mean()) == pytest.approx(float(ice.mean()), rel=0.05)
 
 
-def test_blend_ice_into_volume_method_analytic_matches_direct_call(tmp_path):
-    """blend_ice_into_volume(method='analytic') should be a thin wrapper
-    around IceBank.insert_analytic_ice on V[0] -- same result, batch dim
-    added back."""
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    cache = IceBank(str(tmp_path), progressbars=False)
+@pytest.mark.parametrize("chunk", [3, 7, 64])
+def test_ice_slab_blender_matches_whole_volume_blend(chunk):
+    """Slab by slab, in any slab size, equals the one-shot rule
+    ``V + ice * clamp(1 - occupancy(V), 0, 1)``."""
+    torch.manual_seed(0)
+    nz, n = 40, 24
+    V = torch.zeros(1, nz, n, n)
+    V[0, 10:20, 5:15, 5:15] = 9.0
+    ice = torch.rand(1, nz, n, n) * 4
+    whole = V + ice * (1 - potential_occupancy(V, 1.0)).clamp(0, 1)
 
-    volume = torch.zeros(1, 16, 16, 16)
-    torch.manual_seed(4)
-    result = blend_ice_into_volume(
-        volume.clone(), cache, pixel_size=1.0, method="analytic"
+    from specter.ice._blend import IceSlabBlender
+
+    out = V.clone()
+    blender = IceSlabBlender(1.0)
+    for start in range(0, nz, chunk):
+        end = min(start + chunk, nz)
+        blender.add(out, ice[:, start:end].clone(), start, end)
+    assert torch.allclose(out, whole, rtol=1e-5, atol=1e-6)
+
+
+def test_slab_atoms_returns_empty_for_a_slab_with_no_molecules() -> None:
+    """
+    A slab whose buckets hold no molecule must yield an empty (0, 3) tensor
+    rather than failing on ``torch.cat([])``; the populated slab is unchanged.
+    """
+    import numpy as np
+
+    from specter.ice._blend import _slab_atoms
+
+    nz, dx, chunk = 40, 1.0, 10
+    # Two molecules, both in the first bucket (voxel z 1 and 2).
+    pos = torch.tensor([[0.0, 0.0, -19.0], [1.0, 1.0, -18.0]], dtype=torch.float64)
+    offsets = np.array([0, 2, 2, 2, 2])
+    empty = _slab_atoms(pos, offsets, chunk, nz, dx, 20, 30, "cpu")
+    assert empty.shape == (0, 3) and empty.dtype == torch.float64
+    full = _slab_atoms(pos, offsets, chunk, nz, dx, 0, 10, "cpu")
+    assert full.shape == (2, 3)
+
+
+def test_bundled_library_renders_ice_at_the_package_ice_density() -> None:
+    """
+    The bundled library is built at `density_of_amorphous_ice`, the density
+    the aperture cross section and the documented mean inner potential
+    assume, and its rendered Kirkland ice has the documented mean potential:
+    within 1.5% of the continuum integral ``n * c1 * (f_O(0) + 2 f_H(0))``,
+    4.59 V, the sampled kernel holding 0.992-0.998 of it.
+    """
+    from specter.atom._atomic_potentials import kirkland_atomic_potential_3d_fourier
+    from specter.constants import bohr_radius, electron_charge_volt_angstrom
+
+    bank = IceBank(progressbars=False)
+    for config in bank._configs:
+        density = config["positions"].shape[0] / float(config["box_L"]) ** 3
+        assert density == pytest.approx(ndensity_of_amorphous_ice, rel=1e-4)
+
+    k0 = torch.zeros(1, 1, 1)
+    f0 = sum(
+        count * float(kirkland_atomic_potential_3d_fourier(z, k0).reshape(-1)[0])
+        for z, count in ((8, 1), (1, 2))
     )
+    c1 = 2 * math.pi * bohr_radius() * electron_charge_volt_angstrom()
+    continuum = ndensity_of_amorphous_ice * c1 * f0
+    assert continuum == pytest.approx(4.587, abs=0.002)
 
-    cache2 = IceBank(str(tmp_path), progressbars=False)
-    torch.manual_seed(4)
-    expected = cache2.insert_analytic_ice(volume[0].clone(), dx=1.0)
-
-    assert result.shape == (1, 16, 16, 16)
-    assert torch.equal(result[0], expected)
-
-
-def test_blend_ice_into_volume_method_analytic_rejects_batch(tmp_path):
-    """method='analytic' only supports a single-sample V -- documented,
-    explicit ValueError rather than silently only blending the first
-    sample."""
-    _make_cache_config(tmp_path, "config_000.pt", n=32, dx=1.0)
-    cache = IceBank(str(tmp_path), progressbars=False)
-
-    volume = torch.zeros(2, 16, 16, 16)
-    with pytest.raises(ValueError):
-        blend_ice_into_volume(volume, cache, pixel_size=1.0, method="analytic")
+    ice = bank.generate_ice(
+        n=96, dx=1.0, batchsize=4, generator=torch.Generator().manual_seed(0)
+    )
+    assert float(ice.double().mean()) == pytest.approx(continuum, rel=0.015)

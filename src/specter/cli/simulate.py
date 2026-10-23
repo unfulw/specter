@@ -5,27 +5,45 @@ from __future__ import annotations
 import rich_click as click
 
 from specter.config import (
+    MICROGRAPH_HELP,
     PARTICLE_STACK_HELP,
     TILT_SERIES_HELP,
+    MicrographConfig,
     ParticleStackConfig,
     TiltSeriesConfig,
-    apply_overrides,
-    load_config,
+    TomogramConfig,
 )
 
-from ._click_options import build_config_options, collect_overrides
-
-CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
+from ._click_options import (
+    CONTEXT_SETTINGS,
+    build_config_command,
+    load_cli_config,
+    load_validated_config,
+    prerequisite_usage_error,
+)
 
 # (panel title, field names) -- basic-themed panels first, in the order most
 # runs actually tune them, then a single catch-all "Advanced" panel for
 # everything a user is unlikely to need to touch (mirrors the field ordering
 # in ParticleStackConfig itself -- rich-click panels render in first-seen
 # order, so that ordering is what controls panel order here too).
+#
+# A field means the same thing to every command that takes it, so it sits in
+# the same panel in each: "Specimen" (not "Structure & Potential") for what is
+# being imaged, with `ice_thickness` among it as a property of the sample
+# rather than a tuning knob, and `noise_model` beside the other two model
+# choices.
 _PARTICLE_STACK_GROUPS: list[tuple[str, list[str]]] = [
+    # First, because it is the first question: unset, the run synthesizes its
+    # own particles, and everything below applies as written. Given a file,
+    # the poses and per-particle CTF come from it instead.
     (
-        "Structure & Potential",
-        ["pdb_code", "assembly", "num_pixels", "pixel_size"],
+        "Data source",
+        ["cs_path", "star_path"],
+    ),
+    (
+        "Specimen",
+        ["pdb_source", "assembly", "n_pixels", "pixel_size", "ice_thickness"],
     ),
     (
         "Microscope",
@@ -36,50 +54,70 @@ _PARTICLE_STACK_GROUPS: list[tuple[str, list[str]]] = [
         ["defocus", "shift", "n_particles"],
     ),
     (
+        "Absorption",
+        [
+            "absorption_model",
+            "inelastic_mfp_solvent",
+            "inelastic_mfp_specimen",
+            "objective_aperture",
+            "dose_weights_path",
+            "dose_weights_max_frequency",
+        ],
+    ),
+    (
         "Models",
-        ["scattering_model", "detector_model"],
+        ["scattering_model", "noise_model", "detector_model"],
     ),
     (
         "Post-processing",
         ["normalize_particles", "save_exitwaves", "save_clean_exitwaves"],
     ),
     ("Compute", ["device", "batchsize"]),
-    ("Output", ["output_dir", "filename"]),
+    # One panel, not two: the tracking flags change what --output_dir means
+    # (the leaf the files land in untracked, the root of the numbered job
+    # tree tracked -- see pipelines._common.resolve_output_dir), and split
+    # across separate panels nothing showed that the two interact.
+    (
+        "Output & job tracking",
+        ["output_dir", "filename", "project", "job_id"],
+    ),
     (
         "Advanced",
         [
-            "pdb_savefolder",
-            "cs_path",
-            "num_frames",
+            "pdb_cache_dir",
+            "readd_hydrogens",
+            "monomer_library_path",
+            "use_deposited_bfactors",
+            "n_frames",
             "convergence_angle",
             "cc",
             "energy_spread",
             "deltaV_V",
             "deltaI_I",
+            "temporal_coherence",
             "dose_envelope",
+            "dose_envelope_target",
             "bfactor",
-            "aberration_model",
-            "noise_model",
             "coincidence_radius",
+            "detector_pixel_size",
             "ice_model",
-            "ice_thickness",
             "ice_cache_dir",
             "crowd_min_distance",
             "crowd_max_distance_z",
-            "potential_scale",
             "pad_fft",
-            "potential_parameterization",
+            "oversample",
+            "scattering_factors",
             "potential_method",
             "rcut",
             "conv_backend",
             "periodic",
             "shtyrov_params_path",
-            "mmcif_filepath",
             "ews_curvature_sign",
             "klim",
             "rotate_mode",
-            "ice_parameterization",
+            "bulk_scattering_factors",
             "ice_relax_steps",
+            "ice_motion_variance",
             "crowd_chunk_size",
             "crowd_max_distance_xy",
             "crowd_method",
@@ -95,6 +133,10 @@ _PARTICLE_STACK_GROUPS: list[tuple[str, list[str]]] = [
             "tilty",
             "trefoil1",
             "trefoil2",
+            "tetrafoil1",
+            "tetrafoil2",
+            "tetrafoil3",
+            "tetrafoil4",
             "anisomag_m00",
             "anisomag_m01",
             "anisomag_m10",
@@ -110,10 +152,10 @@ _PARTICLE_STACK_GROUPS: list[tuple[str, list[str]]] = [
 # run_tilt_series`) -- specimen BUILDING is `specter build tomogram`'s job
 # (a separate command/config entirely), not this one's.
 _TILT_SERIES_GROUPS: list[tuple[str, list[str]]] = [
-    ("Specimen", ["volume_path", "target_v_size"]),
+    ("Specimen", ["volume_path", "voxel_size"]),
     (
         "Microscope",
-        ["voltage", "dose_per_tilt", "num_frames", "cs", "alpha"],
+        ["voltage", "dose_per_tilt", "n_frames", "cs", "alpha"],
     ),
     ("Defocus", ["defocus"]),
     (
@@ -121,15 +163,27 @@ _TILT_SERIES_GROUPS: list[tuple[str, list[str]]] = [
         ["min_tilt_angle", "max_tilt_angle", "n_tilts", "tilt_axis"],
     ),
     (
+        "Absorption",
+        [
+            "absorption_model",
+            "inelastic_mfp_solvent",
+            "inelastic_mfp_specimen",
+            "objective_aperture",
+        ],
+    ),
+    (
         "Models",
-        ["scattering_model", "aberration_model", "noise_model", "detector_model"],
+        ["scattering_model", "noise_model", "detector_model"],
     ),
     (
         "Post-processing",
         ["normalize_tilt_series", "save_exitwaves"],
     ),
     ("Compute", ["device"]),
-    ("Output", ["output_dir", "filename"]),
+    (
+        "Output & job tracking",
+        ["output_dir", "filename", "project", "job_id"],
+    ),
     (
         "Advanced",
         [
@@ -139,115 +193,176 @@ _TILT_SERIES_GROUPS: list[tuple[str, list[str]]] = [
             "energy_spread",
             "deltaV_V",
             "deltaI_I",
+            "temporal_coherence",
             "dose_envelope",
+            "dose_envelope_target",
+            "bfactor",
+            "klim",
             "coincidence_radius",
             "ice_model",
             "ice_cache_dir",
             "ice_relax_steps",
+            "ice_motion_variance",
+            "bulk_scattering_factors",
             "pad_fft",
+            "oversample",
+            "seed",
         ],
     ),
 ]
 
 
-def _default_particle_config_path() -> str:
-    from specter.config import REPO_ROOT
+# (panel title, field names) for `specter simulate micrograph` -- same
+# basic-first-advanced-last convention as `_PARTICLE_STACK_GROUPS`. This list,
+# not `MicrographConfig`'s field order, is what decides the order panels and
+# flags appear in `--help` (see `build_config_options`), and it is the order
+# `configs/micrograph.toml`'s tables deliberately mirror.
+#
+# What a first run has to decide is above "Advanced": what to image and at
+# what sampling, the microscope settings, how many, and where the output
+# goes. `ice_thickness` sits with the specimen because for a micrograph it is
+# a property of the sample being imaged, not a tuning knob -- `ice_model` is
+# the tuning knob, and stays below.
+_MICROGRAPH_GROUPS: list[tuple[str, list[str]]] = [
+    (
+        "Specimen",
+        [
+            "pdb_source",
+            "assembly",
+            "n_pixels",
+            "pixel_size",
+            "micrograph_size",
+            "ice_thickness",
+        ],
+    ),
+    (
+        "Microscope",
+        ["voltage", "dose", "defocus", "cs", "alpha"],
+    ),
+    (
+        "Absorption",
+        [
+            "absorption_model",
+            "inelastic_mfp_solvent",
+            "inelastic_mfp_specimen",
+            "objective_aperture",
+        ],
+    ),
+    (
+        "Models",
+        ["scattering_model", "noise_model", "detector_model"],
+    ),
+    ("Dataset", ["n_micrographs", "normalize_micrographs"]),
+    ("Compute", ["device"]),
+    (
+        "Output & job tracking",
+        ["output_dir", "filename", "project", "job_id"],
+    ),
+    (
+        "Advanced",
+        [
+            # Structure handling
+            "pdb_cache_dir",
+            "scattering_factors",
+            "readd_hydrogens",
+            "monomer_library_path",
+            "use_deposited_bfactors",
+            # Envelopes
+            "n_frames",
+            "convergence_angle",
+            "cc",
+            "energy_spread",
+            "deltaV_V",
+            "deltaI_I",
+            "temporal_coherence",
+            "dose_envelope",
+            "dose_envelope_target",
+            "bfactor",
+            "klim",
+            "coincidence_radius",
+            # Ice model and thickness profile
+            "ice_model",
+            "bulk_scattering_factors",
+            "ice_profile",
+            "ice_thickness_range",
+            "ice_profile_angle",
+            "ice_hole_radius",
+            "ice_rim_thickness",
+            "ice_hole_offset",
+            "ice_tilt",
+            "ice_cache_dir",
+            "ice_motion_variance",
+            # Crowding
+            "crowd_min_distance",
+            "crowd_max_distance_z",
+            "crowd_chunk_size",
+            "water_air_interface",
+            "sigma_frac",
+            "peak_amplitude",
+            "baseline",
+            "packing_backend",
+            "packing_gap",
+            "n_orientations",
+            "packing_max_retries",
+            "packing_stall_patience",
+            "packing_seed",
+            "n_candidates",
+            # Numerics
+            "pad_fft",
+            "oversample",
+            # Diagnostics and reproducibility
+            "save_exitwaves",
+            "save_clean_exitwaves",
+            "seed",
+        ],
+    ),
+]
 
-    return str(REPO_ROOT / "configs" / "particle.toml")
 
-
-def _default_tiltseries_config_path() -> str:
-    from specter.config import REPO_ROOT
-
-    return str(REPO_ROOT / "configs" / "tilt_series.toml")
-
-
-def _field_panels(groups: list[tuple[str, list[str]]]) -> dict[str, str]:
-    """Field name -> rich-click panel title, derived from a (title, field names) list."""
-    return {name: title for title, names in groups for name in names}
-
-
-def _particles_callback(config: str, **_overrides_raw: object) -> None:
+def _particles_callback(config: str | None, **_overrides_raw: object) -> None:
     """Handle `specter simulate particles`."""
     from specter.pipelines import run_particle_stack
 
-    ctx = click.get_current_context()
-    assert ctx is not None
-    overrides = collect_overrides(ctx, exclude={"config"})
-
-    cfg = load_config(config, ParticleStackConfig)
-    apply_overrides(cfg, overrides)
-    run_particle_stack(cfg)
+    run_particle_stack(load_cli_config(ParticleStackConfig, config))
 
 
-def _build_particles_command() -> click.RichCommand:
-    params: list[click.Parameter] = [
-        click.RichOption(
-            ["--config"],
-            type=str,
-            default=_default_particle_config_path(),
-            show_default=True,
-            help="TOML config file. Always loaded first, before any flags below "
-            "are applied.",
-            panel="Config",
-        ),
-        *build_config_options(
-            ParticleStackConfig,
-            field_help=PARTICLE_STACK_HELP,
-            field_panels=_field_panels(_PARTICLE_STACK_GROUPS),
-        ),
-    ]
-    return click.RichCommand(
-        name="particles",
-        params=params,
-        callback=_particles_callback,
-        context_settings=CONTEXT_SETTINGS,
-        help="Simulate a cryo-EM particle stack and save it as .mrcs + .star. "
-        "A TOML config (--config) is always loaded first -- every flag below "
-        "is optional and, if given, overrides one field of it.",
-    )
+def _micrograph_callback(config: str | None, **_overrides_raw: object) -> None:
+    """Handle `specter simulate micrograph`."""
+    from specter.pipelines import run_micrograph
+
+    run_micrograph(load_cli_config(MicrographConfig, config))
 
 
-def _tiltseries_callback(config: str, **_overrides_raw: object) -> None:
+def _tiltseries_callback(
+    config: str | None, tomogram_config: str | None, **_overrides_raw: object
+) -> None:
     """Handle `specter simulate tiltseries`."""
     from specter.pipelines import run_tilt_series
 
-    ctx = click.get_current_context()
-    assert ctx is not None
-    overrides = collect_overrides(ctx, exclude={"config"})
+    cfg = load_cli_config(TiltSeriesConfig, config, exclude={"tomogram_config"})
 
-    cfg = load_config(config, TiltSeriesConfig)
-    apply_overrides(cfg, overrides)
-    run_tilt_series(cfg)
-
-
-def _build_tiltseries_command() -> click.RichCommand:
-    params: list[click.Parameter] = [
-        click.RichOption(
-            ["--config"],
-            type=str,
-            default=_default_tiltseries_config_path(),
-            show_default=True,
-            help="TOML config file. Always loaded first, before any flags below "
-            "are applied.",
-            panel="Config",
-        ),
-        *build_config_options(
-            TiltSeriesConfig,
-            field_help=TILT_SERIES_HELP,
-            field_panels=_field_panels(_TILT_SERIES_GROUPS),
-        ),
-    ]
-    return click.RichCommand(
-        name="tiltseries",
-        params=params,
-        callback=_tiltseries_callback,
-        context_settings=CONTEXT_SETTINGS,
-        help="Simulate a cryo-ET tilt series from a pre-built specimen volume "
-        "(--volume_path) and save it as .mrcs + .star. A TOML config "
-        "(--config) is always loaded first -- every flag below is optional "
-        "and, if given, overrides one field of it.",
+    # Through the same helper as --config: a bad --tomogram_config is a
+    # usage error too, and it builds a real specimen, so it deserves the
+    # same validation rather than only the same error handling.
+    tomogram_cfg = (
+        load_validated_config(TomogramConfig, tomogram_config, {})
+        if tomogram_config is not None
+        else None
     )
+
+    # As in build.py: a disjunction (a volume on disk OR one built inline)
+    # that config_from_defaults cannot express, checked here so it reaches
+    # a CLI user as a usage error instead of run_tilt_series' ValueError
+    # arriving as a traceback.
+    if tomogram_cfg is None and not cfg.volume_path:
+        prerequisite_usage_error(
+            "A tilt series needs a specimen volume, and none was given. "
+            "Either pass --volume_path pointing at an .mrc from a previous "
+            "`specter build tomogram`, or pass --tomogram_config a tomogram "
+            "TOML to build one as part of this run."
+        )
+
+    run_tilt_series(cfg, tomogram_config=tomogram_cfg)
 
 
 def build_simulate_group() -> click.RichGroup:
@@ -257,6 +372,64 @@ def build_simulate_group() -> click.RichGroup:
         help="Simulate cryo-EM/cryo-ET data",
         context_settings=CONTEXT_SETTINGS,
     )
-    group.add_command(_build_particles_command())
-    group.add_command(_build_tiltseries_command())
+    group.add_command(
+        build_config_command(
+            "particles",
+            ParticleStackConfig,
+            PARTICLE_STACK_HELP,
+            _PARTICLE_STACK_GROUPS,
+            _particles_callback,
+            help="Simulate a cryo-EM particle stack and save it as .mrcs + .star. "
+            "A TOML config (--config) is loaded first when given, otherwise every setting takes its built-in default -- every flag below "
+            "is optional and, if given, overrides one field of it.",
+        )
+    )
+    group.add_command(
+        build_config_command(
+            "micrograph",
+            MicrographConfig,
+            MICROGRAPH_HELP,
+            _MICROGRAPH_GROUPS,
+            _micrograph_callback,
+            help="Simulate one or more cryo-EM micrographs and save them as .mrcs + "
+            ".star. A TOML config (--config) is loaded first when given, otherwise every setting takes its built-in default -- every flag "
+            "below is optional and, if given, overrides one field of it. Each "
+            "micrograph gets an independently regenerated ice/crowding specimen; "
+            "single-device only.",
+        )
+    )
+    group.add_command(
+        build_config_command(
+            "tiltseries",
+            TiltSeriesConfig,
+            TILT_SERIES_HELP,
+            _TILT_SERIES_GROUPS,
+            _tiltseries_callback,
+            help="Simulate a cryo-ET tilt series from a pre-built specimen volume "
+            "(--volume_path) and save it as .mrcs + .star. A TOML config "
+            "(--config) is loaded first when given, otherwise every setting takes "
+            "its built-in default -- every flag below is optional and, if given, "
+            "overrides one field of it. Pass --tomogram_config "
+            "instead of --volume_path to build the specimen volume first "
+            "(`specter build tomogram`) and image it in the same command.",
+            extra_params=[
+                click.RichOption(
+                    ["--tomogram_config"],
+                    type=str,
+                    default=None,
+                    help="Optional TOML config for `specter build tomogram` "
+                    "(TomogramConfig). If given, that specimen volume is built "
+                    "first and its output used as this run's specimen -- chains "
+                    "`specter build tomogram` + `specter simulate tiltseries` in "
+                    "one command. Mutually exclusive with --volume_path/--config's "
+                    "volume_path. Always builds exactly one tomogram -- "
+                    "`--n_tomograms` isn't a TomogramConfig field and isn't "
+                    "settable here; for several tomograms, run `specter build "
+                    "tomogram --n_tomograms N` yourself and call `simulate "
+                    "tiltseries --volume_path ...` once per output volume instead.",
+                    panel="Config",
+                )
+            ],
+        )
+    )
     return group

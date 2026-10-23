@@ -1,6 +1,11 @@
+"""
+`GradientSKIcemaker`: amorphous ice by gradient optimisation of water
+positions against a structure-factor target and the MLBOP energy.
+"""
+
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Callable
 
 import lightning as L
 import torch
@@ -9,15 +14,59 @@ import torch.nn.functional as F
 from ..arrays import radial_profile_3d, soft_voxelize_coordinates
 from ..fft import fft3, fftconvolve
 from ..progress import ProgressManager, track
-from ._energy import MLBOP
+from ._energy import MLBOP, NeighborListCache, mlbop_energy_summary
 from ._helpers import ndensity_of_amorphous_ice
+from ._kernels import build_water_kernel
 from ._kernels import (
-    build_atomic_potential_kernel,
     compute_native_target,
     ice_kspace_radial_grid,
     interpolate_target_kernel,
     load_mdsim_f_radial_avg,
 )
+from specter.options import IceOptimizer, ScatteringFactors
+
+
+class _PlateauStop:
+    """
+    :meth:`GradientSKIcemaker.optimize`'s early-stopping rule.
+
+    Stop once the relative change in loss, ``abs(prev - cur) / abs(prev)``,
+    has stayed below `tol` for `patience` consecutive steps. Halfway through
+    such a streak `on_stall` is called once (L-BFGS clears its history
+    there), so a stalled line search restarts rather than being read as
+    convergence; a run that has really converged plateaus through the
+    restart and still stops at `patience`.
+
+    Parameters
+    ----------
+    tol : float or None
+        Relative tolerance; None disables the rule.
+    patience : int
+        Consecutive sub-tolerance steps that stop the run.
+    on_stall : callable, optional
+        Called at ``patience // 2`` consecutive sub-tolerance steps.
+    """
+
+    def __init__(
+        self, tol: float | None, patience: int, on_stall: Callable[[], Any] | None
+    ) -> None:
+        self.tol = tol
+        self.patience = patience
+        self.on_stall = on_stall
+        self.prev: float | None = None
+        self.count = 0
+
+    def update(self, loss_val: float) -> bool:
+        """Feed one step's loss; True once the streak has reached `patience`."""
+        if self.tol is None:
+            return False
+        if self.prev is not None:
+            rel_change = abs(self.prev - loss_val) / (abs(self.prev) + 1e-12)
+            self.count = self.count + 1 if rel_change < self.tol else 0
+            if self.count == max(1, self.patience // 2) and self.on_stall is not None:
+                self.on_stall()
+        self.prev = loss_val
+        return self.count >= self.patience
 
 
 def _wrap_coords(x: torch.Tensor, L: float) -> torch.Tensor:
@@ -56,8 +105,13 @@ class GradientSKIcemaker(L.LightningModule):
     device : str or torch.device
         Computation device.
     parameterization : str, optional
-        Atomic potential parameterization for the ice kernel: ``'kirkland'``,
-        ``'lobato'``, or ``'shtyrov'``. Default ``'kirkland'``.
+        Atomic scattering-factor parameterization for the ice kernel:
+        ``'kirkland'``, ``'lobato'``, or ``'shtyrov'``. Default
+        ``'kirkland'``: Shtyrov fits bonded species of BIOMOLECULES over
+        0.011-0.62 1/A, so bulk ice is out of its domain and its k=0 limit
+        (which is what a mean inner potential is) extrapolates below the
+        fitted range. Kirkland, Lobato and Peng are per-element and valid at
+        k=0, and agree with each other there; see `build_water_kernel`.
     progressbars : bool, optional
         Whether to show progress bars. Default is True.
     mdsim_target_path : str, optional
@@ -66,28 +120,39 @@ class GradientSKIcemaker(L.LightningModule):
         load_mdsim_f_radial_avg` expects. If None (default), the target is
         instead computed natively at this instance's own ``(n, dx, nz)`` via
         :func:`~specter.ice._kernels.compute_native_target`, from the bundled
-        LDA-80K (low-density amorphous ice, 80K/0atm) reference frame.
+        LDA-80K (low-density amorphous ice, 80K/0atm) reference frame -- an
+        in-house MD simulation, not from a published dataset.
         Matching ``dx`` between target and training grid matters far more
         than matching absolute box size -- interpolating a fine-``dx``
         target across a coarser training grid is a lossy comparison (the
         simulated side is aliased by coarse voxelization, the target isn't),
-        which was validated this way: coarse-``dx`` training against the old
-        fixed fine-grid default got stuck (S(k) loss O(1)-O(1e3)); against a
-        natively-computed target at the same ``dx`` it converges cleanly
+        which matters: coarse-``dx`` training against a fixed fine-grid
+        target gets stuck (S(k) loss O(1)-O(1e3)); against a natively-
+        computed target at the same ``dx`` it converges cleanly
         (O(1e-5)-O(1e-7)), across dx=0.5/1.0/2.0 and box sizes from 16 Å up
         to 256 Å (beyond the ~127 Å real MD cell, via safe box-size
         extrapolation -- see :func:`compute_native_target`). Pass an
-        explicit path to opt back into the old fixed-target behavior.
+        explicit path to use a fixed target instead.
+
+    References
+    ----------
+    .. [1] Chan, H., Cherukara, M. J., Narayanan, B., Loeffler, T. D.,
+       Benmore, C., Gray, S. K., & Sankaranarayanan, S. K. R. S. (2019).
+       Machine learning coarse grained models for water. *Nature
+       Communications*, 10(1), 379. https://doi.org/10.1038/s41467-018-08222-6
+    .. [2] Liu, D. C., & Nocedal, J. (1989). On the limited memory BFGS method
+       for large scale optimization. *Mathematical Programming*, 45(1–3),
+       503–528. https://doi.org/10.1007/BF01589116
     """
 
     def __init__(
         self,
         n: int = 200,
         dx: float = 0.5,
-        nz: Optional[int] = None,
+        nz: int | None = None,
         min_distance: float = 2.0,
         device: str | torch.device = "cpu",
-        parameterization: str = "kirkland",
+        parameterization: ScatteringFactors = "kirkland",
         progressbars: bool = True,
         mdsim_target_path: str | None = None,
     ) -> None:
@@ -102,7 +167,7 @@ class GradientSKIcemaker(L.LightningModule):
         self.box_x = self.n * self.dx
         self.box_y = self.n * self.dx
         self.box_z = self.nz * self.dx
-        self._ice_kernel: torch.Tensor = build_atomic_potential_kernel(
+        self._ice_kernel: torch.Tensor = build_water_kernel(
             self.dx, self.parameterization
         )
 
@@ -122,13 +187,12 @@ class GradientSKIcemaker(L.LightningModule):
         f_kernel = interpolate_target_kernel(
             K, mdsim_radial_k, mdsim_f_radial_avg, self.n_molecules
         ).float()
-        self.register_buffer("f_target", f_kernel)
+        self.register_buffer("f_target", f_kernel, persistent=False)
 
         self.dk: float = 1 / self.n / self.dx
-        self.f_target_radial: torch.Tensor = radial_profile_3d(f_kernel.cpu())
 
         # Physical |k|-magnitude bins -- NOT radial_profile_3d's voxel-index
-        # bins (used just above for f_target_radial), which only coincide
+        # bins, which only coincide
         # with these when nz == n. For anisotropic grids (nz != n), a voxel
         # step along z spans a different physical k-spacing (1/(nz*dx)) than
         # a voxel step along x/y (1/(n*dx)=dk), so voxel-index distance and
@@ -142,13 +206,15 @@ class GradientSKIcemaker(L.LightningModule):
         r_bins = (K / self.dk).round().long().flatten()
         n_rbins = int(r_bins.max().item()) + 1
         bin_count = torch.bincount(r_bins, minlength=n_rbins).float().clamp(min=1)
-        self.register_buffer("_r_bins", r_bins)
-        self.register_buffer("_bin_count", bin_count)
+        self.register_buffer("_r_bins", r_bins, persistent=False)
+        self.register_buffer("_bin_count", bin_count, persistent=False)
         self._n_rbins: int = n_rbins
         target_bin_sum = torch.bincount(
             r_bins, weights=f_kernel.flatten(), minlength=n_rbins
         )
-        self.register_buffer("_f_target_rad_1d", target_bin_sum / bin_count)
+        self.register_buffer(
+            "_f_target_rad_1d", target_bin_sum / bin_count, persistent=False
+        )
 
         # Repulsion kernel in FFT convention (r=0 at [0,0,0]).
         # rep_kernel[i,j,k] = 1 if the wrapped displacement (i,j,k) is within
@@ -165,9 +231,11 @@ class GradientSKIcemaker(L.LightningModule):
         R_ker = torch.sqrt(ZZ**2 + YY**2 + XX**2)
         rep_kernel = (R_ker < r_min_vox).float()
         rep_kernel[0, 0, 0] = 0.0  # exclude self-contribution
-        self.register_buffer("_rep_kernel_rfft", torch.fft.rfftn(rep_kernel))
+        self.register_buffer(
+            "_rep_kernel_rfft", torch.fft.rfftn(rep_kernel), persistent=False
+        )
 
-        self.positions: Optional[torch.Tensor] = None
+        self.positions: torch.Tensor | None = None
 
         if torch.device(device).type != "cpu":
             self.to(device)
@@ -196,6 +264,8 @@ class GradientSKIcemaker(L.LightningModule):
         rep_strength: float = 0.0,
         mlbop_strength: float = 0.0,
         mlbop_target: float | None = None,
+        neighbor_cache: NeighborListCache | None = None,
+        deterministic: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Radial-profile MSE between |FFT(voxelized positions)| and the target,
@@ -227,14 +297,25 @@ class GradientSKIcemaker(L.LightningModule):
             If set, the ML-BOP penalty becomes
             ``(E_per_atom - mlbop_target) ** 2`` instead of minimizing
             ``E_per_atom`` directly. Amorphous ice phases are metastable,
-            not energy-minimal -- LDA ice in particular is a *compressed*
-            amorphous phase, so its ML-BOP energy sits measurably above the
+            not energy-minimal -- LDA ice is a metastable, disordered
+            phase, so its ML-BOP energy sits measurably above the
             true minimum (real LDA-80K MD frames score around -0.41 eV/atom,
             not the more negative values a denser/more crystalline packing
             would reach). Minimizing ``E_per_atom`` unboundedly pulls the
             optimizer toward that lower-energy, more ordered packing instead
             of matching the target amorphous phase. Ignored (falls back to
             direct minimization) if ``None`` (default).
+        neighbor_cache : NeighborListCache, optional
+            Verlet-skin neighbour list shared across calls at nearby
+            positions, for the ML-BOP term; see
+            :class:`~specter.ice._energy.NeighborListCache`. Default None
+            (search afresh).
+        deterministic : bool, optional
+            Whether the voxel splat accumulates in a fixed order; see
+            :func:`~specter.arrays.soft_voxelize_coordinates`. The radial
+            bin ``scatter_add_`` below is atomic either way, so this loss is
+            never bit-reproducible on CUDA; ``False`` skips a sort the
+            optimiser gains nothing from. Default True.
 
         Returns
         -------
@@ -249,6 +330,7 @@ class GradientSKIcemaker(L.LightningModule):
             voxel_size=self.dx,
             device=self.device,
             periodic=True,
+            deterministic=deterministic,
         )
         f_amp = torch.abs(fft3(vox, shift=True)).clamp(min=1e-8)
         bin_sum = torch.zeros(self._n_rbins, device=self.device)
@@ -270,7 +352,13 @@ class GradientSKIcemaker(L.LightningModule):
         if mlbop_strength > 0.0:
             model = MLBOP(device=pos.device)
             box = (self.box_x, self.box_y, self.box_z)
-            mlbop_result = model.compute_energy(pos, box_size=box, pbc=True)
+            mlbop_result = model.compute_energy(
+                pos,
+                box_size=box,
+                pbc=True,
+                neighbor_cache=neighbor_cache,
+                compute_dtype=torch.float32,
+            )
             e_per_atom = mlbop_result["E_per_atom"]
             if mlbop_target is None:
                 mlbop_penalty = e_per_atom
@@ -284,37 +372,201 @@ class GradientSKIcemaker(L.LightningModule):
     # Optimisation
     # ------------------------------------------------------------------
 
+    def _wrap_positions_(self, pos: torch.Tensor) -> None:
+        """Wrap `pos` (N, 3) into the periodic cell, in place, without grad."""
+        with torch.no_grad():
+            pos.data[:, 0] = _wrap_coords(pos.data[:, 0], self.box_x)
+            pos.data[:, 1] = _wrap_coords(pos.data[:, 1], self.box_y)
+            pos.data[:, 2] = _wrap_coords(pos.data[:, 2], self.box_z)
+
+    def _prerelax(
+        self, pos: torch.Tensor, steps: int, neighbor_cache: NeighborListCache
+    ) -> None:
+        """
+        Relax `pos` in place against the ML-BOP energy alone.
+
+        The starting point for :meth:`optimize`; see its ``prerelax_steps``.
+        Minimises ``E_per_atom`` directly rather than toward
+        ``mlbop_target``: this is overlap removal, and thirty steps from a
+        random start stop far short of the target anyway.
+
+        Parameters
+        ----------
+        pos : torch.Tensor
+            Positions (N, 3) with ``requires_grad=True``, updated in place.
+        steps : int
+            L-BFGS outer steps.
+        neighbor_cache : NeighborListCache
+            Shared with the main optimisation that follows.
+        """
+        model = MLBOP(device=pos.device)
+        box = (self.box_x, self.box_y, self.box_z)
+        opt = torch.optim.LBFGS(
+            [pos],
+            lr=1.0,
+            max_iter=10,
+            history_size=20,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure() -> torch.Tensor:
+            opt.zero_grad()
+            energy = model.compute_energy(
+                pos,
+                box_size=box,
+                pbc=True,
+                neighbor_cache=neighbor_cache,
+                compute_dtype=torch.float32,
+            )["E_per_atom"]
+            energy.backward()
+            return energy
+
+        _manager = ProgressManager()
+        _pbar, _pbar_pos = _manager.get_pbar(
+            range(steps),
+            desc="ML-BOP pre-relaxation",
+            disable=not self.progressbars,
+            transient=True,
+        )
+        try:
+            for _ in _pbar:
+                energy = opt.step(closure)
+                self._wrap_positions_(pos)
+                e_val = energy.item() if isinstance(energy, torch.Tensor) else energy
+                _pbar.set_postfix(E_per_atom=f"{float(e_val):.4f}")
+        finally:
+            _pbar.close()
+            _manager.release(_pbar_pos)
+
+    def _run_steps(
+        self,
+        pos: torch.Tensor,
+        n_steps: int,
+        take_step: Callable[[], float],
+        desc: str,
+        record_every: int,
+        history: dict[str, Any],
+        raw_sk_loss: Callable[[], float],
+        last_f_amp: list[torch.Tensor],
+        stop: "_PlateauStop",
+    ) -> bool:
+        """
+        The outer loop shared by :meth:`optimize`'s optimisers.
+
+        Parameters
+        ----------
+        pos : torch.Tensor
+            The positions being optimised; wrapped into the cell after
+            every step.
+        n_steps : int
+            Step ceiling.
+        take_step : callable
+            Runs one optimiser step and returns the loss it started from.
+        desc : str
+            Progress-bar label.
+        record_every : int
+            Record `history` every this many steps (and at an early stop).
+        history : dict
+            Lists appended to: ``step``, ``loss``, ``sk_loss``,
+            ``radial_profile``.
+        raw_sk_loss : callable
+            The penalty-free S(k) loss at the current positions.
+        last_f_amp : list of torch.Tensor
+            One-element box `take_step` leaves the latest ``|F(k)|`` in.
+        stop : _PlateauStop
+            The early-stopping rule.
+
+        Returns
+        -------
+        bool
+            Whether the rule stopped the run before `n_steps`.
+        """
+
+        def record(step: int, loss_val: float) -> None:
+            with torch.no_grad():
+                rad = radial_profile_3d(last_f_amp[0].cpu())
+            history["step"].append(step)
+            history["loss"].append(loss_val)
+            history["sk_loss"].append(raw_sk_loss())
+            history["radial_profile"].append(rad)
+
+        manager = ProgressManager()
+        pbar, pbar_pos = manager.get_pbar(
+            range(n_steps), desc=desc, disable=not self.progressbars, transient=True
+        )
+        try:
+            for step in pbar:
+                loss_val = take_step()
+                self._wrap_positions_(pos)
+                plateaued = stop.update(loss_val)
+                pbar.set_postfix(loss=f"{loss_val:.6f}")
+                if step % record_every == 0:
+                    record(step, loss_val)
+                if plateaued:
+                    if history["step"] and history["step"][-1] != step:
+                        record(step, loss_val)
+                    return True
+        finally:
+            pbar.close()
+            manager.release(pbar_pos)
+        return False
+
     def optimize(
         self,
-        n_steps: int = 400,
+        n_steps: int = 250,
         lr: float = 1.0,
-        optimizer: str = "lbfgs",
+        optimizer: IceOptimizer = "lbfgs",
         record_every: int = 5,
         rep_strength: float = 0.0,
         mlbop_strength: float = 0.5,
         mlbop_target: float | None = -0.413,
-        tol: Optional[float] = 1e-4,
+        tol: float | None = 1e-3,
         patience: int = 10,
+        history_size: int = 100,
+        max_iter: int = 25,
+        prerelax_steps: int = 30,
+        param_dtype: torch.dtype = torch.float64,
     ) -> dict:
         """
-        Pure gradient descent on the S(k) loss — no Langevin noise.
+        Pure gradient descent on the S(k) loss.
 
-        L-BFGS (default) converges in ~50 steps vs ~500 for Adam on this smooth
-        radial-profile loss; the strong-Wolfe line search adapts step sizes
-        automatically so the ``lr`` parameter rarely needs tuning.
+        L-BFGS (default) converges in far fewer steps than Adam on this
+        smooth radial-profile loss; the strong-Wolfe line search adapts step
+        sizes automatically so the ``lr`` parameter rarely needs tuning.
+
+        The L-BFGS settings were chosen on loss against *closure count* (one
+        closure is one loss + gradient evaluation, the unit of cost) at the
+        bundled library's geometry (n=256, dx=1.0, ~527k atoms), on a
+        6000-closure budget from seed 0:
+
+        ================================================  =====  =====  =====  =======
+        settings                                          @1000  @1500  @6000  E/atom
+        ================================================  =====  =====  =====  =======
+        history 20, max_iter 10, no pre-relaxation        0.266  0.139  0.053  -0.087
+        history 20, max_iter 50                           0.269  0.132  0.046  -0.111
+        history 100, max_iter 25, 30-step pre-relaxation  0.047  0.040  0.022  -0.203
+        history 100, max_iter 50, 30-step pre-relaxation  0.048  0.048  0.022  -0.205
+        ================================================  =====  =====  =====  =======
+
+        The first row needs 4-6k closures to reach a loss of 0.04-0.06; the
+        defaults (third row) reach it in 1000-1500 and go on to a loss, and
+        an ML-BOP energy against the -0.413 target, the first row never
+        reaches. Each row is the same objective, recipe and
+        target: the changes are to the search, not to what is searched for.
+        The table was measured with float32 positions; ``param_dtype``
+        (float64 by default, see below) removes the stall that made the
+        last row's tail so slow, reaching its 6000-closure loss in ~1600.
 
         Parameters
         ----------
         n_steps : int
             Optimizer outer iterations. For L-BFGS each outer step may call
-            the closure up to 10 times for line search. Default is 400 --
-            the old default of 50 is nowhere near enough once
-            ``mlbop_strength`` is active: at n=256, dx=1.0 (~527k atoms),
-            sk_loss is still ~0.58 (vs ~0.0002-0.0008 by step 200-400) after
-            only 50 steps. ``tol``/``patience`` still apply on top of this
-            ceiling, so smaller/easier configs typically stop well short of
-            it. Pass a smaller value explicitly to trade convergence quality
-            for speed.
+            the closure up to ``max_iter`` times, plus line-search
+            evaluations. Default is 250, about 6000 closures at
+            ``max_iter=25``, the budget in the table above; the loss was
+            0.024 at 3000 closures and 0.022 at 6000, so a smaller value
+            gives most of the result. ``tol``/``patience`` still apply on
+            top of this ceiling.
         lr : float
             Step size. Keep at 1.0 for L-BFGS; use ~0.01 for Adam.
         optimizer : str
@@ -355,17 +607,59 @@ class GradientSKIcemaker(L.LightningModule):
             Relative loss-improvement tolerance for early stopping: once the
             fractional change in loss, ``abs(prev - cur) / abs(prev)``, stays
             below ``tol`` for ``patience`` consecutive steps, optimisation
-            stops before reaching ``n_steps``. This tracks the combined
+            stops before reaching ``n_steps``. Halfway through such a streak
+            the L-BFGS history is cleared (``'lbfgs'`` only), so a stalled
+            line search restarts from steepest descent rather than being
+            read as convergence; a run that has really converged plateaus
+            through the restart and still stops at ``patience``. This tracks the combined
             differentiable loss (S(k) MSE + whichever penalty is enabled)
             already computed every step. Set to ``None`` to disable and
-            always run the full ``n_steps``. Default is 1e-4 — tuned against
-            the S(k) loss curve on the bundled LDA-80K target (n=400,
-            dx=0.25): 1e-6 never sustains for ``patience`` steps within a few
-            hundred iterations, since the loss keeps making ~1e-5-scale
-            wiggles long after it's practically converged.
+            always run the full ``n_steps``. Default is 1e-3, a deliberate
+            trade of the tail of the curve for time at the bundled geometry:
+            once S(k) is matched the loss is the energy term alone, and
+            under 1e-4 a config ran 96-250 steps (4-9 min) to reach E/atom
+            -0.20 to -0.28, most of which was the last few hundredths of an
+            eV. (1e-4 is right for the S(k) loss curve at n=400, dx=0.25,
+            where 1e-6 never sustains for ``patience`` steps because of
+            ~1e-5-scale wiggles.)
         patience : int, optional
             Consecutive below-``tol`` steps required to trigger early
             stopping. Default is 10.
+        history_size : int, optional
+            L-BFGS curvature pairs kept (``'lbfgs'`` only). Default 100: a
+            1.6 M-dimensional problem gains from more than torch's default
+            of 20, and 100 vectors are 600 MB at the
+            bundled geometry, small next to the loss's own working set.
+        max_iter : int, optional
+            L-BFGS inner iterations per outer step (``'lbfgs'`` only).
+            Default 25; 50 measured no better.
+        prerelax_steps : int, optional
+            L-BFGS steps on the ML-BOP energy alone, from the initial
+            positions, before the full loss is optimised (``'lbfgs'`` only,
+            and only when ``mlbop_strength > 0``). A uniform-random start
+            has overlapping molecules and a loss of ~5e4, and the full loss
+            spends its first several hundred closures on nothing else; the
+            energy term alone resolves them without the FFT, in ~300 cheap
+            closures. The objective is unchanged, only the starting point.
+            Default 30; 0 disables. A jittered lattice at the right density
+            is not an alternative: the optimiser never leaves its
+            crystalline S(k) (loss stuck at 3e4 at n=128).
+        param_dtype : torch.dtype, optional
+            Dtype of the positions being optimised. Default float64, and
+            this is load-bearing at the bundled geometry: once S(k) is
+            matched (a few hundred evaluations in, MSE ~1e-4) the whole
+            remaining loss is the energy term, and the descent step it
+            calls for moves each atom by ~1e-6 A, below the float32 ulp of
+            a coordinate at 64-128 A (7.6e-6 to 1.5e-5 A). In float32 the
+            line search then returns zero-length steps and the loss freezes
+            at ~0.050 with E/atom near -0.10 (which is where every
+            float32-optimised library ended up); in float64 it continues
+            at 1-4% per step to 0.024 / -0.19 by step 60. The FFT, splat
+            and three-body kernels still run in float32: only the voxel
+            fractions and pair vectors are formed in float64 first, so the
+            cost is elementwise work on N x 3 values and the L-BFGS
+            history (100 x 1.6 M float64, 1.3 GB at n=256). The result is
+            stored back in float32.
 
         Returns
         -------
@@ -379,231 +673,94 @@ class GradientSKIcemaker(L.LightningModule):
         """
         assert self.positions is not None, "Call init_random() first"
 
-        pos = self.positions.to(self.device).clone().requires_grad_(True)
+        pos = (
+            self.positions.to(self.device, dtype=param_dtype)
+            .clone()
+            .requires_grad_(True)
+        )
         history: dict[str, Any] = {
             "step": [],
             "loss": [],
             "sk_loss": [],
             "radial_profile": [],
         }
-        stopped_early = False
-        prev_loss: Optional[float] = None
-        plateau_count = 0
 
         def _raw_sk_loss() -> float:
             with torch.no_grad():
                 sk_loss, _ = self._sk_loss(pos, rep_strength=0.0, mlbop_strength=0.0)
                 return sk_loss.item()
 
+        neighbor_cache = NeighborListCache()
+        last_f_amp: list[torch.Tensor] = [torch.empty(0)]
+
+        def loss_and_backward() -> torch.Tensor:
+            loss, f_amp = self._sk_loss(
+                pos,
+                rep_strength=rep_strength,
+                mlbop_strength=mlbop_strength,
+                mlbop_target=mlbop_target,
+                neighbor_cache=neighbor_cache,
+                deterministic=False,
+            )
+            loss.backward()
+            last_f_amp[0] = f_amp.detach()
+            return loss
+
+        on_stall: Callable[[], Any] | None
         if optimizer == "lbfgs":
-            opt = torch.optim.LBFGS(
+            if prerelax_steps > 0 and mlbop_strength > 0.0:
+                self._prerelax(pos, prerelax_steps, neighbor_cache)
+            lbfgs = torch.optim.LBFGS(
                 [pos],
                 lr=lr,
-                max_iter=10,
-                history_size=20,
+                max_iter=max_iter,
+                history_size=history_size,
                 line_search_fn="strong_wolfe",
             )
-            last_f_amp: list[torch.Tensor] = [torch.empty(0)]
 
             def closure() -> torch.Tensor:
-                opt.zero_grad()
-                loss, f_amp = self._sk_loss(
-                    pos,
-                    rep_strength=rep_strength,
-                    mlbop_strength=mlbop_strength,
-                    mlbop_target=mlbop_target,
-                )
-                loss.backward()
-                last_f_amp[0] = f_amp.detach()
-                return loss
+                lbfgs.zero_grad()
+                return loss_and_backward()
 
-            _manager = ProgressManager()
-            _pbar, _pbar_pos = _manager.get_pbar(
-                range(n_steps),
-                desc="L-BFGS for ice coordinates",
-                disable=not self.progressbars,
-                transient=True,
-            )
-            try:
-                for step in _pbar:
-                    loss = opt.step(closure)
-                    with torch.no_grad():
-                        pos.data[:, 0] = _wrap_coords(pos.data[:, 0], self.box_x)
-                        pos.data[:, 1] = _wrap_coords(pos.data[:, 1], self.box_y)
-                        pos.data[:, 2] = _wrap_coords(pos.data[:, 2], self.box_z)
-                    loss_val = (
-                        loss.item() if isinstance(loss, torch.Tensor) else float(loss)
-                    )
-                    if tol is not None and prev_loss is not None:
-                        rel_change = abs(prev_loss - loss_val) / (
-                            abs(prev_loss) + 1e-12
-                        )
-                        plateau_count = plateau_count + 1 if rel_change < tol else 0
-                    prev_loss = loss_val
-                    _pbar.set_postfix(loss=f"{loss_val:.6f}")
-                    if step % record_every == 0:
-                        with torch.no_grad():
-                            rad = radial_profile_3d(last_f_amp[0].cpu())
-                        history["step"].append(step)
-                        history["loss"].append(loss_val)
-                        history["sk_loss"].append(_raw_sk_loss())
-                        history["radial_profile"].append(rad)
-                    if tol is not None and plateau_count >= patience:
-                        stopped_early = True
-                        if history["step"] and history["step"][-1] != step:
-                            with torch.no_grad():
-                                rad = radial_profile_3d(last_f_amp[0].cpu())
-                            history["step"].append(step)
-                            history["loss"].append(loss_val)
-                            history["sk_loss"].append(_raw_sk_loss())
-                            history["radial_profile"].append(rad)
-                        break
-            finally:
-                _pbar.close()
-                _manager.release(_pbar_pos)
+            def take_step() -> float:
+                loss = lbfgs.step(closure)
+                return loss.item() if isinstance(loss, torch.Tensor) else float(loss)
 
+            desc = "L-BFGS for ice coordinates"
+            # A stalled line search, not convergence, is the usual reason
+            # for a run of unchanged losses: L-BFGS keeps proposing the same
+            # direction, the strong-Wolfe search keeps returning t = 0.
+            # Dropping the curvature history restarts from steepest descent,
+            # which resolves a stall in a few steps; a run that really has
+            # converged plateaus through the restart and still stops at
+            # ``patience``.
+            on_stall = lbfgs.state.clear
         else:  # adam
-            opt_adam = torch.optim.Adam([pos], lr=lr)
-            _manager = ProgressManager()
-            _pbar, _pbar_pos = _manager.get_pbar(
-                range(n_steps),
-                desc="Adam",
-                disable=not self.progressbars,
-                transient=True,
-            )
-            try:
-                for step in _pbar:
-                    opt_adam.zero_grad()
-                    loss, f_amp = self._sk_loss(
-                        pos,
-                        rep_strength=rep_strength,
-                        mlbop_strength=mlbop_strength,
-                        mlbop_target=mlbop_target,
-                    )
-                    loss.backward()
-                    opt_adam.step()
-                    with torch.no_grad():
-                        pos.data[:, 0] = _wrap_coords(pos.data[:, 0], self.box_x)
-                        pos.data[:, 1] = _wrap_coords(pos.data[:, 1], self.box_y)
-                        pos.data[:, 2] = _wrap_coords(pos.data[:, 2], self.box_z)
-                    loss_val = loss.item()
-                    if tol is not None and prev_loss is not None:
-                        rel_change = abs(prev_loss - loss_val) / (
-                            abs(prev_loss) + 1e-12
-                        )
-                        plateau_count = plateau_count + 1 if rel_change < tol else 0
-                    prev_loss = loss_val
-                    _pbar.set_postfix(loss=f"{loss_val:.6f}")
-                    if step % record_every == 0:
-                        with torch.no_grad():
-                            rad = radial_profile_3d(f_amp.detach().cpu())
-                        history["step"].append(step)
-                        history["loss"].append(loss_val)
-                        history["sk_loss"].append(_raw_sk_loss())
-                        history["radial_profile"].append(rad)
-                    if tol is not None and plateau_count >= patience:
-                        stopped_early = True
-                        if history["step"] and history["step"][-1] != step:
-                            with torch.no_grad():
-                                rad = radial_profile_3d(f_amp.detach().cpu())
-                            history["step"].append(step)
-                            history["loss"].append(loss_val)
-                            history["sk_loss"].append(_raw_sk_loss())
-                            history["radial_profile"].append(rad)
-                        break
-            finally:
-                _pbar.close()
-                _manager.release(_pbar_pos)
+            adam = torch.optim.Adam([pos], lr=lr)
+
+            def take_step() -> float:
+                adam.zero_grad()
+                loss = loss_and_backward()
+                adam.step()
+                return loss.item()
+
+            desc = "Adam"
+            on_stall = None
+
+        stopped_early = self._run_steps(
+            pos,
+            n_steps,
+            take_step,
+            desc,
+            record_every,
+            history,
+            _raw_sk_loss,
+            last_f_amp,
+            _PlateauStop(tol, patience, on_stall),
+        )
 
         history["stopped_early"] = stopped_early
-        self.positions = pos.detach().cpu()
-        return history
-
-    def sample(
-        self,
-        n_steps: int = 200,
-        lr: float = 0.05,
-        noise: float = 0.02,
-        record_every: int = 50,
-        rep_strength: float = 0.0,
-        mlbop_strength: float = 0.5,
-        mlbop_target: float | None = -0.413,
-    ) -> dict:
-        """
-        Langevin sampling around a converged structure.
-
-        Combines a gradient step (keeps structure near the S(k) target) with
-        Gaussian noise injection (provides positional diversity). Call
-        :meth:`optimize` first.
-
-        Parameters
-        ----------
-        n_steps : int
-            Number of Langevin steps.
-        lr : float
-            Adam learning rate.
-        noise : float
-            Gaussian noise std per step in Å.
-        record_every : int
-            Diagnostic recording interval.
-        rep_strength : float, optional
-            Weight of the artificial pair-exclusion penalty.  Default is 0.0
-            (disabled in favor of ``mlbop_strength``).
-        mlbop_strength : float, optional
-            Weight of the ML-BOP-energy-based penalty, the default
-            alternative to ``rep_strength`` (see :meth:`_sk_loss` and
-            :meth:`optimize`).  Default is 0.5.
-        mlbop_target : float or None, optional
-            Matches ``E_per_atom`` to this value instead of minimizing it
-            unboundedly (see :meth:`_sk_loss`).  Default is -0.413, matching
-            real LDA-80K MD ice.
-
-        Returns
-        -------
-        history : dict
-            Keys: ``'step'``, ``'loss'``, ``'radial_profile'``.
-        """
-        assert self.positions is not None, "Call optimize() or init_* first"
-
-        pos = self.positions.to(self.device).clone().requires_grad_(True)
-        opt = torch.optim.Adam([pos], lr=lr)
-        history: dict[str, list] = {"step": [], "loss": [], "radial_profile": []}
-
-        _manager = ProgressManager()
-        _pbar, _pbar_pos = _manager.get_pbar(
-            range(n_steps),
-            desc="Langevin",
-            disable=not self.progressbars,
-            transient=True,
-        )
-        try:
-            for step in _pbar:
-                opt.zero_grad()
-                loss, f_amp = self._sk_loss(
-                    pos,
-                    rep_strength=rep_strength,
-                    mlbop_strength=mlbop_strength,
-                    mlbop_target=mlbop_target,
-                )
-                loss.backward()
-                opt.step()
-                with torch.no_grad():
-                    pos.data.add_(noise * torch.randn_like(pos))
-                    pos.data[:, 0] = _wrap_coords(pos.data[:, 0], self.box_x)
-                    pos.data[:, 1] = _wrap_coords(pos.data[:, 1], self.box_y)
-                    pos.data[:, 2] = _wrap_coords(pos.data[:, 2], self.box_z)
-                _pbar.set_postfix(loss=f"{loss.item():.6f}", noise=f"{noise:.4f}")
-                if step % record_every == 0:
-                    with torch.no_grad():
-                        rad = radial_profile_3d(f_amp.detach().cpu())
-                    history["step"].append(step)
-                    history["loss"].append(loss.item())
-                    history["radial_profile"].append(rad)
-        finally:
-            _pbar.close()
-            _manager.release(_pbar_pos)
-
-        self.positions = pos.detach().cpu()
+        self.positions = pos.detach().float().cpu()
         return history
 
     # ------------------------------------------------------------------
@@ -636,8 +793,8 @@ class GradientSKIcemaker(L.LightningModule):
         rep_strength: float = 0.0,
         mlbop_strength: float = 0.5,
         mlbop_target: float | None = -0.413,
-        init_positions=None,
-        tol: Optional[float] = 1e-4,
+        init_positions: torch.Tensor | None = None,
+        tol: float | None = 1e-3,
         patience: int = 10,
     ) -> torch.Tensor:
         """
@@ -669,7 +826,7 @@ class GradientSKIcemaker(L.LightningModule):
             real LDA-80K MD ice.
         tol : float or None, optional
             Early-stopping tolerance forwarded to :meth:`optimize`. Default
-            is 1e-4; set to ``None`` to always run the full ``n_steps``.
+            is 1e-3; set to ``None`` to always run the full ``n_steps``.
         patience : int, optional
             Early-stopping patience forwarded to :meth:`optimize`. Default
             is 10.
@@ -713,7 +870,7 @@ class GradientSKIcemaker(L.LightningModule):
         rep_strength: float = 0.0,
         mlbop_strength: float = 0.5,
         mlbop_target: float | None = -0.413,
-        tol: Optional[float] = 1e-4,
+        tol: float | None = 1e-3,
         patience: int = 10,
     ) -> torch.Tensor:
         """
@@ -745,7 +902,7 @@ class GradientSKIcemaker(L.LightningModule):
             real LDA-80K MD ice.
         tol : float or None, optional
             Early-stopping tolerance forwarded to :meth:`optimize`. Default
-            is 1e-4; set to ``None`` to always run the full ``n_steps``.
+            is 1e-3; set to ``None`` to always run the full ``n_steps``.
         patience : int, optional
             Early-stopping patience forwarded to :meth:`optimize`. Default
             is 10.
@@ -795,57 +952,4 @@ class GradientSKIcemaker(L.LightningModule):
         """
         assert self.positions is not None, "Call optimize() or init_* first"
         box = (self.box_x, self.box_y, self.box_z)
-        model = MLBOP(device=self.positions.device)
-        with torch.no_grad():
-            result = model.compute_energy(self.positions, box_size=box, pbc=pbc)
-        return {k: v.item() for k, v in result.items()}
-
-    @staticmethod
-    def assemble_tiles(
-        tile_positions: list[torch.Tensor],
-        tile_box: tuple[float, float, float],
-        nx: int,
-        ny: int,
-        nz: int,
-    ) -> torch.Tensor:
-        """
-        Assemble ``nx × ny × nz`` independently-optimised tiles into one volume.
-
-        Each tile is a unique set of atom positions (independently optimised),
-        so there is no periodicity artifact.
-
-        Parameters
-        ----------
-        tile_positions : list of torch.Tensor
-            Exactly ``nx * ny * nz`` position tensors, each shape ``(N, 3)``,
-            centered at the origin in tile-box coordinates. Order is x-fastest
-            (C order).
-        tile_box : (Lx, Ly, Lz)
-            Physical size of one tile in Å.
-        nx, ny, nz : int
-            Number of tiles along each axis.
-
-        Returns
-        -------
-        positions : torch.Tensor
-            All assembled positions, shape ``(nx*ny*nz*N, 3)``, in a box
-            centered at the origin with extent ``(nx*Lx, ny*Ly, nz*Lz)`` Å.
-        """
-        n_tiles = nx * ny * nz
-        assert (
-            len(tile_positions) == n_tiles
-        ), f"Expected {n_tiles} tiles, got {len(tile_positions)}"
-        Lx, Ly, Lz = tile_box
-        assembled: list[torch.Tensor] = []
-        for idx, (ix, iy, iz) in enumerate(
-            (ix, iy, iz) for iz in range(nz) for iy in range(ny) for ix in range(nx)
-        ):
-            offset = torch.tensor(
-                [
-                    (ix - (nx - 1) / 2.0) * Lx,
-                    (iy - (ny - 1) / 2.0) * Ly,
-                    (iz - (nz - 1) / 2.0) * Lz,
-                ]
-            )
-            assembled.append(tile_positions[idx] + offset)
-        return torch.cat(assembled, dim=0)
+        return mlbop_energy_summary(self.positions, box, pbc)

@@ -2,23 +2,50 @@ from __future__ import annotations
 
 import subprocess as proc
 import sys
+import traceback
 from pathlib import Path
 
-_FIXTURE_PDB = str(Path(__file__).parent.parent / "pdb-data" / "1mbo.cif")
+import pytest
+from click.testing import CliRunner
+
+from specter.cli._cli import cli
+
+_FIXTURE_PDB = str(Path(__file__).parent / "test_data" / "1mbo.cif")
 
 
-def _run_particles_cli(output_dir: Path, n_particles: int = 2) -> proc.CompletedProcess:
+def _invoke_cli(
+    args: list[str], *, subprocess_entrypoint: bool = False
+) -> proc.CompletedProcess[str]:
+    """Share imports and potential kernels across CLI tests in a worker.
+
+    The default particle smoke case still checks the real module entry point
+    in a fresh interpreter. Other cases exercise Click and the full pipelines
+    in-process, retaining their output-file assertions.
+    """
+    if subprocess_entrypoint:
+        return proc.run(
+            [sys.executable, "-m", "specter.cli._cli", *args],
+            capture_output=True,
+            encoding="utf-8",
+        )
+    result = CliRunner().invoke(cli, args, catch_exceptions=True)
+    stderr = result.stderr
+    if result.exception is not None and result.exit_code != 0:
+        stderr += "".join(traceback.format_exception(result.exception))
+    return proc.CompletedProcess(args, result.exit_code, result.stdout, stderr)
+
+
+def _run_particles_cli(
+    output_dir: Path, n_particles: int = 2, *, subprocess_entrypoint: bool = False
+) -> proc.CompletedProcess[str]:
     args = [
-        sys.executable,
-        "-m",
-        "specter.cli._cli",
         "simulate",
         "particles",
-        "--pdb_code",
+        "--pdb_source",
         _FIXTURE_PDB,
         "--n_particles",
         str(n_particles),
-        "--num_pixels",
+        "--n_pixels",
         "32",
         "--scattering_model",
         "ctf",
@@ -33,35 +60,35 @@ def _run_particles_cli(output_dir: Path, n_particles: int = 2) -> proc.Completed
         "--filename",
         "particles",
     ]
-    return proc.run(args, capture_output=True, encoding="utf-8")
+    return _invoke_cli(args, subprocess_entrypoint=subprocess_entrypoint)
 
 
-def test_cli_particles_smoke(tmp_path: Path) -> None:
-    result = _run_particles_cli(tmp_path)
+@pytest.mark.parametrize(
+    ("n_particles", "permissive", "subprocess_entrypoint"),
+    [(2, False, True), (3, False, False), (1, True, False)],
+    ids=["default", "override", "single"],
+)
+def test_cli_particles_smoke(
+    tmp_path: Path, n_particles: int, permissive: bool, subprocess_entrypoint: bool
+) -> None:
+    """--n_particles overrides the loaded TOML config's value end to end.
+
+    n_particles=1 must work -- the most natural first thing a user tries.
+    random_quaternion squeezes the batch axis at n == 1, so the pipeline used
+    to hand roma a length-1 vector instead of a quaternion and crash with an
+    IndexError before writing anything.
+    """
+    import mrcfile
+
+    result = _run_particles_cli(
+        tmp_path, n_particles=n_particles, subprocess_entrypoint=subprocess_entrypoint
+    )
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "particles.mrcs").exists()
     assert (tmp_path / "particles.star").exists()
 
-
-def test_cli_particles_help_smoke() -> None:
-    result = proc.run(
-        [sys.executable, "-m", "specter.cli._cli", "simulate", "particles", "--help"],
-        capture_output=True,
-        encoding="utf-8",
-    )
-    assert result.returncode == 0
-    assert "--pdb_code" in result.stdout
-    assert "--scattering_model" in result.stdout
-
-
-def test_cli_particles_n_particles_override(tmp_path: Path) -> None:
-    """--n_particles overrides the loaded TOML config's value end to end."""
-    result = _run_particles_cli(tmp_path, n_particles=3)
-    assert result.returncode == 0, result.stderr
-    import mrcfile
-
-    with mrcfile.open(tmp_path / "particles.mrcs") as mrc:
-        assert mrc.data.shape[0] == 3
+    with mrcfile.open(str(tmp_path / "particles.mrcs"), permissive=permissive) as mrc:
+        assert mrc.data.shape[0] == n_particles
 
 
 def test_cli_particles_advanced_flags_reach_the_star_file(tmp_path: Path) -> None:
@@ -70,16 +97,13 @@ def test_cli_particles_advanced_flags_reach_the_star_file(tmp_path: Path) -> Non
     import starfile
 
     args = [
-        sys.executable,
-        "-m",
-        "specter.cli._cli",
         "simulate",
         "particles",
-        "--pdb_code",
+        "--pdb_source",
         _FIXTURE_PDB,
         "--n_particles",
         "4",
-        "--num_pixels",
+        "--n_pixels",
         "32",
         "--scattering_model",
         "ctf",
@@ -102,7 +126,7 @@ def test_cli_particles_advanced_flags_reach_the_star_file(tmp_path: Path) -> Non
         "--phaseshift",
         "0.1,0.2",
     ]
-    result = proc.run(args, capture_output=True, encoding="utf-8")
+    result = _invoke_cli(args)
     assert result.returncode == 0, result.stderr
 
     df = starfile.read(tmp_path / "particles.star")
@@ -116,16 +140,13 @@ def test_cli_particles_advanced_flags_reach_the_star_file(tmp_path: Path) -> Non
 def test_cli_particles_falcon4i_detector_model_reachable(tmp_path: Path) -> None:
     """falcon4i_300kv should be a valid --detector_model choice, not rejected."""
     args = [
-        sys.executable,
-        "-m",
-        "specter.cli._cli",
         "simulate",
         "particles",
-        "--pdb_code",
+        "--pdb_source",
         _FIXTURE_PDB,
         "--n_particles",
         "2",
-        "--num_pixels",
+        "--n_pixels",
         "32",
         "--scattering_model",
         "ctf",
@@ -140,9 +161,62 @@ def test_cli_particles_falcon4i_detector_model_reachable(tmp_path: Path) -> None
         "--filename",
         "particles",
     ]
-    result = proc.run(args, capture_output=True, encoding="utf-8")
+    result = _invoke_cli(args)
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "particles.mrcs").exists()
+
+
+def _run_micrograph_cli(
+    output_dir: Path, n_micrographs: int = 1
+) -> proc.CompletedProcess[str]:
+    args = [
+        "simulate",
+        "micrograph",
+        "--pdb_source",
+        _FIXTURE_PDB,
+        "--n_micrographs",
+        str(n_micrographs),
+        "--n_pixels",
+        "32",
+        "--micrograph_size",
+        "64",
+        "--scattering_model",
+        "ctf",
+        "--ice_model",
+        "none",
+        "--detector_model",
+        "none",
+        # scattering_model="ctf" is a fast, linear (not intensity-guaranteed-
+        # non-negative) approximation, unlike multislice's |exitwave|^2 --
+        # combined with unseeded random defocus sampling, some draws produce
+        # local negative "intensity" that crashes torch.poisson. Not a bug
+        # introduced by this CLI (the same Sample/Detector path the Python
+        # API exercises); noise isn't needed for a shape-only
+        # smoke test, so disable it here rather than flaking on rare draws.
+        "--noise_model",
+        "none",
+        "--device",
+        "cpu",
+        "--output_dir",
+        str(output_dir),
+        "--filename",
+        "micrographs",
+    ]
+    return _invoke_cli(args)
+
+
+@pytest.mark.parametrize("n_micrographs", [1, 2], ids=["default", "override"])
+def test_cli_micrograph_smoke(tmp_path: Path, n_micrographs: int) -> None:
+    """--n_micrographs overrides the loaded TOML config's value end to end."""
+    result = _run_micrograph_cli(tmp_path, n_micrographs=n_micrographs)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "micrographs.mrcs").exists()
+    assert (tmp_path / "micrographs.star").exists()
+
+    import mrcfile
+
+    with mrcfile.open(tmp_path / "micrographs.mrcs") as mrc:
+        assert mrc.data.shape == (n_micrographs, 64, 64)
 
 
 def test_cli_tiltseries_smoke(tmp_path: Path) -> None:
@@ -154,14 +228,11 @@ def test_cli_tiltseries_smoke(tmp_path: Path) -> None:
     torch.save(torch.rand(32, 48, 48) * 0.01, volume_path)
 
     args = [
-        sys.executable,
-        "-m",
-        "specter.cli._cli",
         "simulate",
         "tiltseries",
         "--volume_path",
         str(volume_path),
-        "--target_v_size",
+        "--voxel_size",
         "4.0",
         "--micrograph_size",
         "48",
@@ -171,7 +242,7 @@ def test_cli_tiltseries_smoke(tmp_path: Path) -> None:
         "5",
         "--n_tilts",
         "3",
-        "--num_frames",
+        "--n_frames",
         "1",
         "--ice_model",
         "none",
@@ -186,7 +257,7 @@ def test_cli_tiltseries_smoke(tmp_path: Path) -> None:
         "--filename",
         "tiltseries",
     ]
-    result = proc.run(args, capture_output=True, encoding="utf-8")
+    result = _invoke_cli(args)
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "tiltseries.mrcs").exists()
     assert (tmp_path / "tiltseries.star").exists()
@@ -197,31 +268,155 @@ def test_cli_tiltseries_smoke(tmp_path: Path) -> None:
         assert mrc.data.shape == (3, 48, 48)
 
 
-def test_cli_tiltseries_help_smoke() -> None:
-    result = proc.run(
-        [sys.executable, "-m", "specter.cli._cli", "simulate", "tiltseries", "--help"],
-        capture_output=True,
-        encoding="utf-8",
+def test_cli_tiltseries_tomogram_config_chains_build_and_simulate(
+    tmp_path: Path,
+) -> None:
+    """--tomogram_config should build the specimen volume first (`specter
+    build tomogram`), then image it -- both the intermediate .mrc and the
+    final .mrcs/.star should land on disk from one `simulate tiltseries`
+    call."""
+    if not _FIXTURE_PDB or not Path(_FIXTURE_PDB).exists():
+        import pytest
+
+        pytest.skip("bundled PDB fixture missing")
+
+    tomo_dir = tmp_path / "tomo"
+    tilt_dir = tmp_path / "tilt"
+    tomogram_config_path = tmp_path / "tomogram.toml"
+    tomogram_config_path.write_text(
+        f"""
+[[targets]]
+pdb_source = "{_FIXTURE_PDB}"
+n_copies = 1
+
+[specimen]
+target_shape = [24, 48, 48]
+voxel_size = 4.0
+
+[output]
+output_dir = "{tomo_dir}"
+filename = "chained_tomogram"
+
+[picks]
+write_picks = false
+write_segmentation = false
+"""
     )
-    assert result.returncode == 0
-    assert "--volume_path" in result.stdout
-    assert "--n_tilts" in result.stdout
 
-
-def test_cli_tiltseries_requires_volume_path(tmp_path: Path) -> None:
-    """Without --volume_path, run_tilt_series should fail with a clear error
-    rather than silently falling back to some other specimen source."""
     args = [
-        sys.executable,
-        "-m",
-        "specter.cli._cli",
         "simulate",
         "tiltseries",
+        "--tomogram_config",
+        str(tomogram_config_path),
+        "--voxel_size",
+        "4.0",
+        "--n_tilts",
+        "3",
+        "--n_frames",
+        "1",
+        "--ice_model",
+        "none",
+        "--noise_model",
+        "none",
+        "--detector_model",
+        "none",
+        "--scattering_model",
+        "ctf",
+        "--device",
+        "cpu",
+        "--output_dir",
+        str(tilt_dir),
+        "--filename",
+        "chained_tilts",
+    ]
+    result = _invoke_cli(args)
+    assert result.returncode == 0, result.stderr
+    assert (tomo_dir / "chained_tomogram.mrc").exists()
+    assert (tilt_dir / "chained_tilts.mrcs").exists()
+    assert (tilt_dir / "chained_tilts.star").exists()
+
+
+def test_cli_tiltseries_tomogram_config_and_volume_path_conflict(
+    tmp_path: Path,
+) -> None:
+    """--tomogram_config and --volume_path are mutually exclusive specimen
+    sources -- passing both should fail loudly rather than silently pick one."""
+    import torch
+
+    volume_path = tmp_path / "volume.pt"
+    torch.save(torch.rand(16, 24, 24) * 0.01, volume_path)
+
+    tomogram_config_path = tmp_path / "tomogram.toml"
+    tomogram_config_path.write_text(
+        """
+[[targets]]
+pdb_source = "1mbo"
+n_copies = 1
+
+[specimen]
+target_shape = [24, 24, 24]
+voxel_size = 12.0
+"""
+    )
+
+    args = [
+        "simulate",
+        "tiltseries",
+        "--tomogram_config",
+        str(tomogram_config_path),
+        "--volume_path",
+        str(volume_path),
         "--device",
         "cpu",
         "--output_dir",
         str(tmp_path),
     ]
-    result = proc.run(args, capture_output=True, encoding="utf-8")
+    result = _invoke_cli(args)
     assert result.returncode != 0
+    assert "tomogram_config" in result.stderr
     assert "volume_path" in result.stderr
+
+
+# PotentialBuilder defaults to the Shtyrov parameterization, which is per
+# bonded species -- passing it no atom_species makes every atom fall back to
+# per-element Peng, silently. run_micrograph did exactly that, so the
+# micrograph path got no benefit from Shtyrov at all while run_particle_stack
+# did. This asserts the wiring rather than the pixels: it captures what
+# PotentialBuilder is actually constructed with, then aborts the run.
+def test_run_micrograph_types_atoms_for_shtyrov(monkeypatch, tmp_path: Path) -> None:
+    import specter.pipelines._micrograph as micrograph_module
+    from specter.config import MicrographConfig
+
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    real_builder = micrograph_module.PotentialBuilder
+
+    def _spy(*args, **kwargs):
+        captured["atom_species"] = kwargs.get("atom_species")
+        captured["n_atoms"] = len(args[2]) if len(args) > 2 else None
+        raise _Sentinel
+
+    monkeypatch.setattr(micrograph_module, "PotentialBuilder", _spy)
+
+    config = MicrographConfig(
+        pdb_source=_FIXTURE_PDB,
+        n_pixels=32,
+        micrograph_size=64,
+        n_micrographs=1,
+        ice_model="none",
+        device="cpu",
+        output_dir=str(tmp_path),
+    )
+    with pytest.raises(_Sentinel):
+        micrograph_module.run_micrograph(config)
+
+    assert captured["atom_species"] is not None, (
+        "run_micrograph built a Shtyrov PotentialBuilder without atom_species, "
+        "so every atom would fall back to per-element Peng"
+    )
+    assert len(captured["atom_species"]) == captured["n_atoms"]
+    assert any(s is not None for s in captured["atom_species"])
+    assert real_builder is not _spy

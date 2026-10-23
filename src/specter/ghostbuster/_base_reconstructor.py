@@ -1,4 +1,13 @@
+"""
+`_BaseReconstructor`: the Lightning scaffolding `Reconstructor` and
+`TomogramReconstructor` share -- optimiser and scheduler construction, the
+manual optimisation step, k-space masking after each update, run-directory
+handling and metrics logging.
+"""
+
 from __future__ import annotations
+
+from specter import logger
 
 import json
 from pathlib import Path
@@ -6,8 +15,18 @@ from typing import Any, cast
 
 import lightning as L
 import torch
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 
-from ._helpers import _apply_kmask_inplace, _build_epoch_metrics, _log_current_lr
+from ._helpers import (
+    _apply_kmask_inplace,
+    _build_epoch_metrics,
+    _build_lr_scheduler,
+    _kmask_half_spectrum,
+    _log_current_lr,
+)
+from ._io import save_volume_mrc
+from specter.options import Scheduler
 
 # ---------------------------------------------------------------------------
 # Shared LightningModule scaffolding for Reconstructor and TomogramReconstructor
@@ -25,21 +44,95 @@ class _BaseReconstructor(L.LightningModule):
     base class holds that shared behaviour so each subclass only implements
     its own forward model and loss.
 
-    Subclasses must set ``self.lr_decay``, ``self.lr``, ``self.kmask``,
-    ``self.V``, ``self._run_dir``, and the ``log_total_loss``/
-    ``log_norm_loss``/``log_sparsity_loss``/``log_lrs`` lists before these
-    methods are used.
+    Subclasses must set ``self.lr_decay``, ``self.lr``, ``self.scheduler``,
+    ``self.kmask``, ``self.V``, ``self.voxel_size``, ``self._run_dir``, and
+    call `_init_loss_logs` before these methods are used.
     """
 
     lr_decay: float
     lr: float | None
+    scheduler: Scheduler
     kmask: torch.Tensor | None
     V: torch.Tensor
+    voxel_size: float
     _run_dir: Path | None
     log_lrs: list[float]
     log_total_loss: list[torch.Tensor]
     log_norm_loss: list[torch.Tensor]
-    log_sparsity_loss: list[torch.Tensor]
+
+    def _init_loss_logs(self) -> None:
+        """Start the per-step loss and learning-rate histories."""
+        self.log_lrs = []
+        self.log_total_loss = []
+        self.log_norm_loss = []
+
+    def _volume_optimizer(
+        self,
+    ) -> tuple[list[torch.optim.Optimizer], list[LRScheduler]]:
+        """
+        The AdamW optimiser on ``V`` and its LR scheduler, as the lists
+        `configure_optimizers` returns; both empty when ``lr`` is None.
+
+        Not ``fused=True``: it is ~8 ms faster per step on a 512^3 volume,
+        but Lightning's 16-mixed plugin hands it grads it rejects ("params,
+        grads, exp_avgs, and exp_avg_sqs must have same dtype, device, and
+        layout").
+        """
+        if self.lr is None:
+            return [], []
+        optimizer = AdamW([self.V], lr=self.lr, weight_decay=0.0)
+        lr_scheduler = _build_lr_scheduler(
+            self.scheduler,
+            optimizer,
+            self.lr,
+            self.reciprocal_lr_scheduler,
+            self.n_training_steps_per_epoch,
+            self.n_training_steps,
+        )
+        return [optimizer], [lr_scheduler]
+
+    def _optimise(self, loss: torch.Tensor) -> None:
+        """
+        One manual optimisation step on ``loss``: zero every optimiser,
+        backpropagate, step them all, step the schedulers, and log the
+        loss to the progress bar.
+        """
+        opts = self._optimizers_list()
+        for opt in opts:
+            opt.zero_grad()
+        self.manual_backward(loss)
+        for opt in opts:
+            opt.step()
+        self._step_schedulers()
+        self.log_dict(
+            {"train_loss": loss},
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=False,
+        )
+
+    def _make_run_dir(self) -> bool:
+        """
+        Create ``run_dir`` and its ``epochs/`` folder if this rank writes.
+
+        Returns False when there is no run directory or this is not the
+        global-zero rank: under multi-GPU (DDP) every replica would
+        otherwise race to create and write the same files.
+        """
+        if self._run_dir is None or not self.trainer.is_global_zero:
+            return False
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+        (self._run_dir / "epochs").mkdir(exist_ok=True)
+        return True
+
+    def _volume_cpu(self) -> torch.Tensor:
+        """``V`` detached, on the host, in float32, for saving and FSCs."""
+        return self.V.detach().cpu().float()
+
+    def _save_volume(self, v: torch.Tensor, path: Path) -> None:
+        """Write ``v`` as an MRC at this module's voxel size."""
+        save_volume_mrc(path, v, self.voxel_size)
 
     def reciprocal_lr_scheduler(self, *args: Any) -> float:
         """
@@ -58,9 +151,22 @@ class _BaseReconstructor(L.LightningModule):
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         """Apply the Fourier-space k-mask to V after each gradient update."""
-        _apply_kmask_inplace(self.V, self.kmask)
+        _apply_kmask_inplace(self.V, self._kmask_half())
 
-    def num_training_steps_per_epoch(self) -> int:
+    def _kmask_half(self) -> torch.Tensor | None:
+        """``self.kmask`` as an unshifted half spectrum, built once per mask
+        tensor and device (see :func:`_kmask_half_spectrum`)."""
+        kmask = self.kmask
+        if kmask is None:
+            return None
+        key = (kmask.data_ptr(), kmask.device, tuple(kmask.shape))
+        cached = getattr(self, "_kmask_half_cache", None)
+        if cached is None or cached[0] != key:
+            cached = (key, _kmask_half_spectrum(kmask))
+            self._kmask_half_cache = cached
+        return cached[1]
+
+    def n_training_steps_per_epoch(self) -> int:
         """
         Return the number of optimizer steps per training epoch.
 
@@ -75,11 +181,11 @@ class _BaseReconstructor(L.LightningModule):
         self.trainer.fit_loop.setup_data()
         assert self.trainer.train_dataloader is not None
         dataset_size = len(self.trainer.train_dataloader)
-        num_steps = dataset_size // self.trainer.accumulate_grad_batches
+        n_steps = dataset_size // self.trainer.accumulate_grad_batches
 
-        return num_steps
+        return n_steps
 
-    def num_training_steps(self) -> int:
+    def n_training_steps(self) -> int:
         """
         Return the total number of optimizer steps in the configured run.
 
@@ -95,11 +201,44 @@ class _BaseReconstructor(L.LightningModule):
         if max_epochs is None or max_epochs < 1:
             raise ValueError("OneCycleLR requires a positive trainer.max_epochs.")
 
-        return self.num_training_steps_per_epoch() * max_epochs
+        return self.n_training_steps_per_epoch() * max_epochs
 
     def _metrics_path_suffix(self) -> str:
         """Filename suffix for saved metrics. Override for e.g. halfset labelling."""
         return ""
+
+    def _optimizers_list(self) -> list[Any]:
+        """Normalise ``self.optimizers()`` (Lightning returns one or a list) to a list."""
+        opts = self.optimizers()
+        if not isinstance(opts, (list, tuple)):
+            opts = [opts]
+        return list(opts)
+
+    def _step_schedulers(self) -> None:
+        """
+        Step every LR scheduler once, for manual optimisation.
+
+        No-op under automatic optimisation or when no scheduler is
+        configured (``self.lr is None``). ``ReduceLROnPlateau`` needs a
+        metric argument this single-step call can't supply, but
+        ``_build_lr_scheduler`` never constructs one -- encountering one
+        here would mean a caller bug, not a normal runtime condition.
+        """
+        if self.automatic_optimization:
+            return
+        sch = self.lr_schedulers()
+        if not sch:
+            return
+        if not isinstance(sch, (list, tuple)):
+            sch = [sch]
+        for s in sch:
+            if isinstance(s, ReduceLROnPlateau):
+                raise TypeError(
+                    "ReduceLROnPlateau is not supported by this manual "
+                    "scheduler step loop; _build_lr_scheduler never "
+                    "constructs one."
+                )
+            s.step()
 
     def _gather_for_logging(self, value: torch.Tensor) -> torch.Tensor:
         """
@@ -131,37 +270,48 @@ class _BaseReconstructor(L.LightningModule):
         return gathered.mean()
 
     def _save_metrics(
-        self, include_loss_std: bool = False, include_lr_min: bool = False
-    ) -> None:
-        """Save training metrics (loss, lr) to JSON.
+        self,
+        include_loss_std: bool = False,
+        include_lr_min: bool = False,
+        write: bool = True,
+    ) -> dict[str, Any] | None:
+        """Build training metrics (loss, lr) and, by default, save them to JSON.
 
         Rank-0-only under multi-GPU (DDP) to avoid every replica racing to
         write the same file. ``log_total_loss``/``log_norm_loss`` are
         gathered/averaged across ranks at the point they're recorded (see
         ``_gather_for_logging``), so under DDP the saved metrics reflect the
         true global-batch loss, not just rank 0's local view.
-        ``log_sparsity_loss`` needs no such gathering -- it depends only on
-        the already-synced volume ``V``, identical on every rank already.
-        ``log_lrs`` likewise needs none -- the learning rate is a
+        ``log_lrs`` needs no such gathering -- the learning rate is a
         deterministic function of step count, not of data.
+
+        Parameters
+        ----------
+        write : bool
+            Write ``metrics<suffix>.json`` to ``self._run_dir``. ``Reconstructor``
+            passes ``False`` and folds the returned dict into a single
+            ``job.json`` instead, rather than one metrics file per halfset.
         """
         if (
             self._run_dir is None
             or not self.log_total_loss
             or not self.trainer.is_global_zero
         ):
-            return
+            return None
 
-        suffix = self._metrics_path_suffix()
-        metrics_path = self._run_dir / f"metrics{suffix}.json"
         meta = _build_epoch_metrics(
             self.log_total_loss,
             self.log_norm_loss,
-            self.log_sparsity_loss,
             self.log_lrs,
             self.current_epoch,
             include_loss_std=include_loss_std,
             include_lr_min=include_lr_min,
         )
+        if not write:
+            return meta
+
+        suffix = self._metrics_path_suffix()
+        metrics_path = self._run_dir / f"metrics{suffix}.json"
         metrics_path.write_text(json.dumps(meta, indent=2))
-        print(f"Saved metrics → {metrics_path}")
+        logger.info(f"Saved metrics → {metrics_path}")
+        return meta

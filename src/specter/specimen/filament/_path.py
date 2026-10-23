@@ -9,7 +9,16 @@ the current direction, then perturbs that direction by a random angle drawn
 from ``[0, flex_deg]`` about a random axis roughly perpendicular to it --
 bounded per-step curvature, unbounded cumulative curvature, the same
 "worm-like chain" flavor CTS used for both its actin and microtubule presets
-(``step=27.3, flex=12`` and ``step=85, flex=3`` respectively).
+(``flex=12`` and ``flex=3`` respectively; specter keeps those flex values
+and takes each preset's ``step`` from measured structures instead).
+
+References
+----------
+.. [1] Purnell, C., Heebner, J., Swulius, M. T., Hylton, R., Kabonick, S.,
+   Grillo, M., Grigoryev, S., Heberle, F., Waxham, M. N., & Swulius, M. T.
+   (2023). Rapid synthesis of cryo-ET data for training deep learning models.
+   *bioRxiv*. https://doi.org/10.1101/2023.04.28.538636
+   (CTS source: https://github.com/carsonpurnell/cryotomosim_CTS)
 """
 
 from __future__ import annotations
@@ -52,6 +61,7 @@ def generate_filament_path(
     flex_deg: float,
     origin_xyz: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
+    direction_xyz: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Generate one filament's monomer-center positions via a persistent random
@@ -62,7 +72,7 @@ def generate_filament_path(
     n_monomers : int
         Number of monomer positions to generate.
     step : float
-        Axial rise per monomer, Angstrom (the distance advanced along the
+        Axial rise per monomer, Å (the distance advanced along the
         current direction at each step).
     flex_deg : float
         Maximum per-step direction change, degrees. Each step's turn angle
@@ -75,6 +85,11 @@ def generate_filament_path(
     generator : torch.Generator, optional
         Random generator for the initial direction and all per-step turns.
         Default None (uses torch's global RNG).
+    direction_xyz : torch.Tensor, optional
+        Initial direction, shape ``(3,)`` (normalized internally). Default
+        None: drawn uniformly at random. Used by microtubule placement,
+        which picks the direction itself so it can reject orientations that
+        would leave a thin slab (see ``_tube.place_microtubules``).
 
     Returns
     -------
@@ -87,7 +102,10 @@ def generate_filament_path(
 
     flex_rad = math.radians(flex_deg)
     pos = torch.zeros(3) if origin_xyz is None else origin_xyz.clone()
-    direction = _random_unit_vector(generator)
+    if direction_xyz is None:
+        direction = _random_unit_vector(generator)
+    else:
+        direction = direction_xyz / direction_xyz.norm().clamp_min(1e-8)
 
     positions = torch.empty((n_monomers, 3))
     for i in range(n_monomers):

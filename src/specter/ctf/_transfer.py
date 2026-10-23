@@ -20,6 +20,7 @@ from ..arrays import kgrid_2d
 from ..constants import energy_to_wavelength
 from ..fft import fft2, ifft2
 from ._parameters import CTFParameters
+from specter.options import AberrationModel
 
 
 class TransferFunction(nn.Module):
@@ -35,10 +36,10 @@ class TransferFunction(nn.Module):
     n_pixels : int
         Exit wave side length in pixels.
     pixel_size : float
-        Pixel size in Angstrom.
-    aberration_model : {"holography", "ctf"}, optional
-        ``"holography"`` returns the full complex aberrated wave;
-        ``"ctf"`` returns its real part. Both use the *complex* torch-ctf
+        Pixel size in Å.
+    aberration_model : {"nonlinear", "linear"}, optional
+        ``"nonlinear"`` returns the full complex aberrated wave;
+        ``"linear"`` returns its real part. Both use the *complex* torch-ctf
         transfer function (``return_complex_ctf=True``), matching
         ``aberrations.Aberration``'s existing behaviour exactly. Adopting
         torch-ctf's dedicated real ``-sin(chi)`` weak-phase-object formula
@@ -47,7 +48,7 @@ class TransferFunction(nn.Module):
         testable like-for-like replacement first.
     specimen_absorption : bool, optional
         If True (default), amplitude contrast is assumed to already be
-        baked into the exit wave via ``scattering.complex_potential``
+        baked into the exit wave via ``potential.apply_amplitude_contrast``
         (specter's default: alpha=0.1) *before* this transfer function is
         ever applied. Any nonzero ``ctf_params.amplitude_contrast`` is
         therefore zeroed here (with a warning) to avoid double-counting
@@ -56,14 +57,14 @@ class TransferFunction(nn.Module):
         Set False only when the exit wave came from a potential with no
         absorption applied upstream (e.g. alpha=0 was used everywhere).
     bfactor : float | torch.Tensor, optional
-        Isotropic B-factor envelope in Angstrom^2. None (default) disables
+        Isotropic B-factor envelope in Å². None (default) disables
         it.
     convergence_angle : float, optional
         Beam convergence semi-angle in milliradians, used for the Cs
         (spatial coherence) envelope. None (default) disables it. Matches
         ``aberrations.Aberration``'s constructor-level convenience exactly.
     cc : float, optional
-        Chromatic aberration coefficient in Angstrom, used for the Cc
+        Chromatic aberration coefficient in Å, used for the Cc
         (temporal coherence) envelope. None (default) disables it.
     energy_spread : float, optional
         FWHM of the beam energy spread in eV, used by the Cc envelope.
@@ -75,16 +76,28 @@ class TransferFunction(nn.Module):
         Relative objective-lens current instability, used by the Cc
         envelope. Default 0.01e-6.
     dose_envelope : bool, optional
-        Whether to apply the Grant & Grigorieff (2015) cumulative-dose
+        Whether to apply the Grant & Grigorieff (2015) radiation-damage
         envelope, using ``ctf_params.dose`` (see :class:`CTFParameters`).
         Default False.
+    dose_weighted : bool, optional
+        Whether the image stands for an exposure-filtered movie sum (True,
+        default) or a plain sum of frames (False). See
+        :func:`specter.aberrations.dose_envelope`.
+
+    References
+    ----------
+    .. [1] torch-ctf (v0.5.2): CTF functions for cryo-EM in torch. teamtomo.
+       https://github.com/teamtomo/torch-ctf
+    .. [2] Grant, T., & Grigorieff, N. (2015). Measuring the optimal exposure for
+       single particle cryo-EM using a 2.6 Å reconstruction of rotavirus VP6.
+       *eLife*, 4, e06980. https://doi.org/10.7554/eLife.06980
     """
 
     def __init__(
         self,
         n_pixels: int,
         pixel_size: float,
-        aberration_model: str = "holography",
+        aberration_model: AberrationModel = "nonlinear",
         specimen_absorption: bool = True,
         bfactor: float | torch.Tensor | None = None,
         convergence_angle: float | None = None,
@@ -93,9 +106,10 @@ class TransferFunction(nn.Module):
         deltaV_V: float = 0.06e-6,
         deltaI_I: float = 0.01e-6,
         dose_envelope: bool = False,
+        dose_weighted: bool = True,
     ) -> None:
         super().__init__()
-        if aberration_model not in ("holography", "ctf"):
+        if aberration_model not in ("nonlinear", "linear"):
             raise ValueError(f"Unknown aberration_model: {aberration_model!r}")
         self.n_pixels = n_pixels
         self.pixel_size = pixel_size
@@ -107,11 +121,12 @@ class TransferFunction(nn.Module):
         self.deltaV_V = deltaV_V
         self.deltaI_I = deltaI_I
         self.dose_envelope = dose_envelope
+        self.dose_weighted = dose_weighted
 
         _, _, KX, KY = kgrid_2d(n_pixels, pixel_size)
         k2 = (KX**2 + KY**2).unsqueeze(0)
-        self.register_buffer("k2", k2)
-        self.register_buffer("k", torch.sqrt(k2))
+        self.register_buffer("k2", k2, persistent=False)
+        self.register_buffer("k", torch.sqrt(k2), persistent=False)
 
         if bfactor is None:
             self.bfactor: torch.Tensor | None = None
@@ -127,7 +142,7 @@ class TransferFunction(nn.Module):
             warnings.warn(
                 "specimen_absorption=True but ctf_params.amplitude_contrast "
                 "is nonzero -- amplitude contrast is assumed to already be "
-                "baked into the exit wave via scattering.complex_potential, "
+                "baked into the exit wave via potential.apply_amplitude_contrast, "
                 "so this term is being zeroed here to avoid double-counting "
                 "it at both the specimen and lens stages. Pass "
                 "specimen_absorption=False if that assumption is wrong for "
@@ -137,8 +152,8 @@ class TransferFunction(nn.Module):
             kwargs = {**kwargs, "amplitude_contrast": torch.zeros_like(ac)}
         return kwargs
 
-    def _zero_dc_for_holography(self, transfer: torch.Tensor) -> torch.Tensor:
-        """Pin the DC (k=0) transfer-function value to 1+0j for holography mode.
+    def _zero_dc_for_nonlinear(self, transfer: torch.Tensor) -> torch.Tensor:
+        """Pin the DC (k=0) transfer-function value to 1+0j for the nonlinear model.
 
         Every genuinely k-dependent chi term (defocus, astigmatism, Cs,
         trefoil, beam tilt, tetrafoil, ...) is already exactly zero at k=0
@@ -150,7 +165,7 @@ class TransferFunction(nn.Module):
         the scattered signal alone splits into absorption/phase channels --
         neither has anything to say about the unscattered beam).
 
-        In holography mode the full complex wave is preserved, so any
+        In the nonlinear model the full complex wave is preserved, so any
         residual constant term left in chi at k=0 becomes a spatially
         uniform phase multiplying the *entire* real-space output (by the
         Fourier shift property) -- physically inert (no effect on intensity
@@ -158,8 +173,8 @@ class TransferFunction(nn.Module):
         removed for the phase-plate/amplitude-contrast terms to have their
         intended effect. This isn't optional or mode-tunable: it's the same
         DC-pinning aberrations.Aberration's phaseshift() already enforces
-        for "holography" (there, only phase_shift could ever be nonzero at
-        DC; amplitude_contrast was unimplemented). "ctf" mode does *not*
+        for "nonlinear" (there, only phase_shift could ever be nonzero at
+        DC; amplitude_contrast was unimplemented). "linear" mode does *not*
         get this treatment -- taking the real part downstream makes a
         uniform phase directly observable there, matching torch-ctf's own
         convention of never special-casing DC (see
@@ -226,18 +241,18 @@ class TransferFunction(nn.Module):
             kwargs.get("even_zernike_coeffs"),
             kwargs.get("odd_zernike_coeffs"),
         ]
-        batch_size = None
+        batchsize = None
         for zdict in zernike_dicts:
             if not zdict:
                 continue
             for coeff in zdict.values():
                 if coeff.numel() > 1:
-                    batch_size = coeff.numel()
-        if batch_size is None:
+                    batchsize = coeff.numel()
+        if batchsize is None:
             return fn(**kwargs, **extra_kwargs, return_complex_ctf=True)
 
         per_particle_outputs = []
-        for i in range(batch_size):
+        for i in range(batchsize):
             # Slice to a length-1 leading dim (not a bare 0-d scalar):
             # calculate_ctf_2d's internal `"... -> ... 1 1"` reshape only
             # *prepends* a new leading batch dim when the input already has
@@ -247,9 +262,9 @@ class TransferFunction(nn.Module):
             # no batch dim at all), while a (1,)-shaped input reshapes to
             # (1, 1, 1), which outranks (H, W) and correctly broadcasts to
             # (1, H, W). Concatenating per-particle (H, W) outputs along
-            # dim=0 silently produces a wrong (batch_size * H, W) shape;
+            # dim=0 silently produces a wrong (batchsize * H, W) shape;
             # keeping a (1, H, W) output per particle is what makes
-            # concatenation reproduce the true (batch_size, H, W) shape.
+            # concatenation reproduce the true (batchsize, H, W) shape.
             particle_kwargs = dict(kwargs)
             for key in ("even_zernike_coeffs", "odd_zernike_coeffs"):
                 if kwargs.get(key):
@@ -287,15 +302,15 @@ class TransferFunction(nn.Module):
         kwargs = self._resolve_amplitude_contrast(kwargs)
         transfer = self._call_calculate_ctf_2d(kwargs)
 
-        if self.aberration_model == "holography":
-            transfer = self._zero_dc_for_holography(transfer)
+        if self.aberration_model == "nonlinear":
+            transfer = self._zero_dc_for_nonlinear(transfer)
 
         if self.bfactor is not None:
             bfactor = self.bfactor.view(-1, 1, 1)
             if torch.any(bfactor != 0):
                 transfer = transfer * b_envelope(self.k2, bfactor)
 
-        # Cs/Cc/dose envelopes: aberrations._envelopes expects Angstrom
+        # Cs/Cc/dose envelopes: aberrations._envelopes expects Å
         # throughout, but CTFParameters' defocus/spherical_aberration are
         # in torch-ctf's own units (micrometers/mm) -- converted here, at
         # the point of use, rather than changing CTFParameters' units.
@@ -328,7 +343,9 @@ class TransferFunction(nn.Module):
 
         if self.dose_envelope and ctf_params.dose is not None:
             dose = ctf_params.dose.gather(idx).view(-1, 1, 1)
-            transfer = transfer * dose_envelope(self.k, dose)
+            transfer = transfer * dose_envelope(
+                self.k, dose, weighted=self.dose_weighted, voltage=kwargs["voltage"]
+            )
 
         return transfer
 
@@ -354,12 +371,12 @@ class TransferFunction(nn.Module):
         Returns
         -------
         torch.Tensor
-            Aberrated exit wave. Complex for ``"holography"``, real for
-            ``"ctf"``.
+            Aberrated exit wave. Complex for ``"nonlinear"``, real for
+            ``"linear"``.
         """
         transfer = self.transfer_function(ctf_params, idx=idx)
         aberrated = ifft2(fft2(exitwave) * transfer)
-        return torch.real(aberrated) if self.aberration_model == "ctf" else aberrated
+        return torch.real(aberrated) if self.aberration_model == "linear" else aberrated
 
 
 def _collapse_if_uniform(coeff: torch.Tensor) -> torch.Tensor:

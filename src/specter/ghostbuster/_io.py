@@ -1,4 +1,11 @@
+"""
+Output helpers for a reconstruction run: MRC volumes, plot3d previews and
+FSC figures.
+"""
+
 from __future__ import annotations
+
+from specter import logger
 
 from pathlib import Path
 
@@ -52,7 +59,57 @@ def save_plot3d_preview(path: Path, v: torch.Tensor, title: str) -> None:
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
     except Exception as exc:
-        print(f"[ghostbuster] plot3d preview skipped: {exc}")
+        logger.warning(f"plot3d preview skipped: {exc}")
+
+
+def save_halfmap_fsc_figure(
+    path: Path,
+    volume_a: torch.Tensor,
+    volume_b: torch.Tensor,
+    voxel_size: float,
+    fsc_mask: torch.Tensor | float | None = None,
+) -> str | None:
+    """
+    Compute and save a gold-standard half-map FSC figure. Silently skips on failure.
+
+    Parameters
+    ----------
+    path : Path
+        Output image path.
+    volume_a, volume_b : torch.Tensor
+        The two half-set volumes, shape ``(Z, Y, X)``.
+    voxel_size : float
+        Voxel size in Å.
+    fsc_mask : torch.Tensor or float, optional
+        Mask applied before the FSC is computed.
+
+    Returns
+    -------
+    str or None
+        Resolution at the FSC = 0.143 crossing (e.g. ``"1.397 Å"``), or None
+        if the figure could not be produced.
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        from ..plots import plot_halfmap_fsc
+
+        mask = fsc_mask if isinstance(fsc_mask, torch.Tensor) else None
+        fig, resolutions = plot_halfmap_fsc(
+            [volume_a.float()],
+            [volume_b.float()],
+            voxel_size=voxel_size,
+            mask=mask,
+            labels=["gold-standard"],
+            show=False,
+        )
+        assert fig is not None
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        return resolutions[0]
+    except Exception as exc:
+        logger.warning(f"half-map FSC plot skipped: {exc}")
+        return None
 
 
 def save_fsc_figure(
@@ -100,7 +157,7 @@ def save_fsc_figure(
             fsc_mask.detach().to(device) if isinstance(fsc_mask, torch.Tensor) else None
         )
 
-        vols = [v]
+        volumes = [v]
         labels = [label]
 
         if cryosparc_ref is not None:
@@ -109,11 +166,11 @@ def save_fsc_figure(
                 if isinstance(cryosparc_ref, torch.Tensor)
                 else cryosparc_ref
             )
-            vols.append(cs_ref_dev)
+            volumes.append(cs_ref_dev)
             labels.append("CryoSPARC")
 
         fig = plot_map_to_model_fsc(
-            vols,
+            volumes,
             fsc_ref_dev,
             voxel_size=voxel_size,
             mask=fsc_mask_dev,
@@ -124,4 +181,4 @@ def save_fsc_figure(
         fig.savefig(path, bbox_inches="tight")
         plt.close(fig)
     except Exception as exc:
-        print(f"[ghostbuster] FSC plot skipped: {exc}")
+        logger.warning(f"FSC plot skipped: {exc}")

@@ -1,5 +1,261 @@
 # Generate a micrograph
 
-!!! info "Work in progress"
-    Will cover `generate_micrograph.py`, its full CLI reference, and
-    memory/chunking guidance for large fields.
+`specter simulate micrograph` builds a physics-based cryo-EM micrograph:
+one or several particles (and, optionally, crowding neighbours) embedded in
+amorphous ice, propagated through the forward model and detector at full
+micrograph scale, rather than the single-particle boxes `specter simulate
+particles` writes. It shares the same forward model as particle-stack
+generation; the difference is the field of view and what fills it.
+
+## Basic usage
+
+Every run loads a TOML config first, then applies any flags given on the
+command line as overrides:
+
+```bash
+specter simulate micrograph --config configs/micrograph.toml
+```
+
+```bash
+specter simulate micrograph \
+    --config configs/micrograph.toml \
+    --pdb_source 6bdf \
+    --n_micrographs 5 \
+    --device cuda:0 \
+    --output_dir micrographs
+```
+
+`configs/micrograph.toml` is the canonical starting point. Copy it and edit
+for your own runs. See [Configure a run](configuration.md) for the full
+TOML/CLI field reference.
+
+The shipped config at a 1536 px field, rather than its 4096 px default,
+writes the micrograph below:
+
+```bash
+--8<-- "docs-includes/cli-guides/micrograph-command.txt"
+```
+
+```{ .text .output }
+--8<-- "docs-includes/cli-guides/micrograph-run.txt"
+--8<-- "docs-includes/cli-guides/micrograph-output.txt"
+```
+
+![A 1536 px micrograph written by specter simulate micrograph, a zoomed region, and its power spectrum.](../assets/images/cli-guides/micrograph-image.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+The micrograph low-pass filtered to 15 Å (left), the boxed 400 Å region at
+8 Å (centre), and the power spectrum of the unfiltered image (right). The
+6BDF (Berman et al. 2000; Campbell et al. 2015) copies sit in 500 Å of
+amorphous ice; at 20 e⁻/Å² they are faint in a single exposure, while the Thon rings and the ice's 3.7 Å ring are clear in
+the spectrum.
+///
+
+![The rotationally averaged power spectrum of the micrograph with the predicted CTF zeros.](../assets/images/cli-guides/micrograph-spectrum.png){ width="700" style="display:block;margin:1.2em auto;" }
+///caption
+The rotationally averaged power spectrum, with the zeros of
+\(\sin\chi\) for the micrograph's sampled defocus of 1.00 µm and the
+config's 2 mm \(C_s\) (dotted). The minima fall on the predicted zeros,
+and the broad maximum near 0.27 Å⁻¹ is the ice.
+///
+
+## What you'll usually tune
+
+- **Specimen**: `pdb_source`, `assembly`, `n_pixels` (the 3D particle
+  potential box), `pixel_size`, `ice_thickness`, and `micrograph_size`
+  below.
+- **Field of view**: `micrograph_size`, the output image size in pixels
+  (square), independent of `n_pixels`. A single particle's potential is
+  built at `n_pixels`, then many copies are placed across a
+  `micrograph_size` field via crowding.
+- **Microscope**: `voltage`, `dose` (total dose for the whole micrograph,
+  not per particle), `defocus`, `cs`, `alpha`.
+- **Dataset**: `n_micrographs`, how many independent micrographs to
+  generate in one run.
+- **Models**: `scattering_model`, `noise_model`, `detector_model`, same
+  choices as [particle generation](particle-stack.md#what-youll-usually-tune).
+
+Everything else lives under
+["Advanced"](../api/cli/simulate.md#specter-simulate-micrograph-advanced) in both the
+TOML and the command reference.
+
+## Ice thickness profiles
+
+Unlike particle-stack generation, where each box is small enough that a
+uniform ice slab is a reasonable approximation, a micrograph spans a large
+enough field that real ice geometry becomes visible across it. Real
+vitrified ice is a meniscus pinned to a foil hole's rim, not a flat slab
+(Noble et al. 2018), and a micrograph taken off-centre in that hole sees a
+thickness ramp across its field. `ice_profile` selects among three shapes:
+
+- **`flat`** (default): a uniform slab, the same behaviour as setting a
+  bare `ice_thickness` with no profile.
+- **`wedge`**: thickness ramps linearly across the field, from
+  `ice_thickness_range`'s low value to its high value, along the direction
+  set by `ice_profile_angle`.
+- **`meniscus`**: the radial thickness profile of a real foil hole; place
+  the field of view anywhere in it via `ice_hole_offset`. Near the
+  hole's centre the film is nearly flat; near the rim it thickens sharply.
+  A micrograph is a small patch of a much larger hole, so `ice_hole_offset`
+  decides whether a given field looks flat, wedged, or strongly curved.
+
+![Ice thickness profiles for the three ice_profile modes over the same field of view: a uniform 500 Å slab (flat), a 250-900 Å ramp (wedge), and the radial thickness of a 1.2 µm foil hole sampled 4500 Å off-centre (meniscus).](../assets/images/micrograph-ice-profiles.png){ width="700" style="display:block;margin:1.2em auto;" }
+///caption
+Ice thickness profiles for the three `ice_profile` modes over the same field of view: a uniform 500 Å slab (`flat`), a 250-900 Å ramp (`wedge`), and the radial thickness of a 1.2 µm foil hole sampled 4500 Å off-centre (`meniscus`).
+///
+
+`ice_tilt` is independent of all three modes: it slopes the ice slab's
+mid-plane while leaving thickness unchanged. That's what a tilted specimen
+looks like, distinct from a wedge, which only changes thickness on one
+side. `ice_tilt` and `ice_profile` compose, so you can express a tilted
+meniscus.
+
+Enabling a profile costs you three things:
+
+- **The thickest column sets the box size, everywhere.** `nz` has to
+  hold the deepest part of the film, and multislice runs one full-plane FFT
+  per slice regardless of what that slice contains, so a 250-900 Å wedge
+  costs the same as a uniform 900 Å slab over the whole field, not the
+  250-900 Å average.
+- **The nominal defocus refers to the ice's scattering centroid.** That
+  is the thickness-weighted mean height of the film, the plane a CTF fit of
+  the micrograph reports. The vacuum a profile leaves in the box does not
+  move it: for a level film it is the box's midplane, as for a flat slab.
+  Only a film that is tilted (`ice_tilt`) and thicker on one side moves it,
+  and `IceProfile.centroid` accounts for that automatically.
+- **A `wedge` needs `pad_fft = true`.** `specter simulate micrograph`
+  warns when a wedge or a nonzero `ice_tilt` runs without it, and from
+  Python a `Sample` with such a profile pads unless told otherwise.
+  Multislice propagates by FFT, so
+  the field is implicitly periodic and the wave leaving one edge re-enters
+  at the opposite one. A flat slab tiles seamlessly, because ice at one
+  edge is statistically identical to ice at the other. A wedge does not:
+  its periodic extension has a thickness step equal to the full span of
+  `ice_thickness_range`, and signal crossing that step carries thick-ice
+  contrast into the thin edge and vice versa.
+
+In a 250-900 Å wedge at 8000 Å defocus, the outer eighth of the field on each
+side reaches 1.6 times the contrast of the interior. Padding removes that and
+leaves the interior unchanged. The reach of the effect is the defocus
+delocalization \(\lambda\,\Delta f\,k_\mathrm{max}\), which is why it grows
+with defocus: roughly 10 px at 1000 Å, 79 px at 8000 Å and 148 px at 15000 Å
+for 1 Å pixels. Padding quadruples the propagation memory, so enable it for a
+wedge rather than leaving it on by default.
+
+A `meniscus` usually does not need it. The artifact scales with the thickness
+difference between *opposite edges* of the field, not with how much the
+thickness varies inside it. A hole centred on the field is symmetric and steps
+by nothing, and even the 4500 Å offset used above steps by only 128 Å, which is
+not measurable. Lateral variation on its own is harmless.
+
+## Absorption, radiation damage and solvent motion
+
+The micrograph command models the same absorption and exposure physics as
+[particle generation](particle-stack.md#absorption-radiation-damage-and-solvent-motion),
+with the same fields.
+
+- **Absorption**: `absorption_model = "inelastic_mfp"` replaces the
+  amplitude-contrast ratio with an imaginary potential derived from measured
+  inelastic mean free paths (`inelastic_mfp_solvent`, `inelastic_mfp_specimen`)
+  and, optionally, the elastic loss beyond an `objective_aperture`. `alpha` is
+  then set to 0, including in the `.star` file. The field is read off the
+  specimen before its ice is added, with the occupancy that weights the ice.
+  Without `inelastic_mfp_specimen` and with a flat slab of ice, the
+  absorption is a uniform attenuation of the exit wave and costs nothing; a
+  specimen mean free path or an `ice_profile` other than a flat untilted slab
+  needs a second canvas the size of the specimen. Multislice only. See
+  [Scattering](../concepts/scattering/index.md#mean-free-path-absorption-support).
+- **Radiation damage**: `dose_envelope_target = "specimen"` (with
+  `dose_envelope = true`) damages the specimen's potential and leaves its ice
+  undamaged, rather than filtering the whole image. Each micrograph's
+  specimen is built for its own dose. The ice is blended into a copy of the
+  undamaged specimen, so assembly holds a second canvas while it runs. See
+  [Aberrations](../concepts/aberrations.md).
+- **Solvent motion**: `ice_motion_variance` filters the ice to what survives
+  the summed exposure. It requires `dose_envelope_target = "specimen"` when
+  `dose_envelope` is on. With the host-resident canvas of a large micrograph
+  the ice is then built into a second host canvas and filtered there before
+  it is blended. See [Ice structure](../concepts/ice.md).
+
+## Chunking and memory
+
+`crowd_chunk_size` is how many crowding duplicate volumes are rotated in one
+batch. It is not a count of Z-slices: each duplicate is a full copy of the
+particle template, rotated into its own orientation before being stamped into
+the canvas, and rotating one needs a sampling grid three times its size. A
+micrograph places hundreds, so rotating them together is what exhausts a
+device.
+
+The default of 1 is also the fastest setting available. Wall time is flat in
+this parameter at micrograph scale while peak memory grows linearly with it,
+so raising it trades memory for nothing. It also changes the order duplicates
+are summed into the canvas, which perturbs the result at float-rounding level.
+
+This affects specimen construction only. `Scattering`'s own multislice
+chunking, which is unrelated and is not a `MicrographConfig` field, bounds
+memory during wave propagation.
+
+The specimen canvas itself is assembled in host memory, since at
+`micrograph_size` it is tens of gigabytes (500 × 4096 × 4096 voxels is
+33.5 GB in float32) and usually does not fit a device alongside the
+propagation. Every voxel operation on it still runs on the device: crowding
+duplicates are rotated there and stamped into the host canvas one at a
+time, and the ice is built and blended a z-slab at a time (the molecules
+of the whole canvas are drawn once and kept on the host; each slab is
+splatted, convolved and occupancy-weighted on the device and added back).
+Peak device memory during assembly is therefore a few slab canvases, and
+peak host memory is the canvas plus the multislice's streaming buffer. The
+multislice uploads the canvas if it fits and otherwise streams it a slice
+chunk at a time, which changes cost, not the result.
+
+## Single-device only
+
+`specter simulate micrograph` does not accept a comma-separated device list
+the way `specter simulate particles` does; `specter simulate tiltseries` is
+single-device for the same reason.
+Each micrograph needs its own freshly regenerated ice and crowding
+specimen between forward passes
+(`Field.draw`), and a single micrograph at
+`micrograph_size` resolution is already the GPU-memory-bound unit of work,
+so there is no batch to shard across multiple devices the way many small
+particle boxes can be. Generating several micrographs faster means running
+separate `specter simulate micrograph` invocations, one per device, by
+hand.
+
+## Output
+
+Results land in `output_dir` as `<filename>.mrcs` (an `(n_micrographs, H,
+W)` stack) and `<filename>.star` (one row per micrograph: voltage, pixel
+size, CTF parameters, dose, coincidence radius). `save_exitwaves` /
+`save_clean_exitwaves` additionally write the pre-detector exit wave, the
+same as [particle-stack
+generation](particle-stack.md#inspecting-the-forward-model-exit-waves).
+
+## Using it from Python instead of the CLI
+
+`run_micrograph(config)` (`specter.pipelines`) is the same function the CLI
+calls. Build a `MicrographConfig` directly in Python (or load one with
+`specter.config.load_config`) instead of going through the command line.
+
+## See also
+
+- [Generate a particle stack](particle-stack.md): the single-particle-box
+  counterpart to this page, sharing the same forward model.
+- [Ice structure](../concepts/ice.md): the physics behind `ice_model` and
+  the amorphous ice generator.
+- [Configure a run](configuration.md): complete TOML/CLI field reference.
+- [Manage jobs](jobs.md): recording runs under a project name.
+
+## References
+
+- Berman, H. M., Westbrook, J., Feng, Z., Gilliland, G., Bhat, T. N.,
+  Weissig, H., Shindyalov, I. N., & Bourne, P. E. (2000). The Protein Data
+  Bank. *Nucleic Acids Research*, 28(1), 235–242.
+  [doi:10.1093/nar/28.1.235](https://doi.org/10.1093/nar/28.1.235)
+- Campbell, M. G., Veesler, D., Cheng, A., Potter, C. S., & Carragher, B.
+  (2015). 2.8 Å resolution reconstruction of the *Thermoplasma acidophilum*
+  20S proteasome using cryo-electron microscopy. *eLife*, 4, e06380.
+  [doi:10.7554/eLife.06380](https://doi.org/10.7554/eLife.06380)
+- Noble, A. J., Dandey, V. P., Wei, H., Brasch, J., Chase, J., Acharya, P.,
+  et al. (2018). Routine single particle CryoEM sample and grid
+  characterization by tomography. *eLife*, 7, e34257.
+  [doi:10.7554/eLife.34257](https://doi.org/10.7554/eLife.34257)

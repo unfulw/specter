@@ -1,0 +1,526 @@
+{
+  "generated": "2026-09-02T14:54:47+00:00",
+  "specter_version": "0.1.0",
+  "configs": [
+    {
+      "file": "config_1000.pt",
+      "seed": 1000,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 146,
+      "wall_time": 336.98138865455985,
+      "stopped_early": true,
+      "sk_loss": 0.005719106178730726,
+      "E_per_atom": -0.22825710475444794,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1001.pt",
+      "seed": 1001,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 111,
+      "wall_time": 284.22818054258823,
+      "stopped_early": true,
+      "sk_loss": 0.0042850663885474205,
+      "E_per_atom": -0.22106648981571198,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1002.pt",
+      "seed": 1002,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 174,
+      "wall_time": 436.3149764984846,
+      "stopped_early": true,
+      "sk_loss": 0.0027534072287380695,
+      "E_per_atom": -0.2326744645833969,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1003.pt",
+      "seed": 1003,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 197,
+      "wall_time": 447.66057473793626,
+      "stopped_early": true,
+      "sk_loss": 0.004667419940233231,
+      "E_per_atom": -0.2481820434331894,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1004.pt",
+      "seed": 1004,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 79,
+      "wall_time": 202.16978607699275,
+      "stopped_early": true,
+      "sk_loss": 0.01905563846230507,
+      "E_per_atom": -0.1992177665233612,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1005.pt",
+      "seed": 1005,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 145,
+      "wall_time": 354.62193581834435,
+      "stopped_early": true,
+      "sk_loss": 0.0007028860272839665,
+      "E_per_atom": -0.22715958952903748,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1006.pt",
+      "seed": 1006,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 156,
+      "wall_time": 344.604045573622,
+      "stopped_early": true,
+      "sk_loss": 0.0004872970748692751,
+      "E_per_atom": -0.22841838002204895,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1007.pt",
+      "seed": 1007,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 156,
+      "wall_time": 367.62265848368406,
+      "stopped_early": true,
+      "sk_loss": 0.006977390497922897,
+      "E_per_atom": -0.2294466346502304,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1008.pt",
+      "seed": 1008,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 250,
+      "wall_time": 572.365665756166,
+      "stopped_early": false,
+      "sk_loss": 0.0012733314651995897,
+      "E_per_atom": -0.27027735114097595,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1009.pt",
+      "seed": 1009,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 157,
+      "wall_time": 358.0286822281778,
+      "stopped_early": true,
+      "sk_loss": 0.0014075463404878974,
+      "E_per_atom": -0.22409404814243317,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1010.pt",
+      "seed": 1010,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 75,
+      "wall_time": 195.57539170980453,
+      "stopped_early": true,
+      "sk_loss": 0.0055334498174488544,
+      "E_per_atom": -0.1944749802350998,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1011.pt",
+      "seed": 1011,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 250,
+      "wall_time": 564.1148760542274,
+      "stopped_early": false,
+      "sk_loss": 0.008054591715335846,
+      "E_per_atom": -0.26212772727012634,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1012.pt",
+      "seed": 1012,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 250,
+      "wall_time": 571.1895284876227,
+      "stopped_early": false,
+      "sk_loss": 0.0036874269135296345,
+      "E_per_atom": -0.2675064206123352,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1013.pt",
+      "seed": 1013,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 110,
+      "wall_time": 259.7418974302709,
+      "stopped_early": true,
+      "sk_loss": 0.003423224901780486,
+      "E_per_atom": -0.21725180745124817,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1014.pt",
+      "seed": 1014,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 190,
+      "wall_time": 416.9184254743159,
+      "stopped_early": true,
+      "sk_loss": 0.02208069898188114,
+      "E_per_atom": -0.2346072494983673,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1015.pt",
+      "seed": 1015,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 87,
+      "wall_time": 213.9430774077773,
+      "stopped_early": true,
+      "sk_loss": 0.00022172431636136025,
+      "E_per_atom": -0.1959020495414734,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1016.pt",
+      "seed": 1016,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 76,
+      "wall_time": 187.6080477759242,
+      "stopped_early": true,
+      "sk_loss": 0.0009745617280714214,
+      "E_per_atom": -0.19283027946949005,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1017.pt",
+      "seed": 1017,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 167,
+      "wall_time": 373.45277256146073,
+      "stopped_early": true,
+      "sk_loss": 0.0005076788365840912,
+      "E_per_atom": -0.22715455293655396,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1018.pt",
+      "seed": 1018,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 250,
+      "wall_time": 572.8232027702034,
+      "stopped_early": false,
+      "sk_loss": 0.00858659390360117,
+      "E_per_atom": -0.2601012885570526,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    },
+    {
+      "file": "config_1019.pt",
+      "seed": 1019,
+      "n": 256,
+      "dx": 1.0,
+      "box_L": 256.0,
+      "n_atoms": 527178,
+      "n_steps": 250,
+      "n_steps_actual": 92,
+      "wall_time": 218.7895555831492,
+      "stopped_early": true,
+      "sk_loss": 0.0011275887954980135,
+      "E_per_atom": -0.19753000140190125,
+      "recipe": {
+        "rep_strength": 0.0,
+        "mlbop_strength": 0.5,
+        "mlbop_target": -0.413,
+        "tol": 0.001,
+        "patience": 10
+      },
+      "optimizer": {
+        "history_size": 100,
+        "max_iter": 25,
+        "prerelax_steps": 30
+      }
+    }
+  ]
+}

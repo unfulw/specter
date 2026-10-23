@@ -1,0 +1,138 @@
+"""
+Tests for the FSC resolution readout in specter.plots.
+"""
+
+import matplotlib
+import pytest
+import torch
+
+matplotlib.use("Agg")
+
+from specter.plots import (  # noqa: E402
+    MAP_TO_MODEL_FSC_THRESHOLD,
+    fsc_resolution,
+    plot_map_to_model_fsc,
+    resolution_between,
+)
+
+
+def _band_limited_pair(
+    n: int, voxel_size: float, seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two noisy observations of one band-limited signal, giving an FSC that
+    falls off smoothly like a real half-map pair rather than dropping to zero
+    after one shell."""
+    torch.manual_seed(seed)
+    kf = torch.fft.fftfreq(n, d=voxel_size)
+    k_mag = torch.sqrt(sum(g**2 for g in torch.meshgrid(kf, kf, kf, indexing="ij")))
+    signal = torch.fft.ifftn(
+        torch.fft.fftn(torch.randn(n, n, n)) * torch.exp(-((k_mag / 0.12) ** 2))
+    ).real
+    signal = signal / signal.std()
+    return (
+        signal + 0.6 * torch.randn(n, n, n),
+        signal + 0.6 * torch.randn(n, n, n),
+    )
+
+
+def test_fsc_resolution_k_max_ignores_crossing_in_tail():
+    """`fourier_shell_correlation` returns shells past Nyquist (the corners of
+    the Fourier cube). A threshold crossing there is aliasing, not signal, and
+    `k_max` exists to keep it out of the reported resolution."""
+    # Stays above 0.5 to Nyquist (0.25) and only crosses at k = 0.35, in the
+    # corner tail.
+    k = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+    fsc = torch.tensor([1.0, 0.9, 0.8, 0.7, 0.3, 0.0])
+
+    # Without k_max, the aliased tail crossing is reported.
+    assert fsc_resolution(k, fsc, 0.5) == "2.857 Å"
+    # With it, the tail is ignored and the FSC never crosses below Nyquist.
+    assert fsc_resolution(k, fsc, 0.5, k_max=0.25) == ">Nyquist"
+
+
+def test_map_to_model_plot_resolution_matches_resolution_between():
+    """`plot_map_to_model_fsc` labels each curve with a resolution, and
+    `resolution_between` returns the same number without drawing. They must
+    agree: both are the map-to-model resolution of the same pair, and only one
+    of them capping the curve at Nyquist would report the aliased corner tail."""
+    # This particular pair is chosen because the two paths *disagreed* before
+    # the k_max fix: the plot labelled a genuinely 5.065 Å map as 1.749 Å,
+    # read off a spurious crossing in the corner shells past Nyquist (3.0 Å).
+    n, voxel_size = 48, 1.5
+    a, b = _band_limited_pair(n, voxel_size, seed=5)
+
+    expected = resolution_between(a, b, voxel_size, MAP_TO_MODEL_FSC_THRESHOLD)
+    assert expected == "5.065 Å"
+
+    fig = plot_map_to_model_fsc(
+        [a], b, voxel_size=voxel_size, labels=["vol"], show=False
+    )
+    assert fig is not None
+    (label,) = fig.axes[0].get_legend_handles_labels()[1]
+    try:
+        assert label == f"vol ({expected})"
+    finally:
+        matplotlib.pyplot.close(fig)
+
+
+def test_map_to_model_resolution_never_finer_than_nyquist():
+    """A reported resolution finer than Nyquist is unphysical: it can only come
+    from a crossing in the aliased corner shells."""
+    torch.manual_seed(1)
+    n, voxel_size = 32, 2.0
+    nyquist_res = 2.0 * voxel_size
+    a = torch.randn(n, n, n)
+    b = torch.randn(n, n, n)
+
+    fig = plot_map_to_model_fsc(
+        [a], b, voxel_size=voxel_size, labels=["vol"], show=False
+    )
+    assert fig is not None
+    (label,) = fig.axes[0].get_legend_handles_labels()[1]
+    matplotlib.pyplot.close(fig)
+
+    if ">Nyquist" not in label:
+        reported = float(label.split("(")[1].split()[0])
+        assert reported >= nyquist_res, (
+            f"reported {reported} Å, finer than Nyquist {nyquist_res} Å"
+        )
+
+
+@pytest.mark.parametrize("threshold", [0.143, 0.5])
+def test_fsc_resolution_reports_no_crossing(threshold):
+    k = torch.linspace(0.0, 0.5, 8)
+    fsc = torch.ones(8)
+    assert fsc_resolution(k, fsc, threshold) == ">Nyquist"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_halfmap_plot_accepts_a_mask_on_another_device():
+    """A reconstructor's ``fsc_mask`` is a buffer on the GPU, but the half-maps
+    `_record_halfmap_resolutions` reads back from disk are on the CPU. The
+    masked curve has to follow the volumes' device rather than fail, which it
+    used to do silently, leaving an empty ``fsc_halfmap_<NNN>.png``."""
+    from specter.plots import plot_halfmap_fsc
+
+    volume_a, volume_b = _band_limited_pair(24, 1.0, seed=3)
+    mask = torch.ones(24, 24, 24, device="cuda")
+
+    fig, resolutions = plot_halfmap_fsc(
+        [volume_a], [volume_b], voxel_size=1.0, mask=mask, show=False
+    )
+
+    _, cpu_resolutions = plot_halfmap_fsc(
+        [volume_a], [volume_b], voxel_size=1.0, mask=mask.cpu(), show=False
+    )
+    assert fig is not None
+    assert resolutions == cpu_resolutions
+
+
+def test_fsc_resolution_reports_the_first_crossing():
+    """A masked FSC that drops through the threshold, then climbs back above it
+    toward Nyquist (shared-mask noise correlation), reports the first crossing,
+    not the artefact further out."""
+    k = torch.linspace(0.0, 0.5, 11)
+    fsc = torch.tensor([1.0, 0.9, 0.7, 0.4, 0.2, 0.10, 0.12, 0.16, 0.10, 0.20, 0.25])
+    # first crossing of 0.143 lies between k[4]=0.20 and k[5]=0.25
+    expected = 1.0 / (0.20 + (0.143 - 0.2) / (0.10 - 0.2) * 0.05)
+    assert fsc_resolution(k, fsc, 0.143) == f"{expected:.3f} Å"

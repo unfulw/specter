@@ -1,5 +1,14 @@
+"""
+Direct electron detector models: the bundled MTF curves (K2, K3, Falcon 3EC,
+Falcon 4i, perfect), their DQE(0), and the coincidence-loss geometry per camera.
+"""
+
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
+
+import numpy as np
 import torch
 from scipy.interpolate import interp1d as scipy_interp1d
 from torchinterp1d import interp1d
@@ -43,14 +52,18 @@ _K3_FREQ = [
 ]
 
 
-def _k3_mtf(
+def _tabulated_mtf(
     n: int,
     dx: float,
     device: str | torch.device,
     return1d: bool,
     mtf_values: list[float],
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Shared implementation for K3 MTF functions."""
+    """Shared implementation for MTF curves tabulated on the ``_K3_FREQ`` grid.
+
+    Used by every preset whose curve is sampled on Gatan's frequency grid:
+    the K3 and K2 MTFs and the Falcon 3EC DQE-derived MTF.
+    """
     k_data = torch.tensor(_K3_FREQ, dtype=torch.float32, device=device) / dx
     mtf = torch.tensor(mtf_values, dtype=torch.float32, device=device)
 
@@ -63,6 +76,12 @@ def _k3_mtf(
     return interp1d(k_data, mtf, k_rad.ravel()).reshape(n, n)
 
 
+# Falcon 4i DQE at 0, 0.5 and 1 x Nyquist. The zero-frequency entry is also
+# the counting efficiency in ``DQE0``, which reads it from here.
+_FALCON4I_300KV_DQE = [0.92, 0.72, 0.50]
+_FALCON4I_200KV_DQE = [0.91, 0.62, 0.33]
+
+
 def _falcon4i_mtf(
     n: int,
     dx: float,
@@ -70,10 +89,25 @@ def _falcon4i_mtf(
     return1d: bool,
     dqe_values: list[float],
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Shared implementation for Falcon 4i MTF functions."""
+    """
+    Shared implementation for Falcon 4i MTF functions.
+
+    The published data are DQE, not MTF. Under a white-noise approximation
+    ``DQE(k) = MTF(k)**2``, so the *shape* is recovered as
+    ``MTF(k) = sqrt(DQE(k) / DQE(0))`` -- normalised by the zero-frequency
+    value so that ``MTF(0) == 1``, as an MTF must be.
+
+    Normalising matters: an MTF is a pure blur and conserves total counts.
+    The zero-frequency efficiency ``DQE(0)`` is a *separate* physical effect
+    (electrons that never register at all) and is applied as a counting
+    efficiency via ``Detector(dqe0=...)``, not folded in here. Folding it in
+    would both scale counts by ``sqrt(DQE(0))`` instead of ``DQE(0)`` and give
+    the wrong shot-noise statistics -- see :func:`dqe0_for_detector`.
+    """
     k_nyquist = 1 / 2 / dx
     k_points = torch.tensor([0.0, 0.5, 1.0], dtype=torch.float32) * k_nyquist
-    mtf_data = torch.sqrt(torch.tensor(dqe_values, dtype=torch.float32))
+    dqe = torch.tensor(dqe_values, dtype=torch.float32)
+    mtf_data = torch.sqrt(dqe / dqe[0])
 
     # Quadratic interpolation via scipy (torchinterp1d does not support quadratic)
     interp = scipy_interp1d(
@@ -86,7 +120,11 @@ def _falcon4i_mtf(
     mtf = torch.from_numpy(interp(k_rad.cpu().numpy())).to(device).reshape(n, n)
 
     if return1d:
-        return k_rad[n // 2 :, n // 2], mtf[n // 2 :, n // 2]
+        # k is native/unshifted FFT order (DC at index 0), so the radial cut
+        # from DC out to Nyquist along one axis is k_rad[:n // 2, 0] -- not
+        # k_rad[n // 2:, n // 2], which starts at index n // 2 (the Nyquist
+        # bin, not DC) and so returns frequencies >= Nyquist only.
+        return k_rad[: n // 2, 0], mtf[: n // 2, 0]
     return mtf
 
 
@@ -119,7 +157,7 @@ def k3_200kv(
     ----------
     https://www.gatan.com/sites/default/files/images/mtf_k3_standard_200kV_FL2.star
     """
-    return _k3_mtf(
+    return _tabulated_mtf(
         n,
         dx,
         device,
@@ -191,7 +229,7 @@ def k3_300kv(
     ----------
     https://www.gatan.com/sites/default/files/images/mtf_k3_standard_300kV_FL2.star
     """
-    return _k3_mtf(
+    return _tabulated_mtf(
         n,
         dx,
         device,
@@ -258,17 +296,193 @@ def perfect_detector(
     mtf : torch.Tensor
         - If return1d=False: 2D NxN MTF array (radially symmetric).
         - If return1d=True: Tuple (k_data, mtf_1d) for 1D MTF along a radial line.
+
+    References
+    ----------
+    .. [1] McMullan, G., Chen, S., Henderson, R., & Faruqi, A. R. (2009). Detective
+       quantum efficiency of electron area detectors in electron microscopy.
+       *Ultramicroscopy*, 109(9), 1126–1143.
+       https://doi.org/10.1016/j.ultramic.2009.04.002
     """
     k = torch.fft.fftfreq(n, d=dx, device=device)
 
     if return1d:
+        # k is native FFT order (DC at index 0), so DC-to-Nyquist is the
+        # first half, as in _falcon4i_mtf.
         omega = k / (1 / (2 * dx))
-        return k[n // 2 :], torch.sinc(omega / 2)[n // 2 :]
+        return k[: n // 2], torch.sinc(omega / 2)[: n // 2]
 
     kx, ky = torch.meshgrid(k, k, indexing="ij")
     k_rad = torch.sqrt(kx**2 + ky**2)
     omega = k_rad / (1 / (2 * dx))
     return torch.sinc(omega / 2)
+
+
+def k2_300kv(
+    n: int, dx: float, device: str | torch.device = "cpu", return1d: bool = False
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    Return the MTF of a Gatan K2 Summit detector at 300 kV (counting mode).
+
+    Uses Gatan's published MTF, tabulated on the same 33-point frequency grid
+    as the K3 tables (``_K3_FREQ``, in cycles per physical pixel), so the
+    same interpolation applies. The K2's physical pixel is 5 um; supply
+    ``dx`` as the *physical* pixel size of the recorded image (super-
+    resolution data binned back to physical pixels).
+
+    Parameters
+    ----------
+    n : int
+        Number of pixels along each axis of the output MTF.
+    dx : float
+        Pixel size of the simulated image (same units as spatial frequency).
+    device : str or torch.device, optional
+        Device to create tensors on ('cpu' or 'cuda'). Default is 'cpu'.
+    return1d : bool, optional
+        If True, return 1D MTF sampled at radial frequencies. Default is False.
+
+    Returns
+    -------
+    mtf : torch.Tensor
+        - If return1d=False: 2D NxN MTF array.
+        - If return1d=True: Tuple (k_data, mtf_values) for 1D MTF.
+
+    References
+    ----------
+    https://www.gatan.com/sites/default/files/images/mtf_k2_300kV_FL2.star
+    """
+    return _tabulated_mtf(
+        n,
+        dx,
+        device,
+        return1d,
+        [
+            1.0,
+            0.997368491,
+            0.993644245,
+            0.988880821,
+            0.983130447,
+            0.976444248,
+            0.968872256,
+            0.9604634,
+            0.951265515,
+            0.941325335,
+            0.9306885,
+            0.919399548,
+            0.907501921,
+            0.895037963,
+            0.882048921,
+            0.868574941,
+            0.854655074,
+            0.840327272,
+            0.825628389,
+            0.810594182,
+            0.795259309,
+            0.779657329,
+            0.763820706,
+            0.747780804,
+            0.731567889,
+            0.71521113,
+            0.698738598,
+            0.682177265,
+            0.665553006,
+            0.648890599,
+            0.632213721,
+            0.615544954,
+            0.598905781,
+        ],
+    )
+
+
+# Falcon 3EC in High Quality electron-counting mode at 300 kV, DQE on the
+# ``_K3_FREQ`` grid (cycles per physical pixel). Digitised from Fig. 3 of the
+# Thermo Fisher Falcon 3EC datasheet (DS0236-EN-10-2018), the curve measured by
+# G. McMullan and R. Henderson (2017); the datasheet's own specification at
+# half Nyquist is 0.7 in HQ EC mode (0.7 e/px/s) and 0.6 in EC mode (1 e/px/s).
+# The embedded figure is 300 x 247 px, so each value is good to about +-0.02;
+# the last grid point (1.016 x Nyquist) is extrapolated from the curve's end.
+_FALCON3EC_300KV_DQE = [
+    0.954,
+    0.942,
+    0.929,
+    0.916,
+    0.898,
+    0.883,
+    0.867,
+    0.855,
+    0.845,
+    0.834,
+    0.824,
+    0.816,
+    0.809,
+    0.804,
+    0.797,
+    0.789,
+    0.775,
+    0.765,
+    0.755,
+    0.742,
+    0.727,
+    0.712,
+    0.694,
+    0.671,
+    0.645,
+    0.618,
+    0.586,
+    0.550,
+    0.509,
+    0.463,
+    0.414,
+    0.363,
+    0.311,
+]
+
+
+def falcon3ec_300kv(
+    n: int, dx: float, device: str | torch.device = "cpu", return1d: bool = False
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """
+    Return the MTF of a Thermo Fisher Falcon 3EC detector at 300 kV.
+
+    High Quality electron-counting mode. The published data are a DQE curve
+    (see ``_FALCON3EC_300KV_DQE``), so the shape is recovered as
+    ``MTF(k) = sqrt(DQE(k) / DQE(0))`` under the same white-noise
+    approximation as the Falcon 4i presets, with ``DQE(0)`` applied
+    separately as a counting efficiency (``DQE0``). The curve is tabulated on
+    the K2/K3 frequency grid rather than reduced to three points, because it
+    falls steeply over the last fifth of the Nyquist range.
+
+    Parameters
+    ----------
+    n : int
+        Number of pixels along each axis of the output MTF.
+    dx : float
+        Pixel size of the simulated image, taken as the physical pixel.
+    device : str or torch.device, optional
+        Device to create tensors on ('cpu' or 'cuda'). Default is 'cpu'.
+    return1d : bool, optional
+        If True, return 1D MTF sampled at radial frequencies. Default is False.
+
+    Returns
+    -------
+    mtf : torch.Tensor
+        - If return1d=False: 2D NxN MTF array.
+        - If return1d=True: Tuple (k_data, mtf_values) for 1D MTF.
+
+    References
+    ----------
+    .. [1] Thermo Fisher Scientific. (2018). *Falcon 3EC Direct Electron Detector*
+       (Datasheet DS0236-EN-10-2018), Fig. 3 (measurement by G. McMullan and
+       R. Henderson).
+       https://documents.thermofisher.com/TFS-Assets/MSD/Technical-Notes/Falcon-3EC-Datasheet.pdf
+    .. [2] McMullan, G., Chen, S., Henderson, R., & Faruqi, A. R. (2009). Detective
+       quantum efficiency of electron area detectors in electron microscopy.
+       *Ultramicroscopy*, 109(9), 1126–1143.
+       https://doi.org/10.1016/j.ultramic.2009.04.002
+    """
+    dqe0 = _FALCON3EC_300KV_DQE[0]
+    mtf = [math.sqrt(d / dqe0) for d in _FALCON3EC_300KV_DQE]
+    return _tabulated_mtf(n, dx, device, return1d, mtf)
 
 
 def falcon4i_300kv(
@@ -299,9 +513,17 @@ def falcon4i_300kv(
 
     References
     ----------
-    https://www.thermofisher.com/sg/en/home/electron-microscopy/products/accessories-em/falcon-detector.html
+    .. [1] Thermo Fisher Scientific. (2022). *Falcon 4i Direct Electron Detector*
+       (Datasheet DS0371-EN-01-2022).
+       https://documents.thermofisher.com/TFS-Assets/MSD/Datasheets/falcon-detector-datasheet-ds0371.pdf
+    .. [2] Thermo Fisher Scientific. Falcon 4i Direct Electron Detector.
+       https://www.thermofisher.com/sg/en/home/electron-microscopy/products/accessories-em/falcon-detector.html
+    .. [3] McMullan, G., Chen, S., Henderson, R., & Faruqi, A. R. (2009). Detective
+       quantum efficiency of electron area detectors in electron microscopy.
+       *Ultramicroscopy*, 109(9), 1126–1143.
+       https://doi.org/10.1016/j.ultramic.2009.04.002
     """
-    return _falcon4i_mtf(n, dx, device, return1d, [0.92, 0.72, 0.50])
+    return _falcon4i_mtf(n, dx, device, return1d, _FALCON4I_300KV_DQE)
 
 
 def falcon4i_200kv(
@@ -332,6 +554,335 @@ def falcon4i_200kv(
 
     References
     ----------
-    https://www.thermofisher.com/sg/en/home/electron-microscopy/products/accessories-em/falcon-detector.html
+    .. [1] Thermo Fisher Scientific. (2022). *Falcon 4i Direct Electron Detector*
+       (Datasheet DS0371-EN-01-2022).
+       https://documents.thermofisher.com/TFS-Assets/MSD/Datasheets/falcon-detector-datasheet-ds0371.pdf
+    .. [2] Thermo Fisher Scientific. Falcon 4i Direct Electron Detector.
+       https://www.thermofisher.com/sg/en/home/electron-microscopy/products/accessories-em/falcon-detector.html
+    .. [3] McMullan, G., Chen, S., Henderson, R., & Faruqi, A. R. (2009). Detective
+       quantum efficiency of electron area detectors in electron microscopy.
+       *Ultramicroscopy*, 109(9), 1126–1143.
+       https://doi.org/10.1016/j.ultramic.2009.04.002
     """
-    return _falcon4i_mtf(n, dx, device, return1d, [0.91, 0.62, 0.33])
+    return _falcon4i_mtf(n, dx, device, return1d, _FALCON4I_200KV_DQE)
+
+
+#: The bundled MTF presets by ``detector_model`` name.
+MTF_PRESETS: dict[
+    str, Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]
+] = {
+    "k3_300kv": k3_300kv,
+    "k3_200kv": k3_200kv,
+    "k2_300kv": k2_300kv,
+    "falcon4i_300kv": falcon4i_300kv,
+    "falcon4i_200kv": falcon4i_200kv,
+    "falcon3ec_300kv": falcon3ec_300kv,
+    "perfect": perfect_detector,
+}
+
+
+def detector_mtf(
+    detector_model: str | None,
+    n: int,
+    pixel_size: float,
+    physical_pixel_size: float | None = None,
+    device: str | torch.device = "cpu",
+) -> torch.Tensor | None:
+    """
+    The 2D MTF of a bundled detector on an image's Fourier grid.
+
+    An MTF is a property of the detector's physical pixel. An image that was
+    resampled after recording -- a particle stack Fourier-cropped or binned
+    from the micrographs -- has a coarser pixel, and its Nyquist frequency
+    reaches only part of the detector's. The curve is then evaluated on the
+    physical pixel and read off at the image's frequencies; applying it on the
+    image pixel instead would stretch the whole curve over the resampled range
+    and place the detector's Nyquist fall-off at the image's Nyquist.
+
+    Parameters
+    ----------
+    detector_model : str or None
+        A key of `MTF_PRESETS`. None, ``"none"`` or an unknown name returns None.
+    n : int
+        Image size in pixels along each axis.
+    pixel_size : float
+        Pixel size of the image in Angstrom.
+    physical_pixel_size : float, optional
+        Pixel size at which the movies were recorded, in Angstrom. Default
+        None, the image pixel is the physical pixel, which returns exactly
+        what the preset itself returns.
+    device : str or torch.device, optional
+        Device of the returned tensor. Default 'cpu'.
+
+    Returns
+    -------
+    torch.Tensor or None
+        ``(n, n)`` MTF in unshifted FFT order, or None for no detector.
+    """
+    fn = MTF_PRESETS.get(detector_model) if detector_model is not None else None
+    if fn is None:
+        return None
+    if physical_pixel_size is None or physical_pixel_size == pixel_size:
+        return _as_tensor(fn(n, pixel_size, device))
+    # The curve on the physical pixel, finely sampled, then interpolated at the
+    # image's radial frequencies; past the physical Nyquist (an image finer
+    # than the detector) it holds its last value.
+    k_curve, mtf_curve = fn(2048, physical_pixel_size, "cpu", return1d=True)
+    k = torch.fft.fftfreq(n, pixel_size, dtype=torch.float64)
+    k_rad = torch.sqrt(k[:, None] ** 2 + k[None, :] ** 2)
+    mtf = np.interp(
+        k_rad.numpy(),
+        k_curve.double().cpu().numpy(),
+        mtf_curve.double().cpu().numpy(),
+    )
+    return torch.as_tensor(mtf, dtype=torch.float32, device=device)
+
+
+def _as_tensor(x: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """A preset called with ``return1d=False`` returns one tensor."""
+    assert isinstance(x, torch.Tensor)
+    return x
+
+
+# Zero-frequency detective quantum efficiency, DQE(0), per detector model.
+#
+# This is the *counting efficiency*: the fraction of incident electrons that
+# register at all. For a detector that records each electron independently with
+# probability p, thinning a Poisson process leaves a Poisson process of mean
+# p*N, so DQE(0) = p exactly. It is applied by scaling the expected electron
+# count (see ``Detector(dqe0=...)``), which reproduces both the reduced mean and
+# the correct shot noise -- unlike a multiplicative filter, which gets the
+# variance wrong.
+#
+# Kept separate from the MTF because they are two halves of one measured curve:
+# the MTF carries the frequency dependence (normalised to 1 at DC, conserving
+# counts) and DQE(0) carries the overall efficiency.
+#
+# Only entries with a traceable published source are listed. Models absent here
+# default to 1.0 (an ideal counter), which is optimistic -- real direct
+# detectors sit around 0.5-0.95 at 300 kV.
+#
+# IMPORTANT: these must be *low-dose-rate* values. Published DQE(0) falls with
+# dose rate precisely because of coincidence loss, which specter models
+# separately; using a high-flux figure here would count that loss twice. The
+# Falcon 4i value is consistent with the low-flux limit measured from beam-only
+# micrographs (fitted zero-dose intercept 0.926 vs 0.92 published).
+DQE0: dict[str, float] = {
+    "falcon4i_300kv": _FALCON4I_300KV_DQE[0],
+    "falcon4i_200kv": _FALCON4I_200KV_DQE[0],
+    # Falcon 3EC, HQ electron-counting mode at its lowest dose rate: the
+    # zero-frequency end of the curve in ``_FALCON3EC_300KV_DQE``.
+    "falcon3ec_300kv": 0.95,
+    # K2 Summit counting mode at 300 kV, low dose rate: McMullan, Faruqi,
+    # Clare & Henderson, Ultramicroscopy 147, 156-163 (2014).
+    "k2_300kv": 0.80,
+    "perfect": 1.0,
+}
+
+
+def dqe0_for_detector(detector_model: str | None) -> float:
+    """
+    Return the zero-frequency DQE (counting efficiency) for a detector model.
+
+    Parameters
+    ----------
+    detector_model : str or None
+        Detector model name, e.g. ``"falcon4i_300kv"``. ``None`` or an unknown
+        name returns 1.0.
+
+    Returns
+    -------
+    float
+        DQE(0) in (0, 1]. 1.0 means every incident electron is counted.
+
+    Notes
+    -----
+    The K3 entries deliberately have no value: their bundled response is a
+    measured MTF (already normalised to 1 at DC), and Gatan's datasheet gives
+    only lower bounds on the DQE (above 0.90 at its peak at 300 kV) at no
+    stated dose rate, which is not the low-dose-rate DQE(0) this needs, so
+    assuming one would be inventing physics.
+    They therefore behave as ideal counters until a sourced value is added.
+
+    References
+    ----------
+    .. [1] Thermo Fisher Scientific. (2022). *Falcon 4i Direct Electron Detector*
+       (Datasheet DS0371-EN-01-2022).
+       https://documents.thermofisher.com/TFS-Assets/MSD/Datasheets/falcon-detector-datasheet-ds0371.pdf
+    .. [2] Thermo Fisher Scientific. (2018). *Falcon 3EC Direct Electron Detector*
+       (Datasheet DS0236-EN-10-2018), Fig. 3 (measurement by G. McMullan and
+       R. Henderson).
+       https://documents.thermofisher.com/TFS-Assets/MSD/Technical-Notes/Falcon-3EC-Datasheet.pdf
+    .. [3] McMullan, G., Faruqi, A. R., Clare, D., & Henderson, R. (2014).
+       Comparison of optimal performance at 300 keV of three direct electron
+       detectors for use in low dose electron microscopy. *Ultramicroscopy*,
+       147, 156–163. https://doi.org/10.1016/j.ultramic.2014.08.002
+    """
+    if detector_model is None:
+        return 1.0
+    return DQE0.get(detector_model, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Coincidence loss: the detector constants, and the conversion from a dataset's
+# dose rate to the ``coincidence_radius`` a *simulation* should be given.
+#
+# ``Detector.apply_coincidence`` loses an electron that lands within an
+# exclusion radius r of one already counted in the same frame, so its mean
+# loss depends on one number, the occupancy per exclusion cell per frame,
+#
+#     lambda = (electrons per physical pixel per frame) * pi * r**2 .
+#
+# r is a property of the camera unit and its counting configuration, measured
+# once against beam-only frames (see ``Detector.apply_coincidence``'s notes),
+# and the per-frame flux is the dataset's dose rate divided by the detector's
+# HARDWARE frame rate -- the rate at which counting happens, not the fraction
+# grouping a user chose for motion correction. A simulation usually runs at a
+# binned pixel with far fewer frames than the camera recorded; holding lambda
+# fixed across that change preserves the mean loss and its contrast
+# dependence, which is what `coincidence_radius_for_simulation` does. It does
+# not preserve the *spatial* extent of the exclusion, which only a detector
+# stage run at the physical pixel would.
+# ---------------------------------------------------------------------------
+
+#: Exclusion radius in PHYSICAL pixels, per calibrated detector model. Only
+#: entries with a traceable measurement are listed; a model absent here has no
+#: calibration, and callers should say so rather than borrow a neighbour's.
+EXCLUSION_RADIUS_PX: dict[str, float] = {
+    # Fitted against 14 beam-only EER acquisitions spanning 0.15-31 e/px/s with
+    # DQE(0)=0.92 modelled explicitly (manuscript/coincidence-loss-exp.ipynb).
+    "falcon4i_300kv": 2.0,
+    # Campbell et al. 2015 (eLife 4:e06380): ~12 e/physical px/s incident
+    # recorded as ~9 counts/px/s, a 25% loss at 400 fps, inverted through
+    # Detector.apply_coincidence with dqe0=1 (the published loss is relative
+    # to the low-rate linear extrapolation, so DQE(0) sits on top of it).
+    "k2_300kv": 2.54,
+}
+
+#: Frame rate at which each detector counts, in Hz. Coincidence happens per
+#: hardware frame, so this -- not the number of fractions saved -- sets the
+#: per-frame flux. Falcon 4i: 320 Hz (Thermo Fisher Scientific 2022, datasheet
+#: DS0371-EN-01-2022). K2 Summit: 400 Hz (Li et al. 2013, Nat. Methods 10,
+#: 584-590). K3: 1500 Hz (Gatan datasheet DS-1025-FL8-CA-FEB21; Sheng et al.
+#: 2022, Faraday Discuss. 240, 261-276). K3 data recorded in correlated double
+#: sampling (CDS) mode read every frame twice and count at 750 Hz (Sheng et al.
+#: 2022); for such a dataset pass 750 to `coincidence_occupancy`, which doubles
+#: the occupancy and raises the coincidence radius a simulation should use by
+#: sqrt(2) at the same dose rate. Full references are in
+#: `coincidence_occupancy`. A hybrid-pixel counter (DECTRIS SINGLA, ~4500 Hz
+#: with sub-microsecond dead time) has no coincidence loss at cryo-EM rates,
+#: which ``"perfect"`` stands in for.
+HARDWARE_FRAME_RATE_HZ: dict[str, float] = {
+    "falcon4i_300kv": 320.0,
+    "falcon4i_200kv": 320.0,
+    "k2_300kv": 400.0,
+    "k3_300kv": 1500.0,
+    "k3_200kv": 1500.0,
+}
+
+#: Dose rate a detector is typically operated at, in e/physical px/s. Used
+#: only as a stated fallback when a dataset's own dose rate is unknown.
+TYPICAL_DOSE_RATE_E_PX_S: dict[str, float] = {
+    "falcon4i_300kv": 4.0,
+    "falcon4i_200kv": 4.0,
+    "k2_300kv": 8.0,
+    "k3_300kv": 15.0,
+    "k3_200kv": 15.0,
+}
+
+
+def coincidence_occupancy(
+    exclusion_radius_px: float, dose_rate_e_px_s: float, frame_rate_hz: float
+) -> float:
+    """
+    Electrons per exclusion cell per hardware frame, ``lambda``.
+
+    Parameters
+    ----------
+    exclusion_radius_px : float
+        Exclusion radius in physical pixels (see `EXCLUSION_RADIUS_PX`).
+    dose_rate_e_px_s : float
+        Incident dose rate in electrons per physical pixel per second.
+    frame_rate_hz : float
+        Hardware counting frame rate in Hz (see `HARDWARE_FRAME_RATE_HZ`).
+
+    Returns
+    -------
+    float
+        ``dose_rate / frame_rate * pi * r**2``. The mean coincidence loss of
+        `Detector.apply_coincidence` is a function of this number alone.
+
+    Notes
+    -----
+    The frame rate is the camera's internal counting rate in the mode the data
+    were recorded in (`HARDWARE_FRAME_RATE_HZ`): 320 Hz for the Falcon 4i
+    [1]_, 400 Hz for the K2 Summit [2]_ and 1500 Hz for the K3 [3]_, [4]_. In
+    correlated double sampling (CDS) mode a K3 reads each frame twice and
+    counts at 750 Hz [4]_, so CDS data take ``frame_rate_hz=750``: twice the
+    occupancy of the same dose rate in the standard mode.
+
+    References
+    ----------
+    .. [1] Thermo Fisher Scientific. (2022). *Falcon 4i Direct Electron Detector*
+       (Datasheet DS0371-EN-01-2022).
+       https://documents.thermofisher.com/TFS-Assets/MSD/Datasheets/falcon-detector-datasheet-ds0371.pdf
+    .. [2] Li, X., Mooney, P., Zheng, S., Booth, C. R., Braunfeld, M. B.,
+       Gubbens, S., Agard, D. A., & Cheng, Y. (2013). Electron counting and
+       beam-induced motion correction enable near-atomic-resolution
+       single-particle cryo-EM. *Nature Methods*, 10(6), 584–590.
+       https://doi.org/10.1038/nmeth.2472
+    .. [3] Gatan, Inc. (2021). *K3 Direct Detection Cameras, Models 1025 and
+       1024* (Datasheet DS-1025-FL8-CA-FEB21).
+       https://www.gatan.com/products/tem-imaging-spectroscopy/k3-camera
+    .. [4] Sheng, Y., Harrison, P. J., Vogirala, V., Yang, Z., Strain-Damerell,
+       C., Frosio, T., Himes, B. A., Siebert, C. A., Zhang, P., & Clare, D. K.
+       (2022). Application of super-resolution and correlative double sampling
+       in cryo-electron microscopy. *Faraday Discussions*, 240, 261–276.
+       https://doi.org/10.1039/D2FD00049K
+    """
+    if frame_rate_hz <= 0:
+        raise ValueError("frame_rate_hz must be positive")
+    return dose_rate_e_px_s / frame_rate_hz * math.pi * exclusion_radius_px**2
+
+
+def coincidence_radius_for_simulation(
+    occupancy: float, dose_e_per_A2: float, sim_pixel_size: float, sim_n_frames: int
+) -> float:
+    """
+    The ``coincidence_radius`` (in simulation pixels) that reproduces a given
+    per-cell occupancy when the simulation uses its own pixel size and frame
+    count.
+
+    Parameters
+    ----------
+    occupancy : float
+        Electrons per exclusion cell per frame on the real detector, from
+        `coincidence_occupancy`.
+    dose_e_per_A2 : float
+        Total dose of the simulated image in e/Å².
+    sim_pixel_size : float
+        Pixel size of the simulated image in Å.
+    sim_n_frames : int
+        Number of frames the simulation splits the dose into
+        (``Exposure(n_frames=...)``).
+
+    Returns
+    -------
+    float
+        Radius in simulation pixels such that
+        ``(dose * px**2 / n_frames) * pi * r**2 == occupancy``. Zero
+        occupancy returns 0.0, which `Detector.apply_coincidence` reads as
+        plain Poisson.
+
+    Examples
+    --------
+    EMPIAR-11377 (Falcon 4, 1293 EER fractions of a 5.2 s exposure at
+    4.1 e/px/s) simulated at 1.462 Å with 40 frames: occupancy 0.21, radius
+    0.18 px.
+    """
+    if occupancy <= 0:
+        return 0.0
+    e_per_sim_pixel_frame = dose_e_per_A2 * sim_pixel_size**2 / sim_n_frames
+    if e_per_sim_pixel_frame <= 0:
+        raise ValueError("dose, pixel size and frame count must be positive")
+    return math.sqrt(occupancy / (math.pi * e_per_sim_pixel_frame))

@@ -26,8 +26,9 @@ theme:
   features:
     - navigation.tabs
     - navigation.tabs.sticky
-    - navigation.sections
     - navigation.top
+    - navigation.indexes
+    - navigation.footer
     - content.code.copy
     - content.code.annotate
 
@@ -39,8 +40,11 @@ markdown_extensions:
   - toc:
       permalink: true
   - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
   - pymdownx.superfences
   - pymdownx.highlight
+  - pymdownx.blocks.caption
   - pymdownx.arithmatex:
       generic: true
   - pymdownx.snippets:
@@ -50,27 +54,61 @@ markdown_extensions:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
+extra_css:
+  - stylesheets/extra.css
+
 extra_javascript:
   - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 
 nav:
   - Home: index.md
   - Get started:
+      - Overview: overview.md
       - Installation: installation.md
-      - Quickstart: quickstart.md
-  - User Guide:
-      - Generate a particle stack: user-guide/particle-stack.md
-      - Generate a micrograph: user-guide/micrograph.md
-      - Generate a tilt series: user-guide/tilt-series.md
-      - Build a tomogram specimen: user-guide/build-tomogram.md
-      - Generate a CryoSPARC dataset twin: user-guide/dataset-twin.md
-      - Using the ice cache: user-guide/ice-cache.md
-      - Configure a run: user-guide/configuration.md
-      - Manage jobs: user-guide/jobs.md
-      - Reconstruct a volume: user-guide/reconstruction.md
-  - Concepts:
+      - Basic examples: basic-examples.md
+  - User guide:
+      - Walkthrough:
+          - walkthrough/index.md
+          - Structures and potentials: walkthrough/potentials.md
+          - "Specimens: crowding and ice": walkthrough/specimens.md
+          - Scattering: walkthrough/scattering.md
+          - Contrast transfer function: walkthrough/ctf.md
+          - Partial coherence: walkthrough/coherence.md
+          - Detection: walkthrough/detection.md
+          - Particle stacks: walkthrough/particle-stacks.md
+          - Micrographs: walkthrough/micrographs.md
+          - Tilt series: walkthrough/tilt-series.md
+          - Reconstruction: walkthrough/reconstruction.md
+          - From Python to the command line: walkthrough/command-line.md
+      - Tutorials:
+          - tutorials/index.md
+          - Simulating a real dataset: tutorials/real-dataset.md
+          - Cellular specimens for cryo-ET: tutorials/cellular-specimens.md
+          - Radiation damage and the solvent: tutorials/dose-damage.md
+          - Inelastic scattering and energy filtering: tutorials/inelastic.md
+          - Gradients through the forward model: tutorials/differentiable.md
+          - Composing a forward model by hand: tutorials/custom-forward-model.md
+          - Building an ice library: tutorials/ice-library.md
+      - Command-line guides:
+          - Simulate:
+              - Generate a particle stack: user-guide/particle-stack.md
+              - Generate a micrograph: user-guide/micrograph.md
+              - Generate a tilt series: user-guide/tilt-series.md
+              - Match an experimental dataset: user-guide/dataset-twin.md
+          - Build:
+              - Build a tomogram specimen: user-guide/build-tomogram.md
+              - Using the ice cache: user-guide/ice-cache.md
+          - Reconstruct:
+              - Reconstruct a volume: user-guide/reconstruction.md
+          - Manage runs:
+              - Configure a run: user-guide/configuration.md
+              - Manage jobs: user-guide/jobs.md
+              - Manage the PDB cache: user-guide/cache.md
+      - Example gallery: gallery.md
+  - Theory:
       - Overview: concepts/index.md
       - Pipeline overview: concepts/pipeline-overview.md
+      - Conventions: concepts/conventions.md
       - Specimens:
           - Overview: concepts/specimens.md
           - Atomic potentials: concepts/atomic-potentials.md
@@ -78,10 +116,17 @@ nav:
           - Single-particle:
               - Pose & crowding: concepts/pose-crowding.md
           - Cryo-ET:
+              - Overview: concepts/cryoet-specimen/index.md
               - Membrane shape:
                   - Overview: concepts/membrane-shape/index.md
                   - Spherical harmonics: concepts/membrane-shape/spherical-harmonics.md
                   - Swept spline: concepts/membrane-shape/swept-spline.md
+              - Bilayer & transmembrane proteins: concepts/cryoet-specimen/bilayer.md
+              - Filaments: concepts/cryoet-specimen/filaments.md
+              - Microtubules: concepts/cryoet-specimen/microtubules.md
+              - Gold fiducial beads: concepts/cryoet-specimen/beads.md
+              - Carbon support film: concepts/cryoet-specimen/carbon-film.md
+              - Regions & protein packing: concepts/cryoet-specimen/packing.md
       - Forward simulation:
           - Overview: concepts/forward-simulation.md
           - Scattering:
@@ -89,24 +134,40 @@ nav:
               - Multislice: concepts/scattering/multislice.md
               - Rytov: concepts/scattering/rytov.md
               - Other modes: concepts/scattering/other-modes.md
+              - Frozen plasmon (inelastic): concepts/scattering/frozen-plasmon.md
           - Aberrations: concepts/aberrations.md
           - Detector: concepts/detector.md
-      - Reconstruction math: concepts/reconstruction-math.md
   - Reference:
-      - Overview: api/index.md
-      - specter: api/specter.md
-      - specter.aberrations: api/aberrations.md
-      - specter.atom: api/atom.md
-      - specter.cli: api/cli.md
-      - specter.ghostbuster: api/ghostbuster.md
-      - specter.ice: api/ice.md
-      - specter.imagegenerator: api/imagegenerator.md
-      - specter.io: api/io.md
-      - specter.jobs: api/jobs.md
-      - specter.pipelines: api/pipelines.md
-      - specter.rotations: api/rotations.md
-      - specter.specimen: api/specimen.md
-      - Core modules: api/core.md
+      - CLI:
+          - Overview: api/cli/index.md
+          - specter simulate: api/cli/simulate.md
+          - specter build: api/cli/build.md
+          - specter reconstruct: api/cli/reconstruct.md
+          - specter match: api/cli/match.md
+          - specter convert: api/cli/convert.md
+          - specter jobs: api/cli/jobs.md
+          - specter cache: api/cli/cache.md
+      - API:
+          - Overview: api/index.md
+          - specter: api/specter.md
+          - specter.aberrations: api/aberrations.md
+          - specter.atom: api/atom.md
+          - specter.ctf: api/ctf.md
+          - specter.ghostbuster: api/ghostbuster.md
+          - specter.ice: api/ice.md
+          - specter.imaging: api/imaging.md
+          - specter.inelastic: api/inelastic.md
+          - specter.io: api/io.md
+          - specter.jobs: api/jobs.md
+          - specter.match: api/match.md
+          - specter.pipelines: api/pipelines.md
+          - specter.potential: api/potential.md
+          - specter.rotations: api/rotations.md
+          - specter.scattering: api/scattering.md
+          - specter.specimen: api/specimen.md
+          - specter.tilt: api/tilt.md
+          - Core modules: api/core.md
+      - Bibliography: references.md
 
 plugins:
   - mkdocstrings:
@@ -116,8 +177,6 @@ plugins:
           options:
             docstring_style: numpy
             show_source: false
-            show_root_heading: true
-            show_root_full_path: false
             merge_init_into_class: true
             docstring_section_style: table
             members_order: source

@@ -6,10 +6,29 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "biopython>=1.85",
-    "biotite>=1.4.0",
     "click>=8.4.2",
+    "connected-components-3d>=4.1.0",
     "cryosparc-tools>=5.0",
+    # GPU distance transforms for the spherical_harmonics membrane backend
+    # (specter.specimen.membrane) -- ~3x faster field generation end-to-end,
+    # and the path the membrane memory budgets are calibrated for. Marked
+    # off darwin because cupy-cuda12x publishes Linux and Windows wheels
+    # only; specter still runs there, falling back to scipy's CPU transform
+    # exactly as it does when no CUDA device is present at runtime.
+    #
+    # CUDA 11 users: swap this for "cupy-cuda11x" and change the PyTorch
+    # index below to match. Nothing in specter needs a specific CUDA
+    # release -- see docs/installation.md, "Choosing a CUDA version". A
+    # mismatch here is not fatal: the GPU transform warns once and falls
+    # back to scipy (see specimen/membrane/_field.py).
+    "cupy-cuda12x>=13.0; sys_platform != 'darwin'",
+    # Non-uniform FFTs (specter.nufft): exact point-group averaging evaluates a
+    # volume's transform at rotated frequencies. cufinufft publishes Linux and
+    # Windows wheels only; on macOS, or when it cannot load, finufft runs the
+    # same transform on the CPU.
+    "cufinufft>=2.5; sys_platform != 'darwin'",
     "eerfile>=0.0.4",
+    "finufft>=2.5",
     "gemmi>=0.7.3",
     "h5py>=3.14.0",
     "lightning>=2.5.5",
@@ -18,6 +37,7 @@ dependencies = [
     "numpy>=2.3.3",
     "pandas>=2.3.3",
     "plotly>=6.3.1",
+    "psutil>=5.9",
     "requests>=2.32.5",
     "rich>=14.2.0",
     "rich-click>=1.9.8",
@@ -26,7 +46,12 @@ dependencies = [
     "scipy>=1.16.2",
     "starfile>=0.5.13",
     "torch>=2.5.0",
-    "torch-ctf>=0.5.2",
+    # Upper bound is load-bearing, not caution: ctf/_legacy.py multiplies the
+    # Zernike terms by rho_max**3 to undo torch-ctf 0.5.2's normalize_rho=True
+    # default. That default changed upstream after 0.5.2, so a newer release
+    # would double-correct and silently break trefoil and beam tilt. Lift this
+    # and delete the workaround together, never separately.
+    "torch-ctf>=0.5.2,<0.6",
     "torch-grid-utils>=0.5.2",
     "torchinterp1d>=1.1",
     "tqdm>=4.67.1",
@@ -37,10 +62,6 @@ dependencies = [
 docs = [
     "zensical>=0.0.51",
     "mkdocstrings[python]>=0.30",
-    "mkdocs-material>=9.6",  # fallback renderer for ReadTheDocs' native mkdocs builder
-]
-gpu-edt = [
-    "cupy-cuda12x>=13.0",
 ]
 
 [dependency-groups]
@@ -50,17 +71,28 @@ dev = [
     "gemmi>=0.7.3",
     "ipykernel>=7.1.0",
     "ipywidgets>=8.1.8",
+    "mcp>=2.0.0",
     "mypy>=1.19.1",
     "pre-commit>=4.3.0",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
+    "pytest-xdist>=3.8.0",
     "rich>=14.2.0",
     "ruff>=0.14.4",
+    "seaborn>=0.13.2",
+    "torch-fourier-slice>=0.5.2",
 ]
 
 [tool.uv]
 package = true
 
+# The CUDA build of PyTorch to resolve. cu121 is what this project is
+# developed against, not a requirement of the code -- edit the URL (and the
+# cupy-cuda12x pin above, together) for a different CUDA release; see
+# docs/installation.md, "Choosing a CUDA version", for the version table.
+# Note CUDA minor-version compatibility means any 12.x driver runs these
+# wheels, so this usually only needs changing for CUDA 11, ROCm or CPU-only.
+# uv-specific: a pip install ignores this and takes PyPI's default build.
 [[tool.uv.index]]
 name = "pytorch-cu121"
 url = "https://download.pytorch.org/whl/cu121"
@@ -71,13 +103,15 @@ torch = { index = "pytorch-cu121" }
 
 [[tool.mypy.overrides]]
 module = [
-    "biotite.*",
     "cryosparc.*",
+    "cufinufft.*",
     "cupy.*",
     "cupyx.*",
+    "finufft.*",
     "ipywidgets.*",
     "mrcfile.*",
     "pandas.*",
+    "psutil.*",
     "requests.*",
     "roma.*",
     "scipy.*",
@@ -92,9 +126,53 @@ ignore_missing_imports = true
 include-package-data = true
 
 [tool.setuptools.package-data]
-specter = ["atom_data/*.txt"]
+# Data files that must ship in a wheel, not just resolve from a checkout.
+# atom_data holds *.json as well as *.txt -- params_cat.json backs the default
+# Shtyrov parameterization (see potential.py), so a *.txt-only glob would leave
+# an installed specter unable to build its default potentials.
+# ice_data holds the bundled IceBank library plus the MD reference frame every
+# GradientSKIcemaker run needs for its default S(k) target; ~62 MB, which is
+# under 1% of an install whose torch/nvidia/cupy dependencies already come to
+# several GB. Deliberately NOT here: ice-data/ at the repository root still
+# holds two 32 MB legacy MDSimDump inputs that no code path reads (notebooks
+# only), and shipping them would push the wheel past PyPI's 100 MB per-file
+# limit for no benefit.
+specter = [
+    "atom_data/*.txt",
+    "atom_data/*.json",
+    "ice_data/*.pt",
+    "ice_data/ice_cache/*.pt",
+    # Provenance for the shipped library: seeds, recipe, per-config
+    # convergence and timings. Regenerable from the .pt files themselves,
+    # but shipping it means an installed specter can report what its ice is
+    # without re-deriving it.
+    "ice_data/ice_cache/manifest.json",
+]
 
 [project.scripts]
 specter = "specter.cli._cli:main"
-specter-jobs = "specter.jobs._cli:main"
 
+
+[tool.pytest.ini_options]
+# A bare `uv run pytest` runs the maintained non-network suite. Measured at
+# 2m10s on this 128-core host after reducing CLI startup and fixture costs.
+# Work stealing balances the uneven numerical tests. 32 workers pairs with
+# the 4 threads/worker that tests/conftest.py sets; lower the worker count on
+# a smaller machine. Runtime varies with machine load and available hardware.
+#
+# Use `-n 0` to disable, which is what you want for `--pdb`, `-s`, or any single
+# test -- the 32 worker startups cost more than a short test does.
+# Override with `-m ''` to include network tests, or `-m network` for only those.
+testpaths = ["tests"]
+addopts = "-n 32 --dist worksteal -m 'not network'"
+markers = [
+    "network: needs internet access (fetches structures from RCSB)",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# A walkthrough script imports where its page first quotes the import, so
+# the code a reader sees on the page reads top to bottom, even when the
+# script's own plotting code imported the same module earlier.
+"docs-figures/walkthrough/*.py" = ["E402", "F811"]
+"docs-figures/tutorials/*.py" = ["E402", "F811"]
+"docs-figures/cli_guides/*.py" = ["E402", "F811"]

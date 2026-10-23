@@ -1,0 +1,410 @@
+"""
+Physics checks for the detector coincidence-loss model.
+
+``Detector.apply_detector_physics`` suppresses coincident electron arrivals
+using a randomized square-cell grid, which is an *approximation* to the
+physically-stated rule ("an electron is lost if it lands within radius r of one
+already recorded"). These tests pin down the two properties that make
+``coincidence_radius`` physically meaningful:
+
+1. its effective exclusion area is ``pi * r**2`` -- i.e. the parameter really
+   is a radius, not a shape-specific grid index; and
+2. it agrees with an exact pairwise implementation of the same rule.
+
+The exact rule is reimplemented here rather than shipped in ``src/`` because it
+is O(n^2) and has no production use; keeping it in the test preserves the
+cross-check without carrying dead code.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pytest
+import torch
+from scipy.optimize import brentq
+
+from specter.microscope import Detector
+
+# Enough seeds to average out the +-5% per-call cell-size jitter in the grid
+# rule; too few makes the measured area noisy by several percent.
+N_SEEDS = 16
+SIZE = 256
+
+# Coincidence loss must be large compared to Poisson counting noise, or the
+# measurement is dominated by it: at this density ~4-16% of electrons are lost
+# (per radius below) versus ~0.5% counting noise over N_SEEDS frames. Much
+# lower densities make these tests meaningless rather than merely imprecise.
+N0 = 0.03
+
+
+def _survival_to_area(survival: float, n0: float) -> float:
+    """
+    Invert ``survival = (1 - exp(-n0*A)) / (n0*A)`` for the effective exclusion
+    area ``A``. Exact for a cell-occupancy rule at any density, unlike the
+    ``survival ~= 1 - n0*A/2`` low-density approximation.
+    """
+    return brentq(lambda a: (1 - math.exp(-n0 * a)) / (n0 * a) - survival, 1e-6, 500.0)
+
+
+def _exact_pairwise_survival(n0: float, r: float, size: int, seed: int) -> float:
+    """
+    Fraction of electrons surviving under the exact rule: an electron is
+    discarded if it falls within `r` of any earlier surviving electron.
+    """
+    rng = np.random.default_rng(seed)
+    n_e = rng.poisson(n0 * size * size)
+    if n_e == 0:
+        return 1.0
+    coords = rng.random((n_e, 2)) * size
+
+    keep = np.ones(n_e, dtype=bool)
+    r_sq = r * r
+    for i in range(n_e):
+        if not keep[i]:
+            continue
+        d_sq = ((coords[i + 1 :] - coords[i]) ** 2).sum(axis=1)
+        keep[i + 1 :][d_sq < r_sq] = False
+    return int(keep.sum()) / n_e
+
+
+def _grid_survival(n0: float, r: float, size: int, seeds: range) -> float:
+    """Mean surviving fraction from the production grid rule."""
+    detector = Detector(pixel_size=1.0)
+    intensity = torch.ones(size, size) / (size * size)
+    out = []
+    for s in seeds:
+        torch.manual_seed(s)
+        img = detector.apply_detector_physics(intensity, 1.0, n0, coinc_radius_pixels=r)
+        out.append(img.sum().item() / (n0 * size * size))
+    return float(np.mean(out))
+
+
+@pytest.mark.parametrize("radius", [1.0, 2.0])
+def test_effective_exclusion_area_is_pi_r_squared(radius: float) -> None:
+    """
+    The grid rule's effective exclusion area must equal pi*r^2, which is what
+    makes `coincidence_radius` interpretable as a physical radius (and lets it
+    be converted to real units via the detector's pixel pitch).
+
+    Regression guard for the rescaling: the pre-2026-08 convention indexed the
+    grid cell's *side* as ``r / sqrt(2)``, giving area ``r**2 / 2`` -- which is
+    off by ``2*pi`` in area, i.e. ~2.5x in radius, and would fail here.
+    """
+    survival = _grid_survival(N0, radius, SIZE, range(N_SEEDS))
+    area_eff = _survival_to_area(survival, N0)
+    assert area_eff == pytest.approx(math.pi * radius**2, rel=0.08)
+
+
+@pytest.mark.parametrize("radius", [1.0, 2.0])
+def test_grid_matches_exact_pairwise_rule(radius: float) -> None:
+    """
+    The grid approximation must reproduce the exact pairwise exclusion rule it
+    stands in for. Compared on loss fraction (1 - survival), which is the
+    quantity coincidence loss actually controls.
+    """
+    grid_loss = 1.0 - _grid_survival(N0, radius, SIZE, range(N_SEEDS))
+    exact_loss = 1.0 - float(
+        np.mean([_exact_pairwise_survival(N0, radius, SIZE, s) for s in range(N_SEEDS)])
+    )
+    assert grid_loss == pytest.approx(exact_loss, rel=0.10)
+
+
+def test_zero_radius_disables_coincidence_loss() -> None:
+    """r <= 0 must fall through to plain Poisson noise, losing no electrons."""
+    detector = Detector(
+        pixel_size=1.0, noise_model="poisson", n_frames=4, progressbars=False
+    )
+    img = torch.full((64, 64), 5.0)
+
+    torch.manual_seed(0)
+    out = detector.apply_coincidence(img.clone(), dose=1.0, coincidence_radius=0.0)
+
+    # Poisson-distributed about the input, so no systematic loss.
+    assert out.mean().item() == pytest.approx(img.mean().item(), rel=0.05)
+
+
+def test_positive_radius_all_zero_image_returns_blank_frame() -> None:
+    """
+    Regression test: an all-zero image with coincidence_radius > 0 used to
+    compute ``intensity_map = img / img.sum()`` with no guard for
+    ``img.sum() == 0``, i.e. ``0/0 = NaN`` -- which torch.poisson then
+    rejected with "invalid Poisson rate, expected rate to be non-negative"
+    (NaN fails the same >=0 check a genuine negative rate would). An
+    all-zero image is a real, reachable case: e.g. scattering_model="ctf"
+    has no vacuum baseline (unlike multislice's exp(i*sigma*dz*V) == 1 at
+    V=0), so an entirely empty specimen volume (e.g. a rare zero-particle-
+    placement draw from crowding) produces an exactly-zero image. The
+    physically correct output for zero expected signal is a blank frame,
+    not an exception.
+    """
+    detector = Detector(
+        pixel_size=1.0, noise_model="poisson", n_frames=4, progressbars=False
+    )
+    img = torch.zeros((64, 64))
+
+    out = detector.apply_coincidence(img.clone(), dose=1.0, coincidence_radius=0.7181)
+
+    assert torch.isfinite(out).all()
+    assert (out == 0).all()
+
+
+# ---------------------------------------------------------------------------
+# Detector response: MTF (blur) vs DQE(0) (counting efficiency)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "preset",
+    [
+        "k3_200kv",
+        "k3_300kv",
+        "k2_300kv",
+        "falcon4i_200kv",
+        "falcon4i_300kv",
+        "falcon3ec_300kv",
+        "perfect_detector",
+    ],
+)
+def test_mtf_is_normalised_at_dc(preset: str) -> None:
+    """
+    Every bundled MTF must be 1 at zero frequency.
+
+    An MTF describes blur, which redistributes signal without destroying it.
+    Detection efficiency is a separate effect carried by ``dqe0``. The Falcon
+    presets are derived from published DQE and previously had DC = sqrt(DQE(0))
+    ~ 0.96, which silently scaled counts through what should be a pure filter.
+    """
+    from specter import detectors
+
+    mtf = getattr(detectors, preset)(n=128, dx=1.0, device="cpu")
+    assert float(mtf.flatten()[0]) == pytest.approx(1.0, abs=1e-5)
+    assert float(mtf.max()) == pytest.approx(1.0, abs=1e-5)
+
+
+@pytest.mark.parametrize(
+    "preset", ["falcon4i_200kv", "falcon4i_300kv", "perfect_detector"]
+)
+def test_falcon4i_return1d_matches_2d_radial_profile(preset: str) -> None:
+    """``return1d=True``'s k_data must run from 0 (DC) up to ~Nyquist, and
+    its mtf values must match the 2D MTF sampled along the same radial cut.
+
+    Regression test: the slice used to previously be ``k_rad[n // 2:, n //
+    2]``, which -- since k is native/unshifted FFT order (DC at index 0,
+    not index n // 2) -- selected frequencies >= Nyquist only, the wrong
+    half of the array entirely.
+    """
+    from specter import detectors
+
+    n, dx = 128, 1.0
+    fn = getattr(detectors, preset)
+    k_1d, mtf_1d = fn(n=n, dx=dx, device="cpu", return1d=True)
+    mtf_2d = fn(n=n, dx=dx, device="cpu", return1d=False)
+
+    k_nyquist = 1 / (2 * dx)
+    assert float(k_1d[0]) == pytest.approx(0.0, abs=1e-6)
+    assert float(k_1d.max()) < k_nyquist
+    assert torch.all(torch.diff(k_1d) > 0)  # monotonically increasing
+    assert torch.allclose(mtf_1d, mtf_2d[: n // 2, 0], atol=1e-5)
+
+
+def test_dqe0_scales_detected_counts() -> None:
+    """
+    dqe0 must scale recorded electrons by exactly that factor, and must apply
+    with noise disabled -- it is a property of detection, not of noise.
+    """
+    exitwave = torch.ones(1, 64, 64, dtype=torch.complex64)
+    dose = torch.tensor([10.0])
+    cr = torch.zeros(1)
+
+    ideal = Detector(pixel_size=1.0).forward(exitwave, dose, cr)
+    lossy = Detector(pixel_size=1.0, dqe0=0.92).forward(exitwave, dose, cr)
+
+    assert lossy.sum().item() == pytest.approx(0.92 * ideal.sum().item(), rel=1e-6)
+
+
+def test_dqe0_rejects_out_of_range() -> None:
+    for bad in (0.0, -0.1, 1.5):
+        with pytest.raises(ValueError, match="dqe0"):
+            Detector(pixel_size=1.0, dqe0=bad)
+
+
+def test_named_detector_carries_its_dqe0() -> None:
+    """The DQE(0) and MTF halves must travel together with the detector name."""
+    from specter.detectors import dqe0_for_detector
+
+    assert dqe0_for_detector("falcon4i_300kv") == 0.92
+    assert dqe0_for_detector(None) == 1.0
+    assert dqe0_for_detector("not_a_detector") == 1.0
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("shape", [(29, 37), (64, 64)])
+@pytest.mark.parametrize("radius", [0.5, 2.0])
+@pytest.mark.parametrize("cell_jitter", [-10.0, 0.0, 10.0])
+def test_scatter_coincidence_matches_stable_sort(
+    monkeypatch, device, shape, radius, cell_jitter
+):
+    """Keep exactly the same arrivals, including at the cell-width bounds."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    import specter.microscope as microscope
+
+    detector = Detector(pixel_size=1.059)
+    torch.manual_seed(19)
+    intensity = torch.rand(shape, device=device)
+    intensity /= intensity.sum()
+    # Exercise both clamped cell widths as well as the nominal one.
+    # `apply_detector_physics` forwards its (possibly None) per-image
+    # generator to every draw; `torch.full` takes none, so drop it.
+    monkeypatch.setattr(
+        torch,
+        "randn",
+        lambda *a, generator=None, **kw: torch.full(a, cell_jitter, **kw),
+    )
+    with monkeypatch.context() as ref:
+        ref.setattr(microscope, "_COINCIDENCE_MAX_DENSE_CELLS", 0)
+        torch.manual_seed(5)
+        expected = detector.apply_detector_physics(intensity, 1.059, 0.8, radius)
+        expected_next_random = torch.rand(8, device=device)
+
+    # Fail if the intended dense path silently falls back to sorting.
+    def no_sort(*args, **kwargs):
+        raise AssertionError("Expected dense coincidence selection")
+
+    monkeypatch.setattr(torch, "argsort", no_sort)
+    torch.manual_seed(5)
+    actual = detector.apply_detector_physics(intensity, 1.059, 0.8, radius)
+    assert torch.equal(actual, expected)
+    assert torch.equal(torch.rand(8, device=device), expected_next_random)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("radius,dose", [(1e-4, 0.8), (0.5, 0.001)])
+def test_coincidence_sparse_grid_avoids_dense_allocation(
+    monkeypatch, device, radius, dose
+):
+    """Tiny radii and sparse arrivals must use memory proportional to arrivals."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    def no_dense_selection(*args, **kwargs):
+        raise AssertionError("Sparse coincidence frame allocated a dense lookup")
+
+    monkeypatch.setattr(torch.Tensor, "scatter_reduce_", no_dense_selection)
+    torch.manual_seed(5)
+    intensity = torch.full((64, 64), 1 / 64**2, device=device)
+    result = Detector(pixel_size=1.0).apply_detector_physics(
+        intensity, 1.0, dose, radius
+    )
+    assert result.shape == intensity.shape
+    assert torch.isfinite(result).all()
+    assert result.sum() > 0
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test_batched_detection_matches_per_image_coincidence(weighted: bool) -> None:
+    """`detect_expected_counts` builds the frame-weight grids once per batch
+    and reads the radii in one transfer; under a seed the stack is bitwise
+    the one `apply_coincidence` gives image by image."""
+    gen = torch.Generator().manual_seed(0)
+    images = 5.0 + 5.0 * torch.rand(3, 24, 24, generator=gen)
+    dose = torch.full((3,), 10.0)
+    radius = torch.tensor([1.5, 0.5, 2.0])
+    weights = torch.rand(4, 9, generator=gen) + 0.5 if weighted else None
+    det = Detector(
+        1.0, noise_model="poisson", n_frames=4, dose_weights=weights, progressbars=False
+    )
+    torch.manual_seed(11)
+    batched = det.detect_expected_counts(images.clone(), dose, radius)
+    torch.manual_seed(11)
+    per_image = torch.stack(
+        [
+            det.apply_coincidence(img.clone(), float(d), float(r))
+            for img, d, r in zip(images, dose, radius)
+        ]
+    )
+    assert torch.equal(batched, per_image)
+
+
+def test_dose_weights_without_coincidence_loss() -> None:
+    """dose_weights with coincidence_radius=0 is a weighted sum of plain
+    Poisson frames; it used to divide by a zero coincidence-cell side."""
+    from specter.microscope import Detector
+
+    n, n_frames = 32, 4
+    det = Detector(
+        pixel_size=1.0,
+        noise_model="poisson",
+        n_frames=n_frames,
+        dose_weights=torch.ones(n_frames, 8),
+        dose_weights_max_frequency=0.5,
+        progressbars=False,
+    )
+    torch.manual_seed(0)
+    img = torch.full((n, n), 50.0)
+    out = det.apply_coincidence(img, 50.0, 0.0)
+    assert out.shape == img.shape
+    assert torch.isfinite(out).all()
+    # Unit weights leave the signal untouched.
+    assert out.mean().item() == pytest.approx(50.0, rel=0.02)
+
+
+def test_falcon3ec_reproduces_its_published_dqe() -> None:
+    """
+    DQE(0) * MTF(k)**2 must give back the published Falcon 3EC curve.
+
+    The preset stores the digitised DQE and converts it to an MTF shape plus a
+    separate counting efficiency; this checks the round trip at the points
+    read off the source figure (0.776 at half Nyquist, 0.696 at 0.7 Nyquist),
+    and that the MTF only ever falls.
+    """
+    from specter.detectors import dqe0_for_detector, falcon3ec_300kv
+
+    k, mtf = falcon3ec_300kv(n=256, dx=1.0, device="cpu", return1d=True)
+    dqe = dqe0_for_detector("falcon3ec_300kv") * mtf**2
+    at = lambda f: float(dqe[torch.argmin((k - f / 2).abs())])  # noqa: E731
+    assert at(0.5) == pytest.approx(0.776, abs=0.02)
+    assert at(0.7) == pytest.approx(0.696, abs=0.02)
+    assert bool((mtf[1:] <= mtf[:-1] + 1e-6).all())
+
+
+@pytest.mark.parametrize("preset", ["k3_300kv", "falcon4i_300kv", "falcon3ec_300kv"])
+def test_detector_mtf_without_a_physical_pixel_is_the_preset(preset: str) -> None:
+    """Unset (or equal) physical pixel: exactly what the preset returns."""
+    from specter import detectors
+
+    ref = getattr(detectors, preset)(96, 0.8, "cpu")
+    assert torch.equal(detectors.detector_mtf(preset, 96, 0.8), ref)
+    assert torch.equal(
+        detectors.detector_mtf(preset, 96, 0.8, physical_pixel_size=0.8), ref
+    )
+    assert detectors.detector_mtf(None, 96, 0.8) is None
+
+
+def test_detector_mtf_is_evaluated_on_the_physical_pixel() -> None:
+    """
+    A stack Fourier-cropped after recording (EMPIAR-10551: movies at 0.514 A,
+    particles at 0.7027 A) reaches only 0.73 of the detector's Nyquist. The MTF
+    at the image's Nyquist must be the detector's value there, not the value at
+    the detector's own Nyquist that evaluating on the image pixel would give.
+    """
+    from specter.detectors import detector_mtf, falcon3ec_300kv
+
+    n, img, phys = 480, 0.7027, 0.514
+    mtf = detector_mtf("falcon3ec_300kv", n, img, physical_pixel_size=phys)
+    k_curve, m_curve = falcon3ec_300kv(2048, phys, "cpu", return1d=True)
+    k_nyq_img = 1 / (2 * img)
+    expected = float(np.interp(k_nyq_img, k_curve.numpy(), m_curve.numpy()))
+    naive = float(falcon3ec_300kv(n, img, "cpu")[0, n // 2])
+    assert float(mtf[0, n // 2]) == pytest.approx(expected, abs=1e-3)
+    assert float(mtf[0, n // 2]) > naive + 0.1  # 0.84 against 0.62
+    assert float(mtf[0, 0]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_camera_rejects_a_non_positive_detector_pixel() -> None:
+    from specter.settings import Camera
+
+    with pytest.raises(ValueError, match="detector_pixel_size"):
+        Camera(detector_pixel_size=0.0)

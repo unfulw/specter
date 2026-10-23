@@ -1,39 +1,66 @@
 """
-Carbon support film and gold fiducial bead generation -- a from-scratch
-port of CryoTomoSim (CTS)'s ``gen_carbon.m`` and ``gen_beads.m``. No
-dependency on polnet or VTK.
+Gold fiducial bead generation -- a from-scratch port of CryoTomoSim (CTS)'s
+``gen_beads.m`` [1]_. No dependency on polnet or VTK.
 
 Generic, self-contained physics (no CTS-specific placement logic). Used by
-``specimen.tomogram.MembraneTomogramGenerator`` (the generator behind
-`specter build tomogram`) -- see its own module docstring. Originally
-shared with ``specimen.cryotomosim``'s now-deleted CTS-replica generator;
-kept as its own module rather than folded into ``tomogram/generator.py``
-directly, since nothing about this physics is tomogram-generator-specific.
+``specimen.tomogram.TomogramSpecimenGenerator`` (the generator behind
+`specter build tomogram`) -- see its own module docstring. Its own module
+rather than part of ``tomogram/generator.py``, since nothing about this
+physics is tomogram-generator-specific.
 
-Both classes below are homogeneous-bulk-material models -- there is no
-atomic/molecular structure to hand ``specter.potential.PotentialBuilder``,
-so intensity has to be derived from real bulk mass density rather than
-from explicit atom coordinates.
+``BeadGenerator`` is a bulk-material model -- there is no atomic/molecular
+structure to hand ``specter.potential.PotentialBuilder``, so intensity has
+to be derived from real bulk mass density rather than from a PDB: real
+bulk mass density -> number density (Avogadro's number, molar mass) ->
+per-atom potential integral, by reusing specter's own atomic-potential
+parameterizations (via ``ice._kernels.build_atomic_potential_kernel``) --
+i.e. the same physics used everywhere else in specter to turn atoms into
+scattering potential, just fed a bulk material's number density instead of
+explicit PDB coordinates. This lands in real volts and is independent of
+voxel size, and the resulting mean inner potential comes out in the
+literature ballpark for gold (~29 V at this bulk density; [2]_ compiles
+measured values of 16.8-30.2 V and calculated values of 25.0-35.9 V, and
+measures 32.2 +/- 3.6 V), unlike CTS's
+raw atom-count value (dimensionally inconsistent with
+``PotentialBuilder``'s V*Å-unit output, and unphysically dependent on
+voxel size).
 
-Both do this the same way: real bulk mass density -> number density
-(Avogadro's number, molar mass) -> mean inner potential, by reusing
-specter's own atomic-potential parameterizations (via
-``ice._kernels.build_atomic_potential_kernel``) to get the material's
-per-atom potential integral, then scaling by number density -- i.e. the
-same physics used everywhere else in specter to turn atoms into
-scattering potential, just applied to a bulk material's *mean* potential
-instead of per-atom positions (appropriate here since, unlike ice's
-amorphous structure, sub-atomic texture isn't being modeled for either
-material -- see each class's docstring). This lands in real volts and is
-independent of voxel size, and comes out in the literature ballpark for
-both materials' mean inner potential (~9-13 V for amorphous carbon,
-~25-30 V for gold at these bulk densities), unlike a raw atom-count value
-(dimensionally inconsistent with ``PotentialBuilder``'s V*Å-unit output,
-and unphysically dependent on voxel size).
+Unlike CTS, the bead is not a cloud of point atoms binned into voxels: it
+is built from real fcc gold atoms (randomly oriented, Debye-Waller
+jittered) splatted through the atomic potential kernel, the same way
+``potential.PotentialBuilder`` renders a protein. That is correct at any
+voxel size, whereas binning a Poisson gas carries shot noise a crystalline
+solid does not have (~10% of the projected signal at a 5 Å voxel,
+~22% at 2 Å) and collapses each atom's whole potential integral
+into a single voxel.
 
-``CarbonFilmGenerator``'s hole-edge geometry is also purely analytic (a
-random band-limited function of angle), not a resampled point cloud --
-see its docstring for why that matters for resolution-independence.
+The boundary is an irregular quasi-sphere -- a band-limited spherical-
+harmonic modulation of the radius, standing in for the multiply-twinned
+particles citrate-reduced colloidal gold actually produces. CTS's exact
+sphere is an idealisation (not a shape gold forms), and fcc gold's
+equilibrium truncated octahedron describes an annealed single crystal
+rather than a colloidal fiducial; neither is offered. Every realisation is
+volume-matched, so bead-to-bead shape variation never changes the total
+signal.
+
+``_number_density_per_a3``/``_mean_inner_potential`` are also imported by
+``._carbon`` (the carbon support film generator), which shares this same
+bulk-material approach for its density calibration but is otherwise
+unrelated -- kept here since beads needed them first and there's nothing
+carbon-specific about the physics itself.
+
+References
+----------
+.. [1] Purnell, C., Heebner, J., Swulius, M. T., Hylton, R., Kabonick, S.,
+   Grillo, M., Grigoryev, S., Heberle, F., Waxham, M. N., & Swulius, M. T.
+   (2023). Rapid synthesis of cryo-ET data for training deep learning models.
+   *bioRxiv*. https://doi.org/10.1101/2023.04.28.538636
+   (CTS source: https://github.com/carsonpurnell/cryotomosim_CTS)
+.. [2] Popescu, R., Müller, E., Wanner, M., Gerthsen, D., Schowalter, M.,
+   Rosenauer, A., Böttcher, A., Löffler, D., & Weis, P. (2007). Increase of
+   the mean inner Coulomb potential in Au clusters induced by surface tension
+   and its implication for electron scattering. *Physical Review B*, 76(23),
+   235411. https://doi.org/10.1103/PhysRevB.76.235411
 """
 
 from __future__ import annotations
@@ -41,49 +68,82 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import roma
 import torch
 
-from ..ice._kernels import build_atomic_potential_kernel
+from ..arrays import soft_voxelize_coordinates
+from ..config import ScalarOrRange, parse_scalar_or_range
+from ..fft import spatial_convolve3d_same
+from ..potential import build_atomic_potential_kernel
+from .membrane._field_spherical_harmonics import (
+    _interpolate_angular_grid,
+    _sample_sh_coefficients,
+    _synthesize_angular_grid,
+)
+from specter.options import ScatteringFactors
 
 AVOGADRO = 6.02214076e23  # 1/mol
 
-# Bulk mass densities (g/cm^3) and molar masses (g/mol) for the two
-# materials CTS models as homogeneous bulk fill.
-CARBON_DENSITY_G_CM3 = 2.0
-CARBON_MOLAR_MASS = 12.011
+# fcc lattice constant for gold, Å. 4 atoms per conventional cell
+# gives 4/a**3 = 0.0591 atoms/Å³, matching to 0.2% the number
+# density `_number_density_per_a3` derives independently from bulk mass
+# density -- two unrelated routes to the same material.
+GOLD_FCC_ANGSTROM = 4.0782
+
+# RMS thermal displacement per Cartesian direction, Å, from
+# B ~ 0.6 Å² for Au near room temperature (u = sqrt(B/(8 pi^2))).
+# A literature-typical value, not a measurement on any particular
+# specimen; it sets how much the lattice fringes are smeared.
+# A material constant, so it is a constant here rather than a
+# `BeadGenerator` argument -- tuning gold's Debye-Waller factor to make an
+# image look right is not something the API should invite. Override it
+# here if you have a real number for your specimen's temperature.
+GOLD_U_RMS = 0.087
+
+# Directions used to normalise and volume-match the shape's
+# spherical-harmonic radius field. Deterministic (Fibonacci sphere), so
+# the volume match does not add its own sampling noise.
+_SHAPE_QUADRATURE_POINTS = 4096
+
+# Band limit and power spectrum of the shape's radius modulation. Deliberately NOT constructor arguments: the roughness model
+# is phenomenological, and nothing is known well enough to tune these
+# against -- exposing them would only invite fitting an uncalibrated model
+# to whatever an image happened to look like. `BeadGenerator.roughness`
+# (the amplitude) stays exposed because it is the one property you could
+# measure off EM of a real bead prep.
+#
+# l_max=6 puts the finest lumps at ~30 degrees of arc, i.e. features
+# roughly a quarter of the bead across, which is the scale colloidal gold
+# irregularity actually shows. spectrum_power=0.0 gives equal power per
+# mode; note the membrane backend's own default of 2.0 encodes the
+# Helfrich thermal bending spectrum of a lipid bilayer, which has no
+# analogue in a metal nanoparticle -- a bead's irregularity comes from
+# growth and twinning, not bending modes.
+_ROUGHNESS_L_MAX = 6
+_ROUGHNESS_SPECTRUM_POWER = 0.0
+
+_FCC_BASIS = torch.tensor(
+    [[0.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5], [0.5, 0.5, 0.0]]
+)
+
+# Bulk mass density (g/cm^3) and molar mass (g/mol) for gold, CTS's bead
+# material.
 GOLD_DENSITY_G_CM3 = 19.3
 GOLD_MOLAR_MASS = 196.97
 
-# Amorphous/graphitic bulk carbon has no H neighbors to match a specific
-# organic shtyrov species against; "C(CCC)" (carbon bonded to three other
-# carbons, i.e. sp2-like coordination) is the closest bundled proxy.
-CARBON_SHTYROV_SPECIES = "C(CCC)"
-
-# CarbonFilmGenerator.generate's cap on the number of independent boundary
-# jitter points (see `edge_grain_size`), to bound memory/compute.
-_MAX_EDGE_BINS = 200000
-
-# Quantifoil R1.2/1.3 holey carbon grids: 1.2 micron hole diameter, the
-# standard for high-resolution single-particle/cryo-ET data collection at
-# 50,000x+ magnification (R2/1, R2/2 ~2 micron holes are used instead at
-# lower, 30,000-40,000x magnification). Radius = diameter / 2. Source:
-# https://www.emsdiasum.com/docs/technical/datasheet/quantifoil ,
-# https://www.quantifoil.com/products/quantifoil/quantifoil-circular-holes
-QUANTIFOIL_R1_2_HOLE_RADIUS = 6000.0  # Angstrom (0.6 micron)
-
 
 def _number_density_per_a3(density_g_cm3: float, molar_mass: float) -> float:
-    """Atoms per cubic Angstrom, from bulk mass density and molar mass."""
-    density_g_a3 = density_g_cm3 * 1e-24  # g/cm^3 -> g/Angstrom^3
+    """Atoms per cubic Å, from bulk mass density and molar mass."""
+    density_g_a3 = density_g_cm3 * 1e-24  # g/cm^3 -> g/Å³
     return (density_g_a3 / molar_mass) * AVOGADRO
 
 
 def _mean_inner_potential(
-    v_size: float,
+    voxel_size: float,
     number_density: float,
     atomic_number: int,
-    parameterization: str,
-    shtyrov_species: str = "",
+    parameterization: ScatteringFactors,
+    shtyrov_species: str | None = None,
 ) -> float:
     """
     Mean inner potential (volts) of a homogeneous bulk material.
@@ -92,24 +152,110 @@ def _mean_inner_potential(
     -- the volume integral of a single atom's real-space potential equals
     its k=0 Fourier component, so this is the same physics
     ``potential.PotentialBuilder`` uses per-atom, just summed to a bulk
-    mean instead of kept per-position. Independent of `v_size` (verified:
+    mean instead of kept per-position. Independent of `voxel_size` (verified:
     the integral is stable across voxel size since it's a physical,
     grid-independent quantity), unlike injecting a raw atom count.
     """
-    if parameterization == "shtyrov" and not shtyrov_species:
-        raise ValueError(
-            "shtyrov parameterization requires a bonded species (there is "
-            "no unbonded elemental entry in the bundled species table); "
-            "use 'kirkland' or 'lobato' instead."
-        )
+    # No species means no species: build_atomic_potential_kernel falls back
+    # to per-element Peng at `atomic_number`, the same way PotentialBuilder
+    # does for an atom it cannot type. Substituting a default species here
+    # would render one element with another's kernel.
     kernel = build_atomic_potential_kernel(
-        v_size,
+        voxel_size,
         parameterization,
         atomic_number=atomic_number,
-        shtyrov_species=shtyrov_species or "O(HH)",
+        shtyrov_species=shtyrov_species,
     )
-    atom_potential_integral = kernel.sum().item() * v_size**3  # V*Angstrom^3
+    atom_potential_integral = kernel.sum().item() * voxel_size**3  # V*Å³
     return number_density * atom_potential_integral
+
+
+def _fibonacci_directions(n: int) -> torch.Tensor:
+    """`n` near-uniformly spaced unit vectors, shape (n, 3)."""
+    i = torch.arange(n, dtype=torch.float64) + 0.5
+    z = 1.0 - 2.0 * i / n
+    rho = torch.sqrt((1.0 - z * z).clamp_min(0.0))
+    phi = i * np.pi * (1.0 + np.sqrt(5.0))
+    return torch.stack([rho * torch.cos(phi), rho * torch.sin(phi), z], dim=-1).float()
+
+
+class _BeadShape:
+    """
+    A bead's boundary: a quasi-sphere whose radius is modulated by a
+    band-limited spherical-harmonic field, normalised to `roughness` RMS
+    and rescaled to preserve volume.
+
+    A phenomenological model of the irregular, multiply-twinned particles
+    citrate-reduced colloidal gold actually produces -- the amplitude and
+    band limit are free parameters, not measured ones. `contains` is used
+    for both the atom fill and the segmentation mask, so the two can never
+    disagree; `half_extent` (the bounding half-width) sizes the grid.
+
+    Every realisation is volume-matched to a sphere of the nominal
+    `radius`, so total integrated potential -- and hence projected signal
+    -- never depends on how lumpy a particular bead came out.
+    """
+
+    def __init__(
+        self,
+        radius: float,
+        roughness: float,
+        generator: torch.Generator | None = None,
+    ):
+        self.roughness = roughness
+        l_max = _ROUGHNESS_L_MAX
+
+        # Reuse the membrane backend's harmonic machinery rather than
+        # rolling a second copy: `_sample_sh_coefficients` normalises the
+        # coefficient set so the perturbation's RMS over the sphere is
+        # exactly 1 by Parseval (no empirical rescaling needed), and its
+        # real-SH combination carries the sqrt(2)*(-1)^m factors an
+        # orthonormal basis needs -- drop those and the m=0 modes end up
+        # over-weighted relative to m != 0, which makes the "random"
+        # lumpiness quietly anisotropic about z.
+        seed = int(torch.randint(0, 2**31 - 1, (1,), generator=generator).item())
+        self._coeffs = _sample_sh_coefficients(
+            l_max, _ROUGHNESS_SPECTRUM_POWER, np.random.default_rng(seed)
+        )
+
+        # Synthesize once onto a small angular grid and interpolate
+        # thereafter: `contains` runs over every candidate atom *and* every
+        # voxel centre (millions of points at fine voxel sizes), and
+        # evaluating the harmonics per point makes a bead take seconds.
+        # The field is band-limited to `l_max`, so its finest angular
+        # structure is ~180/l_max degrees and this grid oversamples it
+        # ~12x. Same trick, and the same helpers,
+        # `generate_membrane_field_spherical_harmonics` uses.
+        n_theta = 12 * l_max + 1
+        self._table = _synthesize_angular_grid(
+            self._coeffs, l_max, n_theta, 2 * n_theta
+        )
+
+        # Mean is exactly 0 and RMS exactly 1 (no l=0 term, Parseval
+        # normalisation), so the modulation needs no further centring.
+        # V = (1/3) * integral R^3 dOmega, so matching the sphere's volume
+        # is a single scale factor set by the mean cube of the modulation.
+        modulation = 1.0 + roughness * self._field(
+            _fibonacci_directions(_SHAPE_QUADRATURE_POINTS)
+        )
+        self.scale = radius / float(modulation.pow(3).mean()) ** (1.0 / 3.0)
+        self.half_extent = self.scale * float(modulation.max())
+
+    def _field(self, points: torch.Tensor) -> torch.Tensor:
+        """The harmonic radius modulation along each point's direction."""
+        r = points.norm(dim=-1).clamp_min(1e-9)
+        theta = torch.acos((points[..., 2] / r).clamp(-1.0, 1.0))
+        phi = torch.atan2(points[..., 1], points[..., 0])
+        return torch.as_tensor(
+            _interpolate_angular_grid(
+                self._table, theta.numpy(), phi.numpy(), device="cpu"
+            ),
+            dtype=points.dtype,
+        )
+
+    def contains(self, points: torch.Tensor) -> torch.Tensor:
+        limit = self.scale * (1.0 + self.roughness * self._field(points))
+        return points.norm(dim=-1) <= limit
 
 
 @dataclass
@@ -119,7 +265,7 @@ class BeadSpec:
     Attributes
     ----------
     radii : list of float
-        One bead radius (Angstrom) per requested bead population.
+        One bead radius (Å) per requested bead population.
     count_per_radius : int, optional
         Number of copies to place per radius. Default 1.
     """
@@ -135,54 +281,200 @@ class BeadInstance:
     Attributes
     ----------
     density : torch.Tensor
-        Local density grid, shape (n, n, n), at gold's real mean inner
-        potential (volts).
+        Local density grid, shape (n, n, n), in volts. Stochastically
+        filled (see `BeadGenerator`), so individual voxels scatter about
+        gold's real mean inner potential rather than equalling it.
+    mask : torch.Tensor
+        Bool grid, shape (n, n, n), marking voxels whose *centre* lies
+        inside the bead's boundary. This is the bead's geometry,
+        independent of the stochastic fill -- use it for segmentation/
+        instance labels, since thresholding `density` would punch holes
+        wherever the fill happened to place no atom. Follows whichever
+        `shape` the generator was built with, so it stays consistent with
+        a faceted or roughened bead too.
     radius : float
-        Bead radius, Angstrom.
-    v_size : float
-        Voxel size, Angstrom.
+        Bead radius, Å.
+    voxel_size : float
+        Voxel size, Å.
     """
 
     density: torch.Tensor
+    mask: torch.Tensor
     radius: float
-    v_size: float
+    voxel_size: float
 
 
 class BeadGenerator:
     """
-    Generates solid spherical gold fiducial beads, port of CTS's
-    ``gen_beads.m``, at gold's real mean inner potential (volts) -- see
-    module docstring and ``_mean_inner_potential``.
+    Generates gold fiducial beads, descended from CTS's ``gen_beads.m``,
+    built from real fcc gold atoms at gold's real mean inner potential
+    (volts) -- see module docstring and ``_mean_inner_potential``.
+
+    Atoms sit on an fcc gold lattice with Debye-Waller jitter and are
+    splatted through the real atomic potential kernel, exactly as
+    `potential.PotentialBuilder` renders a protein. The boundary is an
+    irregular quasi-sphere -- see `_BeadShape`.
+
+    Every call to :meth:`generate` is an independent realisation: its own
+    crystal orientation (drawn uniformly over SO(3), so lattice fringes
+    point somewhere different on every bead) and its own boundary shape.
+    Do not reuse one result as a template for several fiducials, or the
+    whole population will be one particle stamped repeatedly.
+
+    Reproducibility follows the usual specter route -- set
+    ``specter.seed(n)`` -- or pass an explicit ``generator`` to
+    :meth:`generate`, which controls the orientation, the lattice jitter
+    and the shape alike.
 
     Parameters
     ----------
-    v_size : float
-        Voxel size, Angstrom.
+    voxel_size : float
+        Voxel size, Å.
     parameterization : str, optional
-        Atomic-potential parameterization used to compute gold's mean
-        inner potential: ``'kirkland'`` (default) or ``'lobato'``.
-        ``'shtyrov'`` is not supported here (no unbonded elemental gold
-        entry in the bundled species table).
+        Atomic-potential parameterization used to compute gold's per-atom
+        potential integral: ``'kirkland'`` (default), ``'lobato'`` or
+        ``'peng'``. ``'shtyrov'`` resolves to ``'peng'`` -- there is no
+        elemental gold in the bundled species tables and a fiducial has no
+        bonds to type, so it takes the same per-element fallback a structure
+        atom does, applied by `build_atomic_potential_kernel` itself.
+    roughness : float or [low, high], optional
+        RMS radius modulation, as a fraction of the radius. Default 0.12.
+        A ``[low, high]`` pair draws a fresh value uniformly per bead, so
+        a population contains both near-round and badly misshapen
+        particles the way a real colloidal prep does -- with a single
+        number, every bead is a *different* lumpy shape but the *same*
+        degree of lumpy. Follows the same scalar-or-range spelling as
+        `config.ParticleStackConfig`'s `dose`/`defocus`.
+
+        Below ~0.06 a bead is visually indistinguishable from a sphere
+        while still costing the harmonic machinery; 0.12-0.20 is where it
+        reads as an irregular particle; 0.0 gives a clean sphere.
+        The only exposed knob on the roughness model, since its amplitude
+        is the one property you could plausibly measure off EM of a real
+        bead prep -- the band limit and spectrum are fixed at
+        `_ROUGHNESS_L_MAX`/`_ROUGHNESS_SPECTRUM_POWER`, see those
+        constants for why.
+
+    Attributes
+    ----------
+    mean_inner_potential : float
+        Gold's bulk mean inner potential (volts) -- the mean over the
+        bead's interior, not the value any given voxel takes.
+
+    Notes
+    -----
+    Two alternatives are deliberately not options.
+
+    A ``fill='gas'`` would reproduce CTS's own model: atoms scattered uniformly
+    at the bulk number density and binned into voxels. It is a Poisson
+    gas, so per-voxel occupancy carries shot noise a crystalline solid
+    does not have -- ~10% of the projected signal at a 5 Å voxel
+    against ~3% for the lattice, rising to ~22% at 2 Å -- and it
+    collapses each atom's whole potential integral into one voxel. There
+    was no voxel size at which it was more accurate.
+
+    A ``shape='sphere'``/``'wulff'`` would offer an exact sphere (CTS's
+    idealisation, not a shape gold forms) and fcc gold's equilibrium
+    truncated octahedron. The latter is the right model for an *annealed
+    single crystal*, but commercial cryo-ET fiducials are citrate-reduced
+    colloidal gold: multiply-twinned and irregular. It also gives a
+    population no shape variety, only pose variety -- every bead the same
+    solid seen from a different angle.
     """
 
-    def __init__(self, v_size: float, parameterization: str = "kirkland"):
-        self.v_size = v_size
+    def __init__(
+        self,
+        voxel_size: float,
+        parameterization: ScatteringFactors = "kirkland",
+        roughness: ScalarOrRange = 0.12,
+    ):
+        self.roughness_range = parse_scalar_or_range(roughness)
+        if self.roughness_range[0] < 0:
+            raise ValueError(f"roughness must be >= 0, got {roughness!r}")
+        if self.roughness_range[1] < self.roughness_range[0]:
+            raise ValueError(f"roughness range must be [low, high], got {roughness!r}")
+        self.voxel_size = voxel_size
         self.number_density = _number_density_per_a3(
             GOLD_DENSITY_G_CM3, GOLD_MOLAR_MASS
         )
-        self.mean_inner_potential = _mean_inner_potential(
-            v_size,
-            self.number_density,
+        # Per-atom potential integral (V*Å³), resolution-
+        # independent: passing number_density=1.0 makes
+        # _mean_inner_potential return exactly that integral (same trick
+        # as ._carbon).
+        self.atom_potential_integral = _mean_inner_potential(
+            voxel_size,
+            1.0,
             atomic_number=79,
             parameterization=parameterization,
         )
+        self.mean_inner_potential = self.number_density * self.atom_potential_integral
+        self._kernel = build_atomic_potential_kernel(
+            voxel_size, parameterization, atomic_number=79
+        )
 
-    def generate(self, radius: float) -> BeadInstance:
+    def _random_orientation(self, generator: torch.Generator | None) -> torch.Tensor:
+        """A uniformly random 3x3 rotation, drawn from `generator`.
+
+        Not `rotations.random_rotation_matrix`: that wraps
+        ``roma.random_rotmat``, which takes no generator and so would
+        always draw from the global RNG -- an explicit `generator` would
+        then control the lattice jitter and the shape but silently *not*
+        the crystal orientation. A normalised Gaussian 4-vector is uniform
+        on the unit quaternion sphere, hence uniform over SO(3).
+        """
+        quat = torch.randn(4, generator=generator)
+        return roma.unitquat_to_rotmat(quat / quat.norm())
+
+    def _raw_lattice(
+        self, half_extent: float, rot: torch.Tensor, generator: torch.Generator | None
+    ) -> torch.Tensor:
+        """Jittered fcc gold lattice covering the bead, in the lab frame.
+
+        Built in the crystal frame and rotated into the lab frame by
+        `rot`, so every bead's lattice -- and therefore its fringe
+        direction -- points somewhere different.
+        """
+        reach = half_extent + GOLD_FCC_ANGSTROM
+        # Rotation preserves norm, so the lab-frame ball of radius `reach`
+        # is the crystal-frame ball of radius `reach`: the cell range only
+        # has to cover that ball, with no sqrt(3) allowance for the
+        # circumscribing cube (which would generate ~10x the atoms and
+        # throw all of them away).
+        m = int(np.ceil(reach / GOLD_FCC_ANGSTROM)) + 1
+        r = torch.arange(-m, m + 1, dtype=torch.float32)
+        cells = torch.stack(torch.meshgrid(r, r, r, indexing="ij"), dim=-1).reshape(
+            -1, 3
+        )
+        atoms = (cells[:, None, :] + _FCC_BASIS[None, :, :]).reshape(
+            -1, 3
+        ) * GOLD_FCC_ANGSTROM
+        atoms = atoms + torch.randn(atoms.shape, generator=generator) * GOLD_U_RMS
+        atoms = atoms @ rot.T  # crystal frame -> lab frame
+        return atoms[atoms.norm(dim=-1) <= reach]
+
+    def generate(
+        self,
+        radius: float,
+        generator: torch.Generator | None = None,
+        offset_xyz: tuple[float, float, float] | torch.Tensor | None = None,
+    ) -> BeadInstance:
         """
         Parameters
         ----------
         radius : float
-            Bead radius, Angstrom.
+            Nominal bead radius, Å. The irregular boundary is
+            volume-matched to a sphere of this radius.
+        generator : torch.Generator, optional
+            RNG for the crystal orientation, lattice jitter and shape
+            realisation. Default None (global RNG, so ``specter.seed``
+            controls it).
+        offset_xyz : tuple of float or torch.Tensor, optional
+            Displacement (x, y, z), Å, of the bead's centre from the grid's
+            centre voxel ``n // 2``, at most half a voxel per axis. The
+            atoms and the mask are both built about the displaced centre,
+            so a bead inserted at the whole voxel nearest its position, with
+            the remainder passed here, renders exactly at that position.
+            Draws no random numbers. Default None (centred on ``n // 2``).
 
         Returns
         -------
@@ -190,358 +482,54 @@ class BeadGenerator:
         """
         if radius <= 0:
             raise ValueError(f"radius must be > 0, got {radius}")
-        n = int(np.ceil(2 * radius / self.v_size)) + 2
-        n += n % 2
-        zz, yy, xx = torch.meshgrid(
-            torch.arange(n), torch.arange(n), torch.arange(n), indexing="ij"
+        offset = (
+            torch.zeros(3)
+            if offset_xyz is None
+            else torch.as_tensor(offset_xyz, dtype=torch.float32).reshape(3)
         )
-        c = n / 2.0
-        r2 = ((zz - c) ** 2 + (yy - c) ** 2 + (xx - c) ** 2).float() * self.v_size**2
-        inside = r2 <= radius**2
-        density = inside.float() * self.mean_inner_potential
-        return BeadInstance(density=density, radius=radius, v_size=self.v_size)
-
-
-@dataclass
-class GridSpec:
-    """
-    Carbon support film, forwarded to ``CarbonFilmGenerator.generate``.
-
-    Describes a realistic single-field-of-view carbon film: a big,
-    real-scale hole (`hole_radius`) of which only a thin strip
-    (`edge_fraction` of the frame) intrudes from one edge (`edge_side`) --
-    see ``edge_hole_center``'s docstring for why that, not a small hole
-    fully contained in frame, is the realistic case.
-
-    Attributes
-    ----------
-    thickness : float, optional
-        Film thickness, Angstrom. Default 150.
-    hole_radius : float, optional
-        Real physical hole radius, Angstrom. Default
-        ``QUANTIFOIL_R1_2_HOLE_RADIUS`` (6000 A / 0.6 micron) -- the fixed
-        real-product spec for Quantifoil R1.2/1.3, the standard grid for
-        high-resolution collection (see that constant's comment for the
-        source), deliberately much larger than a typical `target_shape`
-        field of view.
-    edge_fraction : float or tuple of float, optional
-        Fraction (0-1) of the frame that ends up carbon, entering from
-        `edge_side`. Either a fixed value, or a ``(low, high)`` range to
-        draw uniformly at random each ``generate()`` call (using the same
-        seed as everything else here) -- real images don't all happen to
-        catch exactly the same amount of a hole's edge. Default
-        ``(0.02, 0.05)``.
-    edge_side : str, optional
-        Which frame edge the carbon intrudes from: ``'left'``,
-        ``'right'``, ``'top'``, ``'bottom'``, or ``'random'`` (default).
-    edge_roughness : float, optional
-        Approximate standard deviation of the hole boundary's radial
-        perturbation, Angstrom. Default 30.
-    edge_grain_size : float or None, optional
-        Angstrom arc-length of one independent boundary jitter point (see
-        ``CarbonFilmGenerator.generate``'s docstring for why the edge is
-        built from independent per-point jitter rather than a smooth
-        function). Default None picks ``3 * v_size`` at generate-time.
-    """
-
-    thickness: float = 150.0
-    hole_radius: float = QUANTIFOIL_R1_2_HOLE_RADIUS
-    edge_fraction: float | tuple[float, float] = (0.02, 0.05)
-    edge_side: str = "random"
-    edge_roughness: float = 30.0
-    edge_grain_size: float | None = None
-
-
-@dataclass
-class CarbonFilmInstance:
-    """A carbon support film slab with a circular hole cut out.
-
-    Attributes
-    ----------
-    density : torch.Tensor
-        Density grid, shape (nz, ny, nx), matching the requested
-        `target_shape`.
-    """
-
-    density: torch.Tensor
-
-
-class CarbonFilmGenerator:
-    """
-    Generates a carbon support film -- a roughly planar slab, with a
-    circular hole cut out and an irregular, randomly-roughened edge -- at
-    carbon's real mean inner potential. Port of CTS's ``gen_carbon.m``.
-
-    The film is treated as a spatially uniform bulk material rather than
-    resolving individual carbon atoms: at the voxel sizes this is used at,
-    atomic-scale texture isn't resolvable anyway, and (unlike ice, where
-    ``RandomIcemaker``/``GradientSKIcemaker`` deliberately model amorphous
-    structure) there's no physical requirement to reproduce a specific
-    carbon structure factor here. So every occupied voxel gets the same
-    mean inner potential value, computed from carbon's real bulk number
-    density and specter's own atomic-potential parameterizations (see
-    ``_mean_inner_potential``) -- real volts, independent of voxel size.
-
-    The hole boundary's irregularity is likewise defined analytically, as
-    a seeded random function of angle -- independent per-point radial
-    jitter at points spaced around the hole's circumference, linearly
-    interpolated in between (see `edge_grain_size` below) -- rather than
-    by resampling a fixed-size point cloud through an alpha shape (the
-    previous approach here; a point-cloud/alpha-shape wrap would be
-    appropriate for a genuinely 3D-irregular blob shape, where the whole
-    *shape* is the random part, but is overkill for a hole boundary that's
-    a circle plus a 1D perturbation). This matters for two separate
-    reasons:
-
-    - Reproducibility across resolutions: a point cloud sampled at a fixed
-      count spreads over a `target_shape`-sized footprint, so the same
-      `n_points` covers a shrinking *fraction* of a larger volume/grid,
-      silently degrading from a solid film into a sparse speckle of
-      isolated voxels as `target_shape`/`v_size` change. Classifying every
-      voxel by direct evaluation of the boundary function has no such
-      dependency: the film is uniformly solid (aside from the deliberate
-      hole) at any grid resolution for a fixed seed.
-    - Genuine jaggedness: a smooth analytic function (e.g. a low-order sum
-      of sine waves) is visually smooth no matter how many terms or how
-      they're weighted -- reaching real per-pixel graininess that way
-      needs mode counts in the thousands, for no benefit over just
-      drawing that many independent points directly. Independent jitter
-      with linear (not smooth) interpolation gives real, sharp-cornered
-      jaggedness at any target roughness scale, at a fraction of the cost.
-
-    Parameters
-    ----------
-    v_size : float
-        Voxel size, Angstrom.
-    parameterization : str, optional
-        Atomic-potential parameterization used to compute carbon's mean
-        inner potential: ``'kirkland'`` (default), ``'lobato'``, or
-        ``'shtyrov'``.
-    seed : int, optional
-        Random seed.
-    """
-
-    def __init__(
-        self,
-        v_size: float,
-        parameterization: str = "kirkland",
-        seed: int | None = None,
-    ):
-        self.v_size = v_size
-        self.rng = np.random.default_rng(seed)
-        self.number_density = _number_density_per_a3(
-            CARBON_DENSITY_G_CM3, CARBON_MOLAR_MASS
-        )
-        self.mean_inner_potential = _mean_inner_potential(
-            v_size,
-            self.number_density,
-            atomic_number=6,
-            parameterization=parameterization,
-            shtyrov_species=CARBON_SHTYROV_SPECIES,
-        )
-
-    def generate(
-        self,
-        target_shape: tuple[int, int, int],
-        thickness: float = 150.0,
-        hole_radius: float = QUANTIFOIL_R1_2_HOLE_RADIUS,
-        edge_roughness: float = 30.0,
-        edge_grain_size: float | None = None,
-        hole_center: tuple[float, float] = (0.0, 0.0),
-    ) -> CarbonFilmInstance:
-        """
-        Parameters
-        ----------
-        target_shape : tuple of int
-            Output grid shape (nz, ny, nx).
-        thickness : float, optional
-            Film thickness, Angstrom. Default 150.
-        hole_radius : float, optional
-            Radius of the circular hole cut through the film, Angstrom.
-            Default `QUANTIFOIL_R1_2_HOLE_RADIUS` (6000 A / 0.6 micron,
-            half of Quantifoil R1.2/1.3's 1.2 micron hole diameter -- the
-            real, fixed manufacturing spec for the standard grid used for
-            high-resolution single-particle/cryo-ET collection, not a
-            free-tunable simulation parameter -- see that constant's
-            comment for the source). This is much larger than a single
-            micrograph/tomogram field of view, so a realistic single
-            volume usually sits entirely inside a hole, entirely on the
-            carbon, or straddles just one hole's edge (which looks nearly
-            straight/gently curved over a `target_shape`-sized volume, not
-            like a small closed circle in frame, because `hole_radius` so
-            far exceeds it). Pass a smaller value than the real spec only
-            to make the curvature more visible for illustration -- not
-            for a production-accurate simulation. Combine with a non-zero
-            `hole_center` (below) so the boundary actually falls inside
-            the volume instead of nowhere near it.
-        edge_roughness : float, optional
-            Approximate standard deviation of the random radial
-            perturbation applied to the hole boundary, Angstrom (CTS's own
-            ``carbonshape`` applies similar edge noise). Default 30.
-        edge_grain_size : float or None, optional
-            Angstrom arc-length of one independent boundary "grain" --
-            the boundary radius is drawn as an i.i.d. Gaussian jitter value
-            (std `edge_roughness`) at points spaced `edge_grain_size` apart
-            around the hole's full circumference, linearly interpolated in
-            between. This is deliberately *not* a smooth analytic function
-            (e.g. a low-order Fourier sum): a handful of smooth modes is
-            always visually smooth no matter how you weight them, and
-            reaching genuine per-pixel graininess that way would need mode
-            counts in the thousands to tens of thousands (one per
-            resolvable wavelength around a realistic, large `hole_radius`)
-            with no accuracy benefit over just drawing that many
-            independent points directly, closely matching what CTS's own
-            ``carbonshape``/``gen_carbon.m`` actually does (independent
-            per-point radial jitter). Piecewise-linear interpolation
-            between independent draws gives real jaggedness (sharp slope
-            changes at every grain boundary) rather than a smooth wave, at
-            the same computational cost.
-
-            Default None picks ``3 * v_size`` -- i.e. grains just above
-            voxel-scale, using essentially all the detail the grid can
-            resolve. Note this makes the auto default resolution-*dependent*
-            (a finer grid gets finer default grains) -- unlike
-            `hole_radius`/`hole_center`/`edge_roughness`, which are purely
-            physical quantities. That's intentional here (a real torn edge
-            has detail at every scale down to whatever you can resolve,
-            same reasoning as ice's amorphous texture), but pass an
-            explicit `edge_grain_size` for reproducibility across
-            `target_shape`/`v_size` changes.
-        hole_center : tuple of float, optional
-            (x, y) offset of the hole's center relative to the volume's
-            center, Angstrom. Default (0, 0) -- hole centered on the
-            volume, so the whole hole boundary sits inside the frame if
-            `hole_radius` is comparable to the FOV. Combine with a large
-            `hole_radius` and an offset a bit smaller than `hole_radius`
-            (so the boundary still crosses the volume) to instead show
-            only one edge of a much bigger hole, near one side of the
-            frame -- the realistic case.
-
-        Returns
-        -------
-        CarbonFilmInstance
-        """
-        nz, ny, nx = target_shape
-        z = (torch.arange(nz, dtype=torch.float32) - nz / 2) * self.v_size
-        y = (torch.arange(ny, dtype=torch.float32) - ny / 2) * self.v_size
-        x = (torch.arange(nx, dtype=torch.float32) - nx / 2) * self.v_size
-        yy, xx = torch.meshgrid(y, x, indexing="ij")  # (ny, nx)
-        yy = yy - hole_center[1]
-        xx = xx - hole_center[0]
-
-        theta = torch.atan2(yy, xx)
-        rho = torch.sqrt(xx**2 + yy**2)
-
-        if edge_grain_size is None:
-            edge_grain_size = 3.0 * self.v_size
-        n_bins = int(
-            np.clip(round(2 * np.pi * hole_radius / edge_grain_size), 8, _MAX_EDGE_BINS)
-        )
-
-        # Independent random radial jitter at n_bins points spaced evenly
-        # around the hole's full circumference, linearly interpolated
-        # in between -- see `edge_grain_size` docstring for why this (not
-        # a smooth analytic function) is used for genuine jaggedness. Still
-        # fully determined by physical angle, so it's the same boundary at
-        # any target_shape/v_size for a fixed seed (see class docstring),
-        # modulo whatever `edge_grain_size` resolves to.
-        jitter_bins = torch.as_tensor(
-            self.rng.normal(scale=edge_roughness, size=n_bins), dtype=torch.float32
-        )
-        bin_pos = (theta + np.pi) / (2 * np.pi) * n_bins
-        bin_floor = torch.floor(bin_pos)
-        frac = bin_pos - bin_floor
-        idx0 = bin_floor.long() % n_bins
-        idx1 = (idx0 + 1) % n_bins
-        jitter = jitter_bins[idx0] * (1 - frac) + jitter_bins[idx1] * frac
-        hole_boundary = hole_radius + jitter
-
-        occupied_xy = rho > hole_boundary
-        occupied_z = z.abs() <= (thickness / 2)
-        occupied = occupied_z[:, None, None] & occupied_xy[None]
-        if not occupied.any():
+        if bool((offset.abs() > 0.501 * self.voxel_size).any()):
             raise ValueError(
-                "hole_radius too large relative to target_shape/v_size: "
-                "the entire film footprint falls inside the cut-out hole"
+                f"offset_xyz must be within half a voxel per axis, got {offset_xyz}"
             )
 
-        density = occupied.float() * self.mean_inner_potential
-        return CarbonFilmInstance(density=density)
-
-
-def edge_hole_center(
-    target_shape: tuple[int, int, int],
-    v_size: float,
-    hole_radius: float,
-    edge_fraction: float = 0.1,
-    side: str = "random",
-    rng: np.random.Generator | None = None,
-) -> tuple[float, float]:
-    """
-    Compute a `hole_center` for :meth:`CarbonFilmGenerator.generate` that
-    places only a thin strip of carbon -- `edge_fraction` of the XY frame's
-    width or height -- along one edge of the volume, with the rest of the
-    frame falling inside the (real, much larger) hole.
-
-    This is the realistic single-field-of-view case described in
-    :meth:`CarbonFilmGenerator.generate`'s `hole_radius` docstring: a real
-    support-film hole is usually far bigger than one micrograph/tomogram
-    field of view, so you either see no carbon at all, are entirely on the
-    carbon, or catch just one edge of a hole near a border of the frame --
-    never a small hole fully contained within it. Getting that by hand
-    means solving for where a huge circle's boundary has to sit to land a
-    specific-width strip at a specific frame edge; this does that solve.
-
-    Parameters
-    ----------
-    target_shape : tuple of int
-        (nz, ny, nx) grid shape the film will be generated at.
-    v_size : float
-        Voxel size, Angstrom.
-    hole_radius : float
-        The real, physical hole radius that will be passed to
-        ``CarbonFilmGenerator.generate`` alongside the returned center,
-        Angstrom -- e.g. ``QUANTIFOIL_R1_2_HOLE_RADIUS``, the real,
-        fixed spec for the standard Quantifoil grid (see that constant's
-        comment). Large relative to `target_shape` both for realism and
-        so the boundary crossing the frame reads as close to a straight
-        edge rather than a visibly curved arc.
-    edge_fraction : float, optional
-        Fraction (0-1) of the frame's width (`side` ``'left'``/``'right'``)
-        or height (``'top'``/``'bottom'``) that ends up carbon. Default
-        0.1.
-    side : str, optional
-        Which frame edge the carbon strip sits along: ``'left'``,
-        ``'right'``, ``'top'``, ``'bottom'``, or ``'random'`` (default --
-        picks uniformly using `rng`).
-    rng : numpy.random.Generator, optional
-        Used only when `side="random"`; a fresh default generator is used
-        if not given.
-
-    Returns
-    -------
-    tuple of float
-        (x, y) `hole_center`, ready to pass straight through to
-        ``CarbonFilmGenerator.generate`` together with `hole_radius`.
-    """
-    if side == "random":
-        side = (rng or np.random.default_rng()).choice(
-            ["left", "right", "top", "bottom"]
+        # A fresh crystal orientation per bead, so no two fiducials show
+        # their lattice fringes running the same way.
+        rot = self._random_orientation(generator)
+        # Fresh roughness per bead when a range was given, so a population
+        # mixes near-round and badly misshapen particles.
+        lo, hi = self.roughness_range
+        roughness = (
+            lo
+            if hi <= lo
+            else lo + (hi - lo) * float(torch.rand(1, generator=generator))
         )
-    nz, ny, nx = target_shape
-    half_x, half_y = nx * v_size / 2, ny * v_size / 2
-    if side == "right":
-        edge = half_x * (1 - 2 * edge_fraction)
-        return edge - hole_radius, 0.0
-    elif side == "left":
-        edge = -half_x * (1 - 2 * edge_fraction)
-        return edge + hole_radius, 0.0
-    elif side == "top":
-        edge = half_y * (1 - 2 * edge_fraction)
-        return 0.0, edge - hole_radius
-    elif side == "bottom":
-        edge = -half_y * (1 - 2 * edge_fraction)
-        return 0.0, edge + hole_radius
-    raise ValueError(
-        f"Unknown side '{side}'; choose 'left', 'right', 'top', 'bottom', or 'random'."
-    )
+        shape = _BeadShape(radius, roughness, generator)
+        raw_lattice = self._raw_lattice(shape.half_extent, rot, generator)
+
+        # Odd `n` puts the bead's centre exactly on voxel `n // 2`, which
+        # is the origin convention both `soft_voxelize_coordinates` and
+        # `arrays.clip_insert_bounds` use -- so the rendered bead lands
+        # where the placement code thinks it does. (CTS instead offset its
+        # centre by a further +1.5 voxels, leaving the bead off-centre and
+        # clipped on three faces.) `offset` then moves it off that voxel by
+        # at most half a voxel, which costs no padding: an atom at
+        # `x <= half_extent / voxel + 1/2` voxels from the centre splats no
+        # further than `floor(x) + 1 <= ceil(half_extent / voxel) + 1`, the
+        # same bound as an unshifted one, and the kernel reaches `pad - 1`
+        # beyond that.
+        pad = 1 + self._kernel.shape[0] // 2
+        half = int(np.ceil(shape.half_extent / self.voxel_size)) + pad
+        n = 2 * half + 1
+
+        idx = torch.arange(n, dtype=torch.float32) - half
+        zz, yy, xx = torch.meshgrid(idx, idx, idx, indexing="ij")
+        centres = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3) * self.voxel_size
+        mask = shape.contains(centres - offset).reshape(n, n, n)
+
+        atoms = raw_lattice[shape.contains(raw_lattice)] + offset
+        deltas = soft_voxelize_coordinates(atoms, (n, n, n), self.voxel_size)
+        density = spatial_convolve3d_same(deltas[None], self._kernel)[0]
+
+        return BeadInstance(
+            density=density, mask=mask, radius=radius, voxel_size=self.voxel_size
+        )

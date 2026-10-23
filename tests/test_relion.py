@@ -1,92 +1,71 @@
+import math
+
 import pandas as pd
 import pytest
 import roma
 import starfile
+import numpy as np
 import torch
 
-from specter.imagegenerator import ImageGenerator
-from specter.io import (
-    create_particle_starfile,
-    create_particle_starfile_from_model,
-    extract_parameters_from_starfile,
-)
+from specter.imaging import CTF, Exposure, Poses, Specimen
+from specter.io import create_particle_starfile, extract_parameters_from_starfile
+
+# Effective coincidence exclusion radius; see tests/test_generators.py::_CR.
+_CR = 1.8 / math.sqrt(2 * math.pi)
 
 
-def test_create_particle_starfile_writes_bfactor_column(tmp_path) -> None:
-    n = 3
-    ctf_params = {
-        "dfu": torch.full((n,), 5000.0),
-        "dfv": torch.full((n,), 5000.0),
-        "dfang": torch.zeros(n),
-        "cs": torch.full((n,), 2.7),
-        "phaseshift": torch.zeros(n),
-    }
-    create_particle_starfile(
-        torch.randn(n, 8, 8),
-        rotations=torch.tensor([[0.0, 0.0, 0.0, 1.0]] * n),
-        translations=torch.zeros(n, 2),
-        alpha=0.1,
-        folderpath=str(tmp_path),
-        voltage=300.0,
-        dx=1.5,
-        filename="particles",
-        ctf_params=ctf_params,
-        dose_per_angstrom=2.0,
-        coincidence_radius=1.8,
-        potential_scale=0.75,
-        bfactor=42.0,
-    )
-
-    df = starfile.read(tmp_path / "particles.star")
-    assert (df["specterBfactor"] == 42.0).all()
-    assert (df["specterPotentialScale"] == 0.75).all()
-    assert (df["specterCoincidenceRadius"] == 1.8).all()
-    assert (df["specterDosePerAngstrom"] == 2.0).all()
-
-
-def test_create_particle_starfile_from_model_matches_model_params(tmp_path) -> None:
+def test_a_stack_from_the_chain_records_its_own_parameters(tmp_path) -> None:
+    """The STAR file a simulated stack is written with carries the settings the
+    chain imaged it with, and the nominal defocus, that of the specimen's
+    midplane: the shift to the exit face lives on the exit wave, never on the
+    CTF the file reads."""
     volume = torch.zeros(16, 16, 16)
     volume[6:10, 6:10, 6:10] = 50.0
-    ctf_params = {
-        "dfu": torch.tensor([5000.0]),
-        "dfv": torch.tensor([5000.0]),
-        "dfang": torch.tensor([0.0]),
-        "cs": torch.tensor([2.7]),
-        "phaseshift": torch.tensor([0.0]),
-    }
-
-    torch.manual_seed(0)
-    model = ImageGenerator(
-        scattering_potential=volume,
-        pixel_size=2.0,
-        quaternions=torch.tensor([[0.7071, 0.0, 0.7071, 0.0]]),
-        translations=torch.tensor([[1.0, -1.0]]),
-        ctf_params=ctf_params,
-        voltage=300.0,
-        dose_per_angstrom=2.0,
-        noise_model=None,
-        scattering_model="multislice",
-        alpha=0.1,
-        coincidence_radius=1.8,
-        potential_scale=0.75,
-        bfactor=42.0,
-        verbose=False,
-        progressbars=False,
+    ctf = CTF(
+        {
+            "dfu": torch.tensor([5000.0]),
+            "dfv": torch.tensor([5000.0]),
+            "dfang": torch.tensor([0.0]),
+            "cs": torch.tensor([2.7]),
+            "phaseshift": torch.tensor([0.0]),
+        }
     )
-    particles = model(torch.tensor([0]))
+    poses = Poses(
+        torch.tensor([[0.7071, 0.0, 0.7071, 0.0]]),
+        torch.tensor([[1.0, -1.0]]),
+        torch.arange(1),
+    )
+    exposure = Exposure(2.0)
+    with torch.no_grad():
+        waves = Specimen(volume, 2.0).scatter(poses, voltage=300.0, alpha=0.1)
+        assert waves.defocus_shift != 0.0
+        particles = (
+            waves.apply_ctf(ctf, bfactor=42.0)
+            .intensity()
+            .detect(exposure, noise=None, coincidence_radius=_CR)
+            .array
+        )
 
-    create_particle_starfile_from_model(
-        particles, model, folderpath=str(tmp_path), filename="particles"
+    create_particle_starfile(
+        particles,
+        rotations=poses.quaternions,
+        translations=poses.shifts,
+        ctf_params=ctf.params,
+        dx=2.0,
+        voltage=300.0,
+        alpha=0.1,
+        dose_per_angstrom=exposure.dose,
+        coincidence_radius=_CR,
+        bfactor=42.0,
+        output_dir=str(tmp_path),
+        filename="particles",
     )
 
     df = starfile.read(tmp_path / "particles.star")
+    df = df["particles"] if isinstance(df, dict) else df
     assert (df["specterBfactor"] == 42.0).all()
-    assert (df["specterPotentialScale"] == 0.75).all()
-    assert (df["specterCoincidenceRadius"] == 1.8).all()
+    assert df["specterCoincidenceRadius"].to_numpy() == pytest.approx(_CR)
     assert (df["specterDosePerAngstrom"] == 2.0).all()
-    # Multislice internally shifts dfu/dfv to the volume's midplane (see
-    # _apply_defocus_shift); the saved STAR file must have the original,
-    # externally-meaningful defocus, not the internally-shifted one.
     assert (df["rlnDefocusU"] == 5000.0).all()
     assert (df["rlnImagePixelSize"] == 2.0).all()
 
@@ -123,7 +102,7 @@ def test_extract_parameters_from_starfile_single_block(tmp_path) -> None:
         pixel_size,
         alpha,
         rotations,
-        translations_A,
+        translations_angstrom,
         ctf_params,
         scale,
         anisomag,
@@ -155,7 +134,7 @@ def test_extract_parameters_from_starfile_single_block(tmp_path) -> None:
     expected_translations = torch.tensor(
         df[["rlnOriginXAngst", "rlnOriginYAngst"]].to_numpy(), dtype=torch.float32
     )
-    assert torch.allclose(translations_A, expected_translations)
+    assert torch.allclose(translations_angstrom, expected_translations)
 
     euler_deg = torch.tensor(
         df[["rlnAngleRot", "rlnAngleTilt", "rlnAnglePsi"]].to_numpy(),
@@ -170,7 +149,7 @@ def test_extract_parameters_from_starfile_single_block(tmp_path) -> None:
     assert torch.equal(halfset_labels, torch.tensor([1, 2, 1, 2]))
 
 
-def test_extract_parameters_from_starfile_return_class_filters_halfset(
+def test_extract_parameters_from_starfile_halfset_filters_particles(
     tmp_path,
 ) -> None:
     df = _single_block_star_df()
@@ -178,7 +157,7 @@ def test_extract_parameters_from_starfile_return_class_filters_halfset(
     starfile.write(df, star_path, overwrite=True)
 
     (_, _, _, rotations, _, ctf_params, _, _, indices, halfset_labels) = (
-        extract_parameters_from_starfile(str(star_path), return_class="2")
+        extract_parameters_from_starfile(str(star_path), halfset="B")
     )
 
     assert rotations.shape == (2, 4)
@@ -258,7 +237,7 @@ def test_extract_parameters_from_starfile_two_block_optics(tmp_path) -> None:
         pixel_size,
         alpha,
         rotations,
-        translations_A,
+        translations_angstrom,
         ctf_params,
         scale,
         anisomag,
@@ -274,3 +253,129 @@ def test_extract_parameters_from_starfile_two_block_optics(tmp_path) -> None:
     assert ctf_params["cs"][0].item() == pytest.approx(2.7 * 1e7)
     assert torch.equal(indices, torch.arange(n))
     assert halfset_labels is None
+
+
+#: The shapes a per-file scalar arrives in. `extract_parameters_from_csfile`
+#: returns 0-dim TENSORS, which is what made the repr bug easy to hit, but a
+#: caller reading its own metadata just as reasonably has a python int, a
+#: numpy scalar, or a length-1 array.
+_WRAPS = {
+    "float": lambda v: v,
+    "int": lambda v: int(v) if float(v).is_integer() else v,
+    "np_0d": lambda v: np.array(v),
+    "np_scalar": lambda v: np.float64(v),
+    "np_len1": lambda v: np.array([v]),
+    "torch_0d": lambda v: torch.tensor(v),
+    "torch_int": lambda v: torch.tensor(int(v))
+    if float(v).is_integer()
+    else torch.tensor(v),
+}
+
+
+class TestScalarsAreWrittenAsNumbers:
+    """
+    A 0-dim tensor must not reach the file as its repr.
+
+    `extract_parameters_from_csfile` returns voltage, pixel size and alpha as
+    0-dim tensors, so passing them straight back into a writer is the natural
+    thing to do. Written through unconverted they reach `starfile` as objects
+    and land as ``tensor(300.)`` instead of ``300.000000`` -- an unreadable
+    file, in the three columns that drive the CTF, from code that raised
+    nothing.
+    """
+
+    @staticmethod
+    def _ctf(n):
+        return {
+            k: torch.full((n,), v)
+            for k, v in dict(
+                dfu=12000.0,
+                dfv=11500.0,
+                dfang=30.0,
+                cs=2.7e7,
+                phaseshift=0.0,
+                tiltx=0.0,
+                tilty=0.0,
+                trefoil1=0.0,
+                trefoil2=0.0,
+                tetrafoil1=0.0,
+                tetrafoil2=0.0,
+                tetrafoil3=0.0,
+                tetrafoil4=0.0,
+            ).items()
+        }
+
+    @pytest.mark.parametrize("wrap_name", list(_WRAPS))
+    def test_particle_starfile_scalar_columns_are_numeric(self, tmp_path, wrap_name):
+        import starfile
+
+        from specter.io import create_particle_starfile
+
+        n = 3
+        wrap = _WRAPS[wrap_name]
+        create_particle_starfile(
+            torch.randn(n, 16, 16),
+            rotations=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(n, 1),
+            translations=torch.zeros(n, 2),
+            ctf_params=self._ctf(n),
+            dx=wrap(1.06),
+            voltage=wrap(300.0),
+            alpha=wrap(0.1),
+            filename="p",
+            output_dir=str(tmp_path),
+        )
+        df = starfile.read(str(tmp_path / "p.star"))
+        df = df["particles"] if isinstance(df, dict) else df
+        for col, want in (
+            ("rlnVoltage", 300.0),
+            ("rlnImagePixelSize", 1.06),
+            ("rlnAmplitudeContrast", 0.1),
+            ("rlnSphericalAberration", 2.7),
+        ):
+            assert len(df[col]) == n
+            assert df[col].dtype.kind == "f", f"{col} is {df[col].dtype}, not numeric"
+            assert float(df[col].iloc[0]) == pytest.approx(want, rel=1e-5)
+
+    @pytest.mark.parametrize("wrap_name", list(_WRAPS))
+    def test_micrograph_starfile_scalar_columns_are_numeric(self, tmp_path, wrap_name):
+        import starfile
+
+        from specter.io import create_micrograph_starfile
+
+        n = 2
+        wrap = _WRAPS[wrap_name]
+        create_micrograph_starfile(
+            n,
+            voltage=wrap(300.0),
+            pixel_size=wrap(1.06),
+            alpha=wrap(0.1),
+            ctf_params=self._ctf(n),
+            filename="m",
+            output_dir=str(tmp_path),
+        )
+        df = starfile.read(str(tmp_path / "m.star"))
+        df = df["micrographs"] if isinstance(df, dict) else df
+        for col, want in (
+            ("rlnVoltage", 300.0),
+            ("rlnImagePixelSize", 1.06),
+            ("rlnAmplitudeContrast", 0.1),
+        ):
+            assert df[col].dtype.kind == "f", f"{col} is {df[col].dtype}, not numeric"
+            assert float(df[col].iloc[0]) == pytest.approx(want, rel=1e-5)
+
+
+def test_extract_parameters_from_starfile_refuses_non_uniform_pixel_size(
+    tmp_path,
+) -> None:
+    """
+    A pixel size that varies across particles has no correct scalar, so it is
+    refused rather than handed back as a per-particle tensor that every caller
+    then fails to ``.item()``. [1.0, 1.2, 0.8, 1.0] has mean equal to its first
+    entry, which the old uniformity test accepted.
+    """
+    df = _single_block_star_df()
+    df["rlnImagePixelSize"] = [1.0, 1.2, 0.8, 1.0]
+    star_path = tmp_path / "particles.star"
+    starfile.write(df, star_path, overwrite=True)
+    with pytest.raises(ValueError, match=r"rlnImagePixelSize.*0\.8.*1\.2"):
+        extract_parameters_from_starfile(str(star_path))

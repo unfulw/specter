@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from specter import memory
+from specter.config import load_config
+from specter.memory import (
+    MAX_AUTO_BATCHSIZE,
+    estimate_peak_bytes,
+    recommend_batchsize,
+)
+
+# A box small enough that `_SATURATION_PADDED_VOXELS` is not the binding
+# constraint, so tests about the MEMORY bound and the `n_particles`/ceiling
+# clamps still exercise those. At the default 256 box (pad_fft=True, nz = nxy)
+# one particle already saturates a GPU, which is the whole point of that cap --
+# see `test_recommend_batchsize_caps_at_gpu_saturation`.
+# 40 rather than a round power of two so that
+# `_PADDED_COPIES_PER_PARTICLE * nz * pad_nxy**2 * 4` lands on a whole number of
+# bytes: `recommend_batchsize` keeps that product as a float while
+# `estimate_peak_bytes` rounds it, and a sub-byte disagreement is enough to move
+# a floor() by one.
+_SMALL_NXY = 40
+_SMALL_GEOM = (_SMALL_NXY, _SMALL_NXY, 2 * _SMALL_NXY)
+
+
+def test_estimate_peak_matches_measured_l40_sweep() -> None:
+    """Regression guard on the fitted constants: the estimate must stay above
+    every measured peak in the sweep the module docstring documents, and not
+    wander more than 25% above it (which would start wasting real memory).
+
+    Measured with torch.cuda.max_memory_allocated on an NVIDIA L40, default
+    multislice + IceBank + pad_fft path -- see src/specter/memory.py.
+    """
+    gib = 2**30
+    measured_bytes = {
+        # (nxy, batchsize): measured peak on an L40, the sweep memory.py's
+        # constants were fit to
+        (128, 1): int(0.38 * gib),
+        (128, 4): int(0.54 * gib),
+        (128, 8): int(0.72 * gib),
+        (256, 1): int(0.86 * gib),
+        (256, 2): int(1.26 * gib),
+        (256, 4): int(1.91 * gib),
+        (256, 8): int(3.19 * gib),
+        (384, 1): int(2.39 * gib),
+        (384, 2): int(3.49 * gib),
+        (384, 4): int(5.88 * gib),
+        (512, 1): int(5.48 * gib),
+        (512, 2): int(8.02 * gib),
+        (512, 3): int(11.12 * gib),
+    }
+    for (nxy, b), measured in measured_bytes.items():
+        predicted = estimate_peak_bytes(b, nxy, nxy, 2 * nxy)
+        assert predicted >= measured, f"under-estimate at nxy={nxy}, B={b}"
+        assert predicted <= 1.25 * measured, f"over-estimate at nxy={nxy}, B={b}"
+
+
+def test_recommend_batchsize_scales_with_free_memory(monkeypatch) -> None:
+    """Twice the memory, ~twice the batch (the fixed overhead makes it
+    slightly more than twice, never less)."""
+    per_particle = estimate_peak_bytes(1, *_SMALL_GEOM) - estimate_peak_bytes(
+        0, *_SMALL_GEOM
+    )
+    overhead = estimate_peak_bytes(0, *_SMALL_GEOM)
+
+    def budget_for(n_particles_worth: int) -> int:
+        # Undo the CPU safety fraction so the target lands where we expect.
+        return int((overhead + n_particles_worth * per_particle) / 0.5)
+
+    monkeypatch.setattr(memory, "available_memory_bytes", lambda _d: budget_for(4))
+    assert recommend_batchsize(*_SMALL_GEOM, "cpu") == 4
+    monkeypatch.setattr(memory, "available_memory_bytes", lambda _d: budget_for(8))
+    assert recommend_batchsize(*_SMALL_GEOM, "cpu") == 8
+
+
+@pytest.mark.parametrize(
+    ("budget", "device", "geometry"),
+    [
+        (1024, "cpu", (1024, 1024, 2048)),
+        (10**13, "cuda", (2048, 2048, 4096)),
+    ],
+    ids=["memory_bound", "saturation_cap"],
+)
+def test_recommend_batchsize_never_below_one(
+    monkeypatch, budget: int, device: str, geometry: tuple[int, int, int]
+) -> None:
+    """A box too big for the device still returns 1, not 0 -- the run then
+    fails honestly on a real allocation rather than on an estimate. The same
+    holds when the GPU saturation cap is what binds: a box larger than the
+    whole saturation budget still yields 1."""
+    monkeypatch.setattr(memory, "available_memory_bytes", lambda _d: budget)
+    assert recommend_batchsize(*geometry, device) == 1
+
+
+def test_recommend_batchsize_clamps_to_n_particles_and_ceiling(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(memory, "available_memory_bytes", lambda _d: 10**13)
+    assert recommend_batchsize(*_SMALL_GEOM, "cpu", n_particles=3) == 3
+    assert recommend_batchsize(*_SMALL_GEOM, "cpu") == MAX_AUTO_BATCHSIZE
+
+
+def test_config_batchsize_accepts_auto_and_int(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[potential]\npdb_source = "6bdf"\n\n[compute]\nbatchsize = "auto"\n'
+    )
+    assert load_config(str(path)).batchsize == "auto"
+    path.write_text('[potential]\npdb_source = "6bdf"\n\n[compute]\nbatchsize = 3\n')
+    assert load_config(str(path)).batchsize == 3
+
+
+def test_recommend_batchsize_caps_at_gpu_saturation(monkeypatch) -> None:
+    """
+    A big box gets a small batch even on an empty device.
+
+    Batching amortizes per-call overhead only until one forward pass already
+    saturates the device. Measured on an L40: at the default config's box 256
+    (67.1M padded voxels per particle) throughput is flat to batch 16 and 17%
+    *worse* at 32, while memory grows linearly -- 1.5 GB at batch 1 against
+    30.8 GB at 32. Sizing purely to free memory therefore spends twenty times
+    the memory for nothing, which is also what made `auto` pick a batch that
+    OOM'd.
+
+    Small boxes still get large batches, which is where batching earns its keep
+    (~1.9x at box 64). The full per-batch table is in `specter.memory`, at
+    `_SATURATION_PADDED_VOXELS`.
+    """
+    # A device far larger than anything real, so only the saturation cap binds.
+    monkeypatch.setattr(memory, "available_memory_bytes", lambda _d: 10**13)
+
+    big_box = recommend_batchsize(256, 256, 512, "cuda")
+    small_box = recommend_batchsize(64, 64, 128, "cuda")
+
+    # Measured optima on an L40: 2 at box 256, 8 at box 64.
+    assert big_box == 2, "a 67M-voxel-per-particle box must not batch up"
+    assert small_box == MAX_AUTO_BATCHSIZE, "a small box should batch to the ceiling"
+
+
+def test_cuda_budget_leaves_room_for_allocator_reservation() -> None:
+    """
+    The CUDA budget is discounted enough to cover what the allocator RESERVES.
+
+    `estimate_peak_bytes` is fit against *allocated* bytes, but what has to fit
+    on the card is the caching allocator's reserved footprint, measured at
+    1.3-1.6x allocated on this pipeline. Budgeting against the allocated figure
+    alone is what let `"auto"` pick a batch that then OOM'd on its second
+    forward pass with ~19 GB "reserved but unallocated" going spare, so the
+    fraction has to absorb at least that ratio.
+    """
+    assert memory._CUDA_SAFETY_FRACTION <= 1 / 1.3, (
+        "the CUDA budget must leave room for a reserved:allocated ratio of 1.3"
+    )

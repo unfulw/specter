@@ -1,257 +1,41 @@
+"""
+Molecular crowding: `CrowdWithDuplicates` places rotated copies of one
+template around a particle or across a micrograph, with the placement
+filters (ice-surface adsorption, local ice thickness) and the insertion
+kernel it uses.
+"""
+
 from __future__ import annotations
 
-from typing import Literal
+import contextlib
+
+import math
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Literal
 
 import lightning as L
-import numpy as np
 import torch
 
 from .arrays import clip_insert_bounds
+from .coords import poisson_disk_neighbors, poisson_disk_neighbors_3d
+from .cpu_threads import limited_cpu_threads
 from .progress import track
 
 from . import rotations
 
+if TYPE_CHECKING:
+    from .ice import IceProfile
 
-def poisson_disk_neighbors(
-    min_distance: float,
-    n_points: int | float = torch.inf,
-    box: tuple[int, int] = (256, 256),  # (height, width)
-    k: int = 30,
-    seed: Literal["origin", "random"] = "origin",
-) -> torch.Tensor:
-    """
-    2D Poisson-disk sampling in a rectangular box centered at the origin.
-
-    Parameters
-    ----------
-    min_distance : float
-        Minimum spacing between points.
-    n_points : int
-        Total number of points to generate (including seed).
-    box : tuple of int
-        (height, width) of the bounding box in pixels. Origin is at (0,0).
-        Valid coordinates are y in [-H/2, H/2), x in [-W/2, W/2).
-    k : int
-        Number of candidate points to try per active point.
-    seed : {"origin", "random"}
-        If "origin", first point is at the center (0,0).
-        If "random", first point is chosen uniformly inside the box.
-
-    Returns
-    -------
-    pts : (m,2) torch.Tensor
-        Sampled 2D coordinates, including the seed point.
-    """
-    H, W = box
-    y_min, y_max = -H // 2, H // 2
-    x_min, x_max = -W // 2, W // 2
-
-    # initialize first point
-    if seed == "origin":
-        first_point = torch.tensor([0.0, 0.0])
-        n_points += 1  # don't count origin.
-    elif seed == "random":
-        y = (y_max - y_min) * torch.rand(1) + y_min
-        x = (x_max - x_min) * torch.rand(1) + x_min
-        first_point = torch.tensor([y.item(), x.item()])
-    else:
-        raise ValueError("seed must be 'origin' or 'random'")
-
-    pts = [first_point]
-    active = [0]
-
-    while active and len(pts) < n_points:
-        idx = int(torch.randint(len(active), (1,)).item())
-        center_point = pts[active[idx]]
-
-        # generate k candidates in annulus [min_distance, 2*min_distance]
-        theta = torch.rand(k) * 2 * torch.pi
-        radius = min_distance + min_distance * torch.rand(k)
-        candidates = center_point.unsqueeze(0) + torch.stack(
-            (radius * torch.cos(theta), radius * torch.sin(theta)), dim=1
-        )
-
-        # reject candidates outside the centered box
-        mask = (
-            (candidates[:, 0] >= y_min)
-            & (candidates[:, 0] < y_max)
-            & (candidates[:, 1] >= x_min)
-            & (candidates[:, 1] < x_max)
-        )
-        candidates = candidates[mask]
-
-        if candidates.shape[0] == 0:
-            active.pop(idx)
-            continue
-
-        # distance check against all existing points
-        pts_tensor = torch.stack(pts)
-        diff = candidates[:, None, :] - pts_tensor[None, :, :]
-        dist2 = (diff**2).sum(dim=2)
-        min_dist2, _ = dist2.min(dim=1)
-        candidates = candidates[min_dist2 >= min_distance**2]
-
-        if candidates.shape[0] > 0:
-            pts.append(candidates[0])
-            active.append(len(pts) - 1)
-        else:
-            active.pop(idx)
-
-    if n_points == torch.inf:
-        return torch.stack(pts)
-    else:
-        return torch.stack(pts[: int(n_points)])
-
-
-def poisson_disk_neighbors_3d(
-    min_distance: float,
-    n_points: int | float = torch.inf,
-    box: tuple[float, float, float] = (256.0, 256.0, 256.0),  # (D,H,W)
-    k: int = 30,
-    seed: Literal["origin", "random"] = "origin",
-) -> torch.Tensor:
-    """
-    Generate 3D points using Poisson-disk sampling within a 3D tensor volume.
-
-    This function produces points in a (D, H, W) volume such that no two points
-    are closer than `min_distance` pixels, creating a uniform but spatially
-    separated distribution.
-
-    Parameters
-    ----------
-    min_distance : float
-        Minimum allowed distance between points, in Å.
-    n_points : int or torch.inf, optional
-        Maximum number of points to generate. Default is infinite (fill the volume).
-    box : tuple of float, optional
-        Dimensions of the 3D volume in Å, as (D, H, W). Default is (256, 256, 256).
-    k : int, optional
-        Number of candidate points to generate around each active point. Higher
-        values produce denser sampling. Default is 30.
-    seed : {'origin', 'random'}, optional
-        Determines the initial seed point:
-        - 'origin': starts at (0, 0, 0)
-        - 'random': starts at a random location within the box
-
-    Returns
-    -------
-    torch.Tensor
-        Tensor of shape (N, 3), where each row is a point coordinate (x, y, z) in Å.
-
-    Notes
-    -----
-    - The coordinate system is centered at (0,0,0), with ranges:
-      x ∈ [-W/2, W/2], y ∈ [-H/2, H/2], z ∈ [-D/2, D/2].
-    - The function uses a grid-accelerated version of Bridson's Poisson-disk sampling
-      algorithm for efficient neighbor checking.
-    """
-    D, H, W = box
-    z_min, z_max = -D / 2, D / 2
-    y_min, y_max = -H / 2, H / 2
-    x_min, x_max = -W / 2, W / 2
-
-    # Grid acceleration
-    cell_size = min_distance / np.sqrt(3)
-    grid_shape = tuple(torch.ceil(torch.tensor([D, H, W]) / cell_size).int().tolist())
-    grid = -torch.ones(grid_shape, dtype=torch.long)
-
-    def point_to_grid(p):
-        # p = (x, y, z)
-        zi = ((p[2] - z_min) / cell_size).long().clamp(0, grid_shape[0] - 1)
-        yi = ((p[1] - y_min) / cell_size).long().clamp(0, grid_shape[1] - 1)
-        xi = ((p[0] - x_min) / cell_size).long().clamp(0, grid_shape[2] - 1)
-        return zi, yi, xi
-
-    # initialize first point
-    if seed == "origin":
-        first_point = torch.tensor([0.0, 0.0, 0.0])  # x,y,z
-        n_points += 1
-    elif seed == "random":
-        x = (x_max - x_min) * torch.rand(1) + x_min
-        y = (y_max - y_min) * torch.rand(1) + y_min
-        z = (z_max - z_min) * torch.rand(1) + z_min
-        first_point = torch.tensor([x.item(), y.item(), z.item()])
-    else:
-        raise ValueError("seed must be 'origin' or 'random'")
-
-    pts = [first_point]
-    active = [0]
-
-    zi, yi, xi = point_to_grid(first_point)
-    grid[zi, yi, xi] = 0
-
-    while active and len(pts) < n_points:
-        idx = int(torch.randint(len(active), (1,)).item())
-        center_point = pts[active[idx]]
-
-        # generate k candidates in spherical shell
-        phi = torch.acos(2 * torch.rand(k) - 1)
-        theta = 2 * torch.pi * torch.rand(k)
-        r = min_distance * (1 + torch.rand(k))
-
-        dx = r * torch.sin(phi) * torch.cos(theta)
-        dy = r * torch.sin(phi) * torch.sin(theta)
-        dz = r * torch.cos(phi)
-        candidates = center_point.unsqueeze(0) + torch.stack([dx, dy, dz], dim=1)
-
-        # filter candidates in tensor bounds (z,y,x)
-        mask = (
-            (candidates[:, 0] >= x_min)
-            & (candidates[:, 0] < x_max)
-            & (candidates[:, 1] >= y_min)
-            & (candidates[:, 1] < y_max)
-            & (candidates[:, 2] >= z_min)
-            & (candidates[:, 2] < z_max)
-        )
-        candidates = candidates[mask]
-
-        if candidates.shape[0] == 0:
-            active.pop(idx)
-            continue
-
-        # grid neighbor check
-        accepted = []
-        for c in candidates:
-            zi, yi, xi = point_to_grid(c)
-            neighbor_found = False
-            for dz_i in [-1, 0, 1]:
-                for dy_i in [-1, 0, 1]:
-                    for dx_i in [-1, 0, 1]:
-                        nz, ny, nx = zi + dz_i, yi + dy_i, xi + dx_i
-                        if (
-                            0 <= nz < grid_shape[0]
-                            and 0 <= ny < grid_shape[1]
-                            and 0 <= nx < grid_shape[2]
-                        ):
-                            pid = int(grid[nz, ny, nx].item())
-                            if pid != -1:
-                                dist = torch.norm(c - pts[pid])
-                                if dist < min_distance:
-                                    neighbor_found = True
-                                    break
-                    if neighbor_found:
-                        break
-                if neighbor_found:
-                    break
-            if not neighbor_found:
-                accepted.append(c)
-
-        if accepted:
-            new_pt = accepted[0]
-            pts.append(new_pt)
-            active.append(len(pts) - 1)
-            zi, yi, xi = point_to_grid(new_pt)
-            grid[zi, yi, xi] = len(pts) - 1
-        else:
-            active.pop(idx)
-
-    if seed == "origin":
-        if len(pts) == 1:
-            return torch.empty((0, 3))
-        pts = pts[1:]  # don't include origin
-        return torch.stack(pts if n_points == torch.inf else pts[: int(n_points)])
-    elif seed == "random":
-        return torch.stack(pts if n_points == torch.inf else pts[: int(n_points)])
+__all__ = [
+    "poisson_disk_neighbors",
+    "poisson_disk_neighbors_3d",
+    "insert_particles_into_micrograph",
+    "fold_subvoxel_offsets",
+    "filter_by_z_density",
+    "filter_by_local_z_density",
+    "rotation_safe_crop",
+    "CrowdWithDuplicates",
+]
 
 
 def insert_particles_into_micrograph(
@@ -295,6 +79,13 @@ def insert_particles_into_micrograph(
     -----
     If a particle extends beyond the micrograph boundaries, only the portion
     within bounds is inserted (clipping at edges).
+
+    Each volume is stamped at the whole voxel nearest its position, with its
+    index ``n // 2`` on that voxel; the remainder, up to half a voxel per
+    axis, is not applied here. A caller that resamples its copies anyway
+    (every rotated copy does) carries it through that resampling instead,
+    with :func:`fold_subvoxel_offsets`, and passes the whole-voxel positions
+    that function returns.
     """
     N, Zp, Yp, Xp = volumes.shape
     device = volumes.device
@@ -328,11 +119,110 @@ def insert_particles_into_micrograph(
     cy_center = Y // 2
     cx_center = X // 2
 
-    for i in range(N):
+    # Per particle: a bounds clip and one slice add. Under the default
+    # thread pool of a many-core host the small CPU ops dominate; see
+    # cpu_threads. A CUDA canvas has no CPU tensor op in the loop at all,
+    # so the cap there only pays `torch.set_num_threads`' pool-resize cost
+    # (3.15 ms per down/up pair at a 64-thread pool on this host) once per
+    # call -- 337 calls for one 21.5k-instance tomogram species pool.
+    cap = contextlib.nullcontext() if micrograph.is_cuda else limited_cpu_threads()
+    with cap:
+        _insert_all(
+            volumes,
+            positions_int,
+            (cz_center, cy_center, cx_center),
+            (Zp, Yp, Xp),
+            (Z, Y, X),
+            micrograph,
+        )
+    return micrograph
+
+
+def fold_subvoxel_offsets(
+    theta: torch.Tensor,
+    positions: torch.Tensor,
+    pixel_size: float,
+    template_shape: Sequence[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Move each copy's sub-voxel offset into the affine that resamples it.
+
+    :func:`insert_particles_into_micrograph` stamps at whole voxels, so on its
+    own a copy lands up to half a voxel from its recorded position on every
+    axis. A rotated copy is resampled anyway, and a translation in the same
+    affine costs nothing: this splits each position into the whole voxel the
+    copy is stamped at and the remainder, which the rotation then applies.
+
+    Parameters
+    ----------
+    theta : torch.Tensor
+        Affine matrices from :func:`~specter.rotations.build_affine_matrix`,
+        shape (N, 3, 4), applied to the template by
+        :func:`~specter.rotations.rotate_volume` (``origin="relion"``).
+    positions : torch.Tensor
+        Copy centres (x, y, z) in physical units, origin at the canvas centre,
+        shape (N, 3) or (N, 2) (z taken as zero).
+    pixel_size : float
+        Voxel size, in the units of `positions`.
+    template_shape : sequence of int
+        Shape (Z, Y, X) of the volume `theta` will be applied to; the
+        translation is normalised by its x width.
+
+    Returns
+    -------
+    theta : torch.Tensor
+        The affines with the remainder added as a lab-frame displacement,
+        shape (N, 3, 4).
+    positions_whole : torch.Tensor
+        Positions rounded to whole voxels, in physical units, shape (N, 3),
+        to pass to :func:`insert_particles_into_micrograph`.
+
+    Notes
+    -----
+    ``build_affine_matrix(R, T)`` displaces the density by ``-T`` in the lab
+    frame whatever ``R`` is, by pre-rotating ``T``; the remainder ``f`` is
+    therefore added as ``R @ (-f)`` in the normalised units of
+    :func:`~specter.rotations.translations_angstrom_to_torch`, on top of any
+    translation `theta` already carries. The rounding is the one
+    :func:`insert_particles_into_micrograph` applies, so the two parts add
+    back to the position exactly. Trilinear resampling conserves the first
+    moment of a shifted density, so the copy's centroid lands on its position
+    to interpolation accuracy rather than to the nearest voxel.
+    """
+    if positions.shape[1] == 2:
+        positions = torch.cat([positions, positions.new_zeros(len(positions), 1)], 1)
+    voxels = positions / pixel_size
+    whole = voxels.round()
+    remainder = (voxels - whole).to(device=theta.device, dtype=theta.dtype)
+    shift = rotations.translations_angstrom_to_torch(
+        -remainder, int(template_shape[-1]), 1.0
+    )
+    R = theta[..., :3]
+    t = theta[..., 3] + torch.einsum("bij,bj->bi", R, shift)
+    return torch.cat([R, t.unsqueeze(-1)], dim=-1), whole * pixel_size
+
+
+def _insert_all(
+    volumes: torch.Tensor,
+    positions_int: torch.Tensor,
+    center: tuple[int, int, int],
+    part_shape: tuple[int, int, int],
+    micro_shape: tuple[int, int, int],
+    micrograph: torch.Tensor,
+) -> None:
+    """The insertion loop of :func:`insert_particles_into_micrograph`."""
+    cz_center, cy_center, cx_center = center
+    Zp, Yp, Xp = part_shape
+    Z, Y, X = micro_shape
+    # One host transfer for the whole chunk rather than three `.item()`s per
+    # particle: on a CUDA tensor each of those is a separate device
+    # synchronisation, and the loop does nothing else that needs one.
+    positions_list = positions_int.cpu().tolist()
+    for i, (px_i, py_i, pz_i) in enumerate(positions_list):
         # Convert centered coords to array indices
-        cx_index = cx_center + int(positions_int[i, 0].item())
-        cy_index = cy_center + int(positions_int[i, 1].item())
-        cz_index = cz_center + int(positions_int[i, 2].item())
+        cx_index = cx_center + px_i
+        cy_index = cy_center + py_i
+        cz_index = cz_center + pz_i
 
         bounds = clip_insert_bounds(
             (cz_index, cy_index, cx_index), (Zp, Yp, Xp), (Z, Y, X)
@@ -342,7 +232,108 @@ def insert_particles_into_micrograph(
         dst, src = bounds
         micrograph[dst] += volumes[i][src]
 
-    return micrograph
+
+def _local_z_density_probs(
+    z_pts: torch.Tensor,
+    z_bot: torch.Tensor,
+    z_top: torch.Tensor,
+    sigma_frac: float = 0.05,
+    peak_amplitude: float = 1.0,
+    baseline: float = 0.1,
+) -> torch.Tensor:
+    """Keep-probability at each point's own z, per :func:`filter_by_local_z_density`.
+
+    Factored out so a caller that needs the *mask* itself -- not just the
+    filtered points -- can draw one and apply it consistently to several
+    parallel arrays (e.g. coordinates and their committed rotations).
+    """
+    thickness = (z_top - z_bot).clamp(min=1e-6)
+    sigma = (sigma_frac * thickness).clamp(min=1e-6)
+    g1 = torch.exp(-0.5 * ((z_pts - z_bot) / sigma) ** 2)
+    g2 = torch.exp(-0.5 * ((z_pts - z_top) / sigma) ** 2)
+    probs = baseline + peak_amplitude * (g1 + g2)
+    return (probs / probs.max()).clamp(0.0, 1.0)
+
+
+def filter_by_local_z_density(
+    pts: torch.Tensor,
+    z_bot: torch.Tensor,
+    z_top: torch.Tensor,
+    sigma_frac: float = 0.05,
+    peak_amplitude: float = 1.0,
+    baseline: float = 0.1,
+    curve_points: int = 200,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Filter points against a two-Gaussian z-density profile whose peaks sit on
+    each point's *own* ice surfaces.
+
+    The general form of :func:`filter_by_z_density`, which places both peaks at
+    a single global ``±z_length / 2``. Under an
+    :class:`~specter.ice.IceProfile` the surfaces move with (x, y), so a global
+    pair of peaks would put adsorbed particles at the mean surface rather than
+    the local one -- in the thin regions of a wedge, outside the ice entirely.
+
+    Parameters
+    ----------
+    pts : torch.Tensor
+        Particle coordinates with shape (N, 3) containing (x, y, z) positions.
+    z_bot : torch.Tensor
+        Lower ice surface at each point's (x, y), shape (N,), in Å.
+    z_top : torch.Tensor
+        Upper ice surface at each point's (x, y), shape (N,), in Å.
+    sigma_frac : float, optional
+        Gaussian width as a fraction of the local thickness. Default is 0.05.
+    peak_amplitude : float, optional
+        Amplitude of Gaussian peaks at surfaces. Default is 1.0.
+    baseline : float, optional
+        Minimum probability in the bulk region. Default is 0.1.
+    curve_points : int, optional
+        Number of points for returning the probability curve along z.
+        Default is 200.
+
+    Returns
+    -------
+    pts_filtered : torch.Tensor
+        Filtered points with shape (M, 3) where M <= N.
+    z_distribution : torch.Tensor
+        Probability density curve along z-axis with shape (curve_points,),
+        evaluated at the mean surfaces.
+
+    Notes
+    -----
+    The probability distribution is: P(z) = baseline + amplitude * (G1 + G2)
+    where G1 and G2 are Gaussians centered at each point's own ``z_bot`` and
+    ``z_top``. The profile models the adsorption of most particles to the
+    air-water interfaces observed by cryo-electron tomography [1]_.
+
+    References
+    ----------
+    .. [1] Noble, A. J., Dandey, V. P., Wei, H., Brasch, J., Chase, J.,
+       Acharya, P., et al. (2018). Routine single particle CryoEM sample and
+       grid characterization by tomography. *eLife*, 7, e34257.
+       https://doi.org/10.7554/eLife.34257
+    """
+    if len(pts) == 0:
+        return pts, torch.zeros(curve_points)
+
+    probs = _local_z_density_probs(
+        pts[:, 2], z_bot, z_top, sigma_frac, peak_amplitude, baseline
+    )
+    mask = torch.rand(len(probs)) < probs
+    pts_filtered = pts[mask]
+
+    # Curve along z, reported at the mean surfaces: with a profile there is no
+    # single z-axis every point shares.
+    z_min, z_max = float(z_bot.mean()), float(z_top.mean())
+    sigma_curve = sigma_frac * (z_max - z_min)
+    z_curve = torch.linspace(z_min, z_max, curve_points)
+    g1_curve = torch.exp(-0.5 * ((z_curve - z_min) / sigma_curve) ** 2)
+    g2_curve = torch.exp(-0.5 * ((z_curve - z_max) / sigma_curve) ** 2)
+    p_curve = baseline + peak_amplitude * (g1_curve + g2_curve)
+    z_distribution = (p_curve / p_curve.max()).clamp(0.0, 1.0)
+
+    return pts_filtered, z_distribution
 
 
 def filter_by_z_density(
@@ -352,13 +343,16 @@ def filter_by_z_density(
     peak_amplitude: float = 1.0,
     baseline: float = 0.1,
     curve_points: int = 200,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Filter points based on a two-Gaussian z-density profile with peaks at the
     top and bottom of the z-range.
 
     Simulates particle distribution at ice-water interface where particles
     preferentially accumulate at top and bottom surfaces.
+
+    A flat-slab wrapper around :func:`filter_by_local_z_density`, which takes
+    the surfaces per point rather than as a single global pair.
 
     Parameters
     ----------
@@ -387,38 +381,126 @@ def filter_by_z_density(
     -----
     The probability distribution is: P(z) = baseline + amplitude * (G1 + G2)
     where G1 and G2 are Gaussians centered at z_min and z_max respectively.
+
+    References
+    ----------
+    .. [1] Noble, A. J., Dandey, V. P., Wei, H., Brasch, J., Chase, J.,
+       Acharya, P., et al. (2018). Routine single particle CryoEM sample and
+       grid characterization by tomography. *eLife*, 7, e34257.
+       https://doi.org/10.7554/eLife.34257
     """
-    z_min, z_max = -z_length / 2, z_length / 2
-    sigma = sigma_frac * z_length
-
     if len(pts) == 0:
-        z_curve = torch.linspace(z_min, z_max, curve_points)
         return pts, torch.zeros(curve_points)
+    ones = torch.ones(len(pts), dtype=pts.dtype, device=pts.device)
+    return filter_by_local_z_density(
+        pts,
+        -z_length / 2 * ones,
+        z_length / 2 * ones,
+        sigma_frac=sigma_frac,
+        peak_amplitude=peak_amplitude,
+        baseline=baseline,
+        curve_points=curve_points,
+    )
 
-    # compute z for each point
-    z_pts = pts[:, 2]
 
-    # Gaussian peaks at top and bottom
-    g1 = torch.exp(-0.5 * ((z_pts - z_min) / sigma) ** 2)
-    g2 = torch.exp(-0.5 * ((z_pts - z_max) / sigma) ** 2)
+#: Voxels per z-chunk of the radius grid :func:`rotation_safe_crop` builds.
+#: 2**24 float32 is 64 MB, bounding a one-off measurement whose input can be
+#: a whole micrograph-scale template.
+_CROP_RADIUS_CHUNK_VOXELS = 2**24
 
-    # acceptance probability for each point
-    probs_filtered = baseline + peak_amplitude * (g1 + g2)
-    probs_filtered = (probs_filtered / probs_filtered.max()).clamp(0.0, 1.0)
+#: Furthest :func:`fold_subvoxel_offsets` can move density, in voxels: half a
+#: voxel on each of three axes.
+_SUBVOXEL_SHIFT_REACH = math.sqrt(3.0) / 2
 
-    # filter points randomly
-    mask = torch.rand(len(z_pts)) < probs_filtered
-    pts_filtered = pts[mask]
-    probs_filtered = probs_filtered[mask]
 
-    # create probability curve along z
-    z_curve = torch.linspace(z_min, z_max, curve_points)
-    g1_curve = torch.exp(-0.5 * ((z_curve - z_min) / sigma) ** 2)
-    g2_curve = torch.exp(-0.5 * ((z_curve - z_max) / sigma) ** 2)
-    p_curve = baseline + peak_amplitude * (g1_curve + g2_curve)
-    z_distribution = (p_curve / p_curve.max()).clamp(0.0, 1.0)
+def rotation_safe_crop(volume: torch.Tensor) -> torch.Tensor:
+    """
+    The smallest centred crop no rotation about the centre can move density
+    out of.
 
-    return pts_filtered, z_distribution
+    A rendered template is mostly empty: a molecule occupies a sphere, and
+    the box around it has to be large enough for the *image*, not for the
+    molecule. 6bdf at 384 px / 1 Å fills a 103-voxel radius, so rotating the
+    whole box resamples 6.3x more voxels than the content needs, and stamps
+    6.3x more zeros into the canvas. Cropping first is exact rather than an
+    approximation: rotation preserves distance from the centre, so every
+    voxel that could carry density into the crop started inside it, and
+    everything outside was zero and rotates to zero. The crop also leaves room
+    for the sub-voxel offset each copy is resampled with
+    (:func:`fold_subvoxel_offsets`), so that shift cannot clip it either.
+
+    Parameters
+    ----------
+    volume : torch.Tensor
+        Template of shape ``(Z, Y, X)``.
+
+    Returns
+    -------
+    torch.Tensor
+        A contiguous centred crop, or `volume` itself when no axis can be
+        cropped (density reaching the faces, or an all-zero template).
+
+    Notes
+    -----
+    Each axis keeps its own parity, so the crop's centre stays where the
+    original's was under both conventions that read one: ``grid_sample``
+    places the geometric centre at ``(n - 1) / 2``, while
+    :func:`~specter.arrays.clip_insert_bounds` positions index ``n // 2``.
+    The two differ by half a voxel for an even axis, and a crop that changed
+    parity would shift the duplicate by that half voxel.
+
+    The radius is the true furthest occupied voxel, not the corner of the
+    density's bounding box. The bounding box is three cheap reductions and
+    needs no radius grid, but it over-estimates by the corner-to-sphere
+    ratio -- 254 voxels against 207 for 6bdf -- and at the box sizes a
+    particle stack actually runs at that is the difference between a useful
+    crop and none at all (at 256 px, 254 rounds up to the box itself). The
+    grid is materialised a z-chunk at a time and the answer cached by
+    `CrowdWithDuplicates`, so it is paid once per template, not once per
+    duplicate.
+    """
+    nz, ny, nx = volume.shape[-3:]
+    axis_grid = [
+        torch.arange(n, device=volume.device, dtype=torch.float32) - (n - 1) / 2
+        for n in (nz, ny, nx)
+    ]
+    plane_r2 = axis_grid[1][:, None] ** 2 + axis_grid[2][None, :] ** 2
+    furthest_r2 = -1.0
+    chunk = max(1, _CROP_RADIUS_CHUNK_VOXELS // (ny * nx))
+    for z0 in range(0, nz, chunk):
+        occupied = volume[..., z0 : z0 + chunk, :, :] != 0
+        if not bool(occupied.any()):
+            continue
+        r2 = plane_r2 + (axis_grid[0][z0 : z0 + chunk] ** 2)[:, None, None]
+        furthest_r2 = max(
+            furthest_r2, float(torch.where(occupied, r2, r2.new_zeros(())).amax())
+        )
+    if furthest_r2 < 0:
+        return volume
+    # Plus the interpolation's own reach. `rotate_volume` resamples
+    # trilinearly, so an output voxel takes from the eight source voxels
+    # around its preimage: an occupied voxel at radius R can therefore put
+    # density at radius R + sqrt(3), one voxel diagonal further out.
+    # Cropping at R alone clips that shell, which is not a rounding
+    # difference -- it cost 20% of a blob's density in the test that pins
+    # this. And plus the sub-voxel offset `fold_subvoxel_offsets` folds into
+    # the same resample, at most half a voxel per axis.
+    radius = math.sqrt(furthest_r2) + math.sqrt(3.0) + _SUBVOXEL_SHIFT_REACH
+
+    sides = []
+    for n in (nz, ny, nx):
+        side = math.ceil(2 * radius + 1)
+        side += (n - side) % 2  # keep the axis's parity, so the centre holds
+        sides.append(min(n, side))
+    if sides == [nz, ny, nx]:
+        return volume
+    starts = [(n - s) // 2 for n, s in zip((nz, ny, nx), sides)]
+    return volume[
+        ...,
+        starts[0] : starts[0] + sides[0],
+        starts[1] : starts[1] + sides[1],
+        starts[2] : starts[2] + sides[2],
+    ].contiguous()
 
 
 class CrowdWithDuplicates(L.LightningModule):
@@ -457,8 +539,14 @@ class CrowdWithDuplicates(L.LightningModule):
             - 'origin': start at center (0,0,0)
             - 'random': start at a random location within the box
     chunk_size : int, optional
-        Number of volumes to rotate per batch for memory-efficient computation.
-        If None, all volumes are rotated at once.
+        Number of duplicate volumes to rotate per batch. Default 1. Rotating
+        them all at once needs ~28 bytes of transient sampling grid per template
+        voxel per duplicate, which a micrograph cannot afford, and batching them
+        is free in both directions: wall time measured flat from 1 to 64 at
+        micrograph scale while peak memory ran 0.55 GB to 30.1 GB. Raising this
+        therefore only trades memory for nothing, and changes the order
+        duplicates are summed into the accumulator, perturbing the output at
+        float-rounding level.
     move_to_cpu : bool, optional
         If True, intermediate rotated volumes are moved to CPU to save GPU memory.
     progressbars : bool, optional
@@ -466,6 +554,97 @@ class CrowdWithDuplicates(L.LightningModule):
     water_air_interface : bool, optional
         If True, applies a bimodal distribution along z-coordinates. Mimics the
         particle adsorption in cryo-EM ice-water interface.
+    sigma_frac : float, optional
+        Gaussian width as a fraction of the local ice thickness (or of
+        ``max_distance_z`` when ``ice_profile`` is None), forwarded to
+        :func:`~specter.crowding.filter_by_local_z_density`. Smaller pulls
+        adsorbed particles into a tighter shell against each surface; larger
+        spreads them further into the bulk. Only used when
+        ``water_air_interface=True``. Default 0.05.
+    peak_amplitude : float, optional
+        Amplitude of the two Gaussians centered on each surface, forwarded to
+        :func:`~specter.crowding.filter_by_local_z_density`. Only used when
+        ``water_air_interface=True``. Default 1.0.
+    baseline : float, optional
+        Minimum keep-probability in the bulk, away from either surface,
+        forwarded to :func:`~specter.crowding.filter_by_local_z_density` --
+        the fraction of particles left floating free in solution rather than
+        adsorbed. Only used when ``water_air_interface=True``. Default 0.1.
+    ice_profile : IceProfile, optional
+        Laterally varying ice geometry. When given, '3d' placement is gated on
+        each candidate's own column: a placement whose particle would poke out
+        of the local slab is rejected, and ``water_air_interface`` adsorbs to
+        the local surfaces via
+        :func:`~specter.crowding.filter_by_local_z_density` rather than to a
+        single global pair. Default None (a slab filling ``max_distance_z``).
+    particle_radius : float, optional
+        Half-height in Å used for that fit test. Defaults to
+        ``min_distance / 2``. Ignored when ``ice_profile`` is None.
+    packing_backend : {'poisson_disk', 'shape'}, optional
+        Placement algorithm. ``'poisson_disk'`` (default) is the original
+        Bridson-sampled, bounding-sphere-exclusion placement above.
+        ``'shape'`` instead packs via
+        :func:`~specter.specimen.packing.pack_shapes_3d` -- the same
+        Random-Sequential-Addition packer `TomogramSpecimenGenerator` uses,
+        colliding the real rotated molecular footprint against a running
+        occupancy grid instead of a bounding-sphere distance. Measured on
+        specter's own benchmarks, bounding-sphere exclusion cannot exceed
+        the density a molecule's envelope occupies within its own bounding
+        sphere (~0.178 for a typical protein), while shape-aware RSA
+        reaches physiological crowding densities (~0.2-0.25 volume
+        fraction) on the same box -- see `pack_shapes_3d`'s own docstring
+        for the measured numbers. Requires ``atom_coordinates``.
+
+        ``ice_profile``-aware: the outside-ice region (per-column, from
+        ``ice_profile.surfaces``) is pre-seeded into `pack_shapes_3d`'s own
+        ``occupancy`` grid -- the same hook obstacles like membranes use --
+        so a candidate that would land outside the local slab is a
+        *rejected attempt* RSA retries within its budget, not an accepted
+        instance thrown away afterward. ``water_air_interface`` then thins
+        the resulting (already-jammed, already-confined) pack toward the
+        local surfaces with the same two-Gaussian keep-probability
+        `filter_by_local_z_density` uses, rather than biasing candidate
+        placement itself: RSA saturates density everywhere it's allowed to
+        land, so restricting *where* it draws from further wins nothing
+        once occupancy already confines it.
+    atom_coordinates : torch.Tensor, optional
+        Atomic coordinates of the template molecule, shape (N, 3), in the
+        molecule's own frame -- `specter.pdb.PDB.coordinates` is already
+        centered the way this needs. Required (and used only) when
+        ``packing_backend='shape'``, to rasterize the real footprint via
+        `~specter.specimen.packing.build_species_mask` rather than
+        colliding `V` itself (a rendered potential, not a binary shape).
+    gap : float, optional
+        Extra clearance baked into the shape-backend footprint mask, Å --
+        forwarded to `build_species_mask`. Default 0.0. Ignored for
+        ``packing_backend='poisson_disk'``, which uses `min_distance`
+        instead.
+    n_orientations : int, optional
+        Size of the shape backend's per-species rotation cache, forwarded
+        to `pack_shapes_3d`. Default 256. Ignored for ``'poisson_disk'``.
+    packing_max_retries : int, optional
+        Shape backend's attempts-per-instance ceiling, forwarded to
+        `pack_shapes_3d` as ``max_retries``. This is the knob that sets
+        achieved density -- see that function's own docstring for the
+        measured density-vs-wall-time table. Default 1500. Ignored for
+        ``'poisson_disk'``.
+    packing_stall_patience : int, optional
+        Shape backend's early-stop threshold, forwarded to `pack_shapes_3d`
+        as ``stall_patience``. Default 5000. Ignored for
+        ``'poisson_disk'``.
+    packing_seed : int, optional
+        Shape backend's RNG seed, forwarded to `pack_shapes_3d` as
+        ``seed``. Distinct from ``seed`` above, which controls the
+        poisson-disk backend's *starting point* strategy instead of an RNG
+        seed. Default None. Ignored for ``'poisson_disk'``.
+    n_candidates : int, optional
+        Shape backend's candidate pool size (how many placement attempts
+        RSA gets to work with before ``max_retries``/``stall_patience``
+        cut it off). Default None: estimated as ``20 *
+        grid_volume / footprint_volume``, clamped to [500, 200_000] --
+        a rough oversampling factor, not a target count (RSA saturates
+        well before exhausting the pool at realistic density). Ignored for
+        ``'poisson_disk'``, which has its own ``n_points``.
 
     Attributes
     ----------
@@ -473,10 +652,23 @@ class CrowdWithDuplicates(L.LightningModule):
         Coordinates of generated duplicates after Poisson-disk sampling.
     theta : torch.Tensor
         Affine rotation matrices for each duplicate.
-    vols : torch.Tensor
+    volumes : torch.Tensor
         Rotated duplicates ready for insertion into a micrograph.
     N : int
         Number of duplicates generated.
+
+    References
+    ----------
+    .. [1] Bridson, R. (2007). Fast Poisson disk sampling in arbitrary
+       dimensions. In *ACM SIGGRAPH 2007 Sketches* (p. 22). ACM.
+       https://doi.org/10.1145/1278780.1278807
+    .. [2] Shoemake, K. (1992). Uniform random rotations. In *Graphics Gems
+       III (IBM Version)* (pp. 124–132). Elsevier.
+       https://doi.org/10.1016/B978-0-08-050755-2.50036-1
+    .. [3] Noble, A. J., Dandey, V. P., Wei, H., Brasch, J., Chase, J.,
+       Acharya, P., et al. (2018). Routine single particle CryoEM sample and
+       grid characterization by tomography. *eLife*, 7, e34257.
+       https://doi.org/10.7554/eLife.34257
     """
 
     def __init__(
@@ -491,12 +683,39 @@ class CrowdWithDuplicates(L.LightningModule):
         method: Literal["2d", "3d"] = "3d",
         n_points: int | float = torch.inf,
         seed: Literal["origin", "random"] = "origin",
-        chunk_size: int | None = None,
+        chunk_size: int = 1,
         move_to_cpu: bool = False,
         progressbars: bool = True,
         water_air_interface: bool = False,
+        sigma_frac: float = 0.05,
+        peak_amplitude: float = 1.0,
+        baseline: float = 0.1,
+        ice_profile: "IceProfile | None" = None,
+        particle_radius: float | None = None,
+        packing_backend: Literal["poisson_disk", "shape"] = "poisson_disk",
+        atom_coordinates: torch.Tensor | None = None,
+        gap: float = 0.0,
+        n_orientations: int = 256,
+        packing_max_retries: int = 1500,
+        packing_stall_patience: int = 5000,
+        packing_seed: int | None = None,
+        n_candidates: int | None = None,
     ):
         super().__init__()
+        if packing_backend == "shape" and atom_coordinates is None:
+            raise ValueError(
+                "packing_backend='shape' requires atom_coordinates (the "
+                "template's real atomic coordinates, used to rasterize its "
+                "footprint) -- pass the PDB's own PDB.coordinates."
+            )
+        self.packing_backend = packing_backend
+        self.atom_coordinates = atom_coordinates
+        self.gap = gap
+        self.n_orientations = n_orientations
+        self.packing_max_retries = packing_max_retries
+        self.packing_stall_patience = packing_stall_patience
+        self.packing_seed = packing_seed
+        self.n_candidates = n_candidates
 
         self.register_buffer("V", V)
         self.dx = dx
@@ -505,10 +724,31 @@ class CrowdWithDuplicates(L.LightningModule):
         self.poisson_disc_method = method
         self.n_points = n_points
         self.seed = seed
+        # Rotating a duplicate costs ~28 bytes per template voxel (the
+        # (B, Z, Y, X, 3) sampling grid plus the resampled output), so rotating
+        # them all at once is what a micrograph cannot afford: 864 duplicates of
+        # a 256^3 template asks for 60 GiB in one allocation.
+        #
+        # 1 by default because batching these is free in both directions --
+        # measured at micrograph scale, wall time is flat from 1 to 64
+        # (86.9-88.9 s) while peak memory runs 0.55 GB to 30.1 GB. So a larger
+        # value only ever trades memory for nothing. Raising it also perturbs
+        # the output at float-rounding level (~4e-6 relative, measured), since
+        # it changes the order duplicates are summed into the accumulator.
         self.chunk_size = chunk_size
         self.move_to_cpu = move_to_cpu
         self.progressbars = progressbars
         self.water_air_interface = water_air_interface
+        self.sigma_frac = sigma_frac
+        self.peak_amplitude = peak_amplitude
+        self.baseline = baseline
+        self.ice_profile = ice_profile
+        # min_distance is the caller's own estimate of how much room one
+        # particle needs -- `MicrographSpecimenGenerator`'s callers pass
+        # `pdb.max_diameter` -- so half of it is the particle's radius.
+        self.particle_radius = (
+            particle_radius if particle_radius is not None else min_distance / 2
+        )
 
         if nz_out is None:
             nz_out = self.n
@@ -526,17 +766,27 @@ class CrowdWithDuplicates(L.LightningModule):
 
     def generate_coordinates(self) -> None:
         """
-        Generate coordinates of duplicates using Poisson-disk sampling.
+        Generate coordinates of duplicates.
 
-        For '2d' sampling, points are sampled in xy plane and z is set to 0.
-        For '3d' sampling, points are sampled in full 3D volume.
-        Coordinates are stored in `self.coords`.
+        Dispatches on `packing_backend`. For ``'shape'``, see
+        `_generate_coordinates_shape`. For ``'poisson_disk'`` (default):
+        '2d' sampling places points in the xy plane and sets z to 0; '3d'
+        sampling places points in the full 3D volume. Coordinates are
+        stored in `self.coords`.
         """
+        if self.packing_backend == "shape":
+            self._generate_coordinates_shape()
+            return
         if self.poisson_disc_method == "2d":
+            # The sampler works in the units of `min_distance`, Angstrom, and
+            # its coordinates are read as Angstrom downstream, so the box must
+            # be too: passing `nxy_out` in pixels confined the duplicates to
+            # the central 1 / dx of the box's width.
+            extent = self.nxy_out * self.dx
             coords = poisson_disk_neighbors(
                 self.min_distance,
                 n_points=self.n_points,
-                box=(self.nxy_out, self.nxy_out),
+                box=(extent, extent),
                 seed=self.seed,
             )
             # add z-coordinates
@@ -549,9 +799,33 @@ class CrowdWithDuplicates(L.LightningModule):
                 box=(self.max_distance_z, self.max_distance_xy, self.max_distance_xy),
                 seed=self.seed,
             )
-            if self.water_air_interface:
+            if self.ice_profile is not None:
+                # Reject anything that would poke out of its OWN column's slab.
+                # `max_distance_z` spans the whole profile, so without this the
+                # thin regions get particles sitting in vacuum.
+                z_bot, z_top = self.ice_profile.surfaces_at(
+                    coords[:, :2], self.nxy_out, self.dx
+                )
+                fits = (coords[:, 2] - self.particle_radius >= z_bot) & (
+                    coords[:, 2] + self.particle_radius <= z_top
+                )
+                coords, z_bot, z_top = coords[fits], z_bot[fits], z_top[fits]
+                if self.water_air_interface:
+                    coords, self.z_distribution = filter_by_local_z_density(
+                        coords,
+                        z_bot,
+                        z_top,
+                        sigma_frac=self.sigma_frac,
+                        peak_amplitude=self.peak_amplitude,
+                        baseline=self.baseline,
+                    )
+            elif self.water_air_interface:
                 coords, self.z_distribution = filter_by_z_density(
-                    coords, self.max_distance_z
+                    coords,
+                    self.max_distance_z,
+                    sigma_frac=self.sigma_frac,
+                    peak_amplitude=self.peak_amplitude,
+                    baseline=self.baseline,
                 )
         else:
             raise ValueError(
@@ -559,116 +833,222 @@ class CrowdWithDuplicates(L.LightningModule):
             )
         self.coords = coords
 
+    def _generate_coordinates_shape(self) -> None:
+        """
+        Generate coordinates (and orientations) via shape-aware RSA.
+
+        Colliding the real rotated molecular footprint against a running
+        occupancy grid instead of `min_distance`-apart bounding spheres --
+        see `packing_backend`'s own docstring for why this reaches
+        substantially higher density. A single species, duplicated: the
+        candidate pool is one uniform `species_idx` (this class places one
+        template, unlike `TomogramSpecimenGenerator`'s multi-species case).
+
+        The accepted rotations are stored on `self._shape_rotations` for
+        `generate_affine_matrices` to reuse directly -- they are the
+        orientations the packer actually tested for collisions, so
+        redrawing them at render time would render geometry that does not
+        match what was packed (see that method's own comment).
+
+        Under an `ice_profile`, the outside-ice region is pre-seeded into
+        `pack_shapes_3d`'s own `occupancy` grid (the same hook obstacles
+        like membranes use), rather than filtering accepted coordinates
+        afterward: pre-seeding makes a candidate that lands in vacuum a
+        rejected *attempt*, which RSA retries within its budget, instead of
+        an accepted instance that just gets discarded -- so the attempt
+        budget converges on placements that actually land, rather than
+        being spent partly on ones that don't.
+        """
+        from .specimen.packing import build_species_mask, pack_shapes_3d
+
+        grid_shape = (self.nz_out, self.nxy_out, self.nxy_out)
+        if self.atom_coordinates is None:
+            raise ValueError(
+                "packing_backend='shape' needs atom_coordinates (the template's "
+                "real atomic coordinates) to build its collision footprint."
+            )
+        mask = build_species_mask(self.atom_coordinates, self.dx, gap=self.gap)
+
+        occupancy = None
+        if self.ice_profile is not None:
+            z_bot_field, z_top_field = self.ice_profile.surfaces(self.nxy_out, self.dx)
+            # Packing voxel k is canvas voxel k, at (k - n // 2) * dx: the
+            # position `pack_shapes_3d` records for it, and the one the
+            # profile's own grid and window use.
+            z_axis = (
+                torch.arange(self.nz_out, dtype=torch.float32) - self.nz_out // 2
+            ) * self.dx
+            interior = (z_axis[:, None, None] >= z_bot_field[None]) & (
+                z_axis[:, None, None] <= z_top_field[None]
+            )
+            occupancy = ~interior
+
+        n_candidates = self.n_candidates
+        if n_candidates is None:
+            grid_volume = self.nz_out * self.nxy_out * self.nxy_out
+            mask_volume = max(int(mask.sum().item()), 1)
+            n_candidates = int(min(max(20 * grid_volume / mask_volume, 500), 200_000))
+        species_idx = torch.zeros(n_candidates, dtype=torch.long)
+
+        coords, rotation_matrices, _accepted_idx, _occupancy = pack_shapes_3d(
+            [mask],
+            species_idx,
+            grid_shape,
+            self.dx,
+            occupancy=occupancy,
+            n_orientations=self.n_orientations,
+            max_retries=self.packing_max_retries,
+            stall_patience=self.packing_stall_patience,
+            seed=self.packing_seed,
+            device=str(self.device),
+        )
+
+        if self.ice_profile is not None:
+            z_bot, z_top = self.ice_profile.surfaces_at(
+                coords[:, :2], self.nxy_out, self.dx
+            )
+        elif self.water_air_interface:
+            ones = torch.ones(len(coords))
+            z_bot = -self.max_distance_z / 2 * ones
+            z_top = self.max_distance_z / 2 * ones
+
+        if self.water_air_interface and len(coords) > 0:
+            # Thin the jammed pack toward the local surfaces rather than
+            # biasing where candidates are drawn from: RSA already
+            # saturates density everywhere it's allowed to land, so nothing
+            # is gained by restricting placement itself. Reusing the same
+            # two-Gaussian keep-probability as `filter_by_local_z_density`
+            # here has a much bigger accepted pool to thin than
+            # poisson_disk's own raw candidates -- that's what makes the
+            # bias actually show up (see that function's docstring for why
+            # it can't, on a sparse pool).
+            probs = _local_z_density_probs(
+                coords[:, 2],
+                z_bot,
+                z_top,
+                self.sigma_frac,
+                self.peak_amplitude,
+                self.baseline,
+            )
+            keep = torch.rand(len(coords)) < probs
+            coords, rotation_matrices = coords[keep], rotation_matrices[keep]
+
+        self.coords = coords
+        self._shape_rotations = rotation_matrices
+
     def generate_affine_matrices(self) -> None:
         """
-        Generate random rotation matrices and corresponding affine matrices
-        for each duplicate volume.
+        Generate rotation matrices and corresponding affine matrices for
+        each duplicate volume.
+
+        For ``packing_backend='shape'``, reuses the orientations
+        `_generate_coordinates_shape` already committed to during
+        collision testing rather than drawing fresh ones -- redrawing
+        would render a volume whose geometry doesn't match what the
+        packer actually tested for overlaps (see
+        `TomogramSpecimenGenerator._render_species_pool`'s identical
+        comment). For ``'poisson_disk'``, orientation has no bearing on
+        the (spherical) collision test, so rotations are drawn randomly
+        here.
 
         Rotations are stored in `self.theta`.
         """
         self.N = len(self.coords)
-        R = rotations.random_rotation_matrix(self.N)
+        if self.packing_backend == "shape":
+            R = self._shape_rotations
+        else:
+            R = rotations.random_rotation_matrix(self.N)
         # in case only one position was found, ensures R is (1,3,3)
         if len(R.shape) == 2:
             R = R.unsqueeze(0)
         self.theta = rotations.build_affine_matrix(R)
 
-    def rotate_volumes(self) -> None:
+    def _rotation_template(self) -> torch.Tensor:
         """
-        Rotate the original volume according to the affine matrices `self.theta`.
+        `V` cropped to the part a rotation can move, see
+        :func:`rotation_safe_crop`.
 
-        If `chunk_size` is specified, volumes are rotated in batches for memory efficiency.
-        The rotated volumes are stored in `self.vols`.
+        Cached, since one template is rotated once per duplicate and the
+        whole stack shares it. The key is the buffer's identity, so a `V`
+        that is replaced or moved to another device re-crops.
         """
-        if self.chunk_size is not None:
-            if self.move_to_cpu:
-                self.vols = torch.empty((self.N,) + self.V.shape)
-            else:
-                self.vols = torch.empty((self.N,) + self.V.shape, device=self.device)
+        key = (self.V.data_ptr(), tuple(self.V.shape), self.V.dtype)
+        cached = getattr(self, "_rotation_template_cache", None)
+        if cached is None or cached[0] != key:
+            cached = (key, rotation_safe_crop(self.V))
+            self._rotation_template_cache = cached
+        return cached[1]
 
-            for start in track(
-                range(0, self.N, self.chunk_size),
-                description="Rotating duplicates",
-                transient=True,
-                disable=not self.progressbars,
-            ):
-                end = min(start + self.chunk_size, self.N)
-                if self.move_to_cpu:
-                    self.vols[start:end] = rotations.rotate_volume(
-                        self.V,
-                        self.theta[start:end].to(self.V.device),
-                        padding_mode="zeros",
-                    ).cpu()
-                else:
-                    self.vols[start:end] = rotations.rotate_volume(
-                        self.V,
-                        self.theta[start:end].to(self.V.device),
-                        padding_mode="zeros",
-                    )
-        else:
-            self.vols = rotations.rotate_volume(
-                self.V, self.theta.to(self.V.device), padding_mode="zeros"
-            )
-
-    def insert_volumes(self) -> torch.Tensor:
-        """
-        Insert the rotated volumes (`self.vols`) into a 3D micrograph according to `self.coords`.
-
-        Returns
-        -------
-        torch.Tensor
-            Micrograph of shape (nz_out, nxy_out, nxy_out) containing all duplicates.
-        """
-        micro = insert_particles_into_micrograph(
-            self.vols,
-            self.coords,
-            pixel_size=self.dx,
-            micro_shape=(self.nz_out, self.nxy_out, self.nxy_out),
-        )
-        return micro
-
-    def forward(self) -> torch.Tensor:
+    def forward(self, into: torch.Tensor | None = None) -> torch.Tensor:
         """
         Full pipeline: generate coordinates, random rotations, rotate volumes,
         and insert them into a micrograph.
 
+        Parameters
+        ----------
+        into : torch.Tensor, optional
+            An existing ``(nz_out, nxy_out, nxy_out)`` canvas to accumulate the
+            duplicates into, in place. When given, no separate accumulator is
+            allocated and the duplicates are stamped straight onto it, which
+            is what a caller that would otherwise do ``V += crowd()`` wants:
+            at a 512-pixel box with ``pad_fft`` the accumulator is a second
+            2 GB canvas held only to be added once. The rotated chunks follow
+            ``into``'s device, so ``move_to_cpu`` has no effect on this path.
+
         Returns
         -------
         torch.Tensor
-            The final micrograph containing all duplicates, shape (nz_out, nxy_out, nxy_out).
-            All-zeros if no candidate positions were generated.
+            The micrograph containing all duplicates, shape (nz_out, nxy_out,
+            nxy_out) -- ``into`` itself when given. All-zeros (or ``into``
+            unchanged) if no candidate positions were generated.
         """
         self.generate_coordinates()
         self.generate_affine_matrices()
         if len(self.coords) == 0:
+            if into is not None:
+                return into
             return torch.zeros(
                 self.nz_out, self.nxy_out, self.nxy_out, device=self.device
             )
-        if self.chunk_size is None:
-            self.rotate_volumes()
-            micrograph = self.insert_volumes()
-            if self.move_to_cpu:
-                micrograph = micrograph.cpu()
+        # Rotate and insert a chunk at a time, so neither the sampling grid nor
+        # the stack of rotated duplicates is ever held for all N at once. The
+        # accumulator follows `move_to_cpu`, matching where the rotated volumes
+        # are sent -- at micrograph scale it is far larger than any chunk (a
+        # 500 x 4096 x 4096 canvas is 33 GB) and is what `move_to_cpu` exists
+        # to keep off the device.
+        if into is not None:
+            accumulator_device = into.device
+            micrograph = into
         else:
-            micrograph = torch.zeros(self.nz_out, self.nxy_out, self.nxy_out)
-            for start in track(
-                range(0, self.N, self.chunk_size),
-                description="Rotating duplicates and insert into micrograph",
-                transient=True,
-                disable=not self.progressbars,
-            ):
-                end = min(start + self.chunk_size, self.N)
-                vols = rotations.rotate_volume(
-                    self.V,
-                    self.theta[start:end].to(self.V.device),
-                    padding_mode="zeros",
-                )
-                if self.move_to_cpu:
-                    vols = vols.cpu()
-                micrograph = insert_particles_into_micrograph(
-                    vols,
-                    self.coords[start:end],
-                    pixel_size=self.dx,
-                    micrograph=micrograph,
-                )
+            accumulator_device = (
+                torch.device("cpu") if self.move_to_cpu else self.device
+            )
+            micrograph = torch.zeros(
+                self.nz_out, self.nxy_out, self.nxy_out, device=accumulator_device
+            )
+        # Each duplicate is stamped at a whole voxel and the sub-voxel rest of
+        # its position rides on the rotation's own resample. Folded once for
+        # all N, so the chunk loop gains no per-chunk host transfer.
+        template = self._rotation_template()
+        theta, whole = fold_subvoxel_offsets(
+            self.theta.to(template.device), self.coords, self.dx, template.shape
+        )
+        for start in track(
+            range(0, self.N, self.chunk_size),
+            description="Rotating duplicates and insert into micrograph",
+            transient=True,
+            disable=not self.progressbars,
+        ):
+            end = min(start + self.chunk_size, self.N)
+            volumes = rotations.rotate_volume(
+                template,
+                theta[start:end],
+                padding_mode="zeros",
+            )
+            micrograph = insert_particles_into_micrograph(
+                volumes.to(accumulator_device),
+                whole[start:end],
+                pixel_size=self.dx,
+                micrograph=micrograph,
+            )
         return micrograph

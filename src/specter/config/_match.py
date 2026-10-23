@@ -1,0 +1,297 @@
+"""MatchConfig: parameters for `specter match particles`."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from ._common_fields import (
+    job_id_setting,
+    output_dir_setting,
+    project_setting,
+    seed_setting,
+)
+from ._field import help_of, setting
+from typing import Literal
+
+from ._paths import default_pdb_cache_dir
+from specter.options import AbsorptionModel
+
+
+@dataclass
+class MatchConfig:
+    """Parameters for deriving a simulation config that matches a real particle set.
+
+    ``specter match particles`` takes a refined particle set, its images and
+    the atomic model, derives every simulation parameter the forward model has
+    from the metadata and from probe simulations against the images, and
+    writes a ``matched.toml`` that ``specter simulate particles`` runs as is,
+    together with a report of how close the match is and what, if anything,
+    no parameter can close.
+
+    Most of what a simulation needs comes from the refinement file itself
+    (voltage, Cs, amplitude contrast, pixel size, per-particle defocus and
+    poses). What no file carries is the acquisition card below: the detector,
+    the total dose, the dose rate, and whether an energy filter was used.
+    Those are in every methods section and every EMDB record.
+    """
+
+    # --- Inputs (required) ---
+    metadata_path: str = setting(
+        help=(
+            "Refined particle set: a CryoSPARC passthrough .cs or a "
+            "RELION .star. Supplies voltage, Cs, amplitude contrast, pixel size, "
+            "per-particle defocus and poses. The refinement must be aligned to the "
+            "atomic model (an Align 3D of its map against the model, then re-extract "
+            "the particles from it); the pose-alignment check fails otherwise."
+        ),
+        check="existing_file",
+    )  # CryoSPARC .cs (passthrough) or RELION .star
+    pdb_source: str = setting(
+        help=(
+            "Atomic model matching the particles: a local .cif/.pdb "
+            "file or a 4-character PDB accession code."
+        )
+    )
+    dose: float = setting(
+        help=(
+            "Total electron dose per movie in e-/Angstrom^2, from the methods "
+            "section or the EMDB record. Drives the radiation-damage envelope."
+        ),
+        check="positive_ordered",
+    )  # e-/A^2 per movie
+
+    # --- Inputs (optional) ---
+    # Particle images in the same order as `metadata_path`. Unset reads them
+    # from the paths the metadata file itself points at (`blob/path` for a
+    # .cs, `rlnImageName` for a .star), resolved against the file's own
+    # project directory.
+    images_path: str | None = setting(
+        None,
+        help=(
+            "Particle image stack (.mrcs) in the same order as "
+            "--metadata_path. Unset reads the images the metadata file points at."
+        ),
+        check="existing_file",
+    )
+    assembly: bool = setting(
+        True, help="Fetch the biological assembly of --pdb_source."
+    )
+
+    # --- Acquisition card ---
+    # "unknown" applies no MTF, no DQE(0) and no coincidence loss, and says so
+    # in the report; it is never silently replaced by a similar model.
+    detector_model: Literal[
+        "unknown",
+        "perfect",
+        "k3_300kv",
+        "k3_200kv",
+        "k2_300kv",
+        "falcon4i_300kv",
+        "falcon4i_200kv",
+        "falcon3ec_300kv",
+    ] = setting(
+        "unknown",
+        help=(
+            "Detector the data were recorded on. Supplies the MTF, "
+            "DQE(0), the coincidence exclusion radius and the hardware frame rate. "
+            "'unknown' applies none of them and is reported as such."
+        ),
+    )
+    dose_rate: float | None = setting(
+        None,
+        help=(
+            "Incident dose rate in electrons per physical pixel per "
+            "second, from the acquisition notes. Sets the coincidence-loss occupancy. "
+            "Unset falls back to the detector's typical operating rate, and the report "
+            "says so."
+        ),
+    )  # e-/physical px/s; unset -> detector's typical rate
+    energy_filter: bool | None = setting(
+        None,
+        help=(
+            "Whether an energy filter (slit) was used. Recorded in "
+            "the report: the forward model removes inelastically scattered "
+            "electrons without adding their image back, so unfiltered data are "
+            "expected to leave a residual."
+        ),
+    )  # None = not stated
+    cc: float = setting(
+        2.7,
+        help=(
+            "Chromatic aberration coefficient of the objective lens, in mm (2.7 "
+            "for a Titan Krios). With energy_spread it sets the temporal "
+            "coherence loss every probe carries. No particle file records it; "
+            "0 disables it."
+        ),
+        check="non_negative",
+    )  # mm
+    energy_spread: float = setting(
+        0.7,
+        help=(
+            "FWHM of the source's energy spread, in eV: 0.7 for an X-FEG, about "
+            "0.3 for a cold FEG. The zero-loss peak width in the filter's EELS "
+            "spectrum is an upper bound (it includes spectrometer resolution)."
+        ),
+        check="non_negative",
+    )  # eV FWHM
+    absorption_model: AbsorptionModel = setting(
+        "inelastic_mfp",
+        help=(
+            "Where the imaginary potential comes from, for every probe and for "
+            "the matched config. 'inelastic_mfp' derives it per material from a "
+            "measured mean free path and ignores the dataset's amplitude "
+            "contrast, which CTF estimation takes as an input and never fits."
+        ),
+    )
+    inelastic_mfp_solvent: float | None = setting(
+        None,
+        help=(
+            "Inelastic mean free path of the ice, in Angstrom, for "
+            "absorption_model='inelastic_mfp'. Unset takes the measured value for "
+            "the run's voltage (3950 at 300 kV, 2030 at 120 kV), and elsewhere an "
+            "estimate from those two with a warning (200 kV: 3040 +/- 7%; 100 kV: "
+            "1730 +/- 20%)."
+        ),
+        check="positive",
+    )  # Å
+    dose_weights_path: str | None = setting(
+        None,
+        help=(
+            "Path to the exposure filter's per-frame weights (.npy, "
+            "(n_frames, n_bins)), e.g. CryoSPARC's refm_empirical_dw.npy. Carried "
+            "into every probe and the matched config."
+        ),
+        check="existing_file",
+    )
+    dose_weights_max_frequency: float | None = setting(
+        None,
+        help=(
+            "Frequency in 1/Angstrom of the last bin of --dose_weights_path. Unset "
+            "derives it from the motion-correction job's own files, which is the "
+            "reliable route: the pixel size alone does not determine it."
+        ),
+        check="positive",
+    )
+    inelastic_mfp_specimen: float | None = setting(
+        None,
+        help=(
+            "Inelastic mean free path of the specimen, in Angstrom. Unset gives "
+            "it the ice's value, so it carries bulk attenuation but no absorption "
+            "contrast. 2460 is the derived value for protein at 300 kV."
+        ),
+        check="positive",
+    )  # Å
+
+    # --- Probing ---
+    n_probe: int = setting(
+        64,
+        help=(
+            "Particles per probe simulation (ice thickness and neighbour "
+            "spacing candidates)."
+        ),
+    )  # particles per probe simulation
+    n_battery: int = setting(
+        200,
+        help=(
+            "Particles per seed in the final two-seed comparison that "
+            "the report is computed from."
+        ),
+    )  # particles per seed in the final comparison
+    # Probes (pose check, ice, neighbours) render at the box Fourier-cropped
+    # by this factor, against the experimental images cropped the same way;
+    # the final two-seed comparison always runs at the native box. Capped so
+    # the probe pixel stays at or below 5 A and the box at or above 32 px.
+    probe_bin: int = setting(
+        2,
+        help=(
+            "Fourier-crop factor for the probe simulations and the "
+            "images they are scored against; the final two-seed comparison always "
+            "runs at the native box. Capped so the probe pixel stays at or below "
+            "5 Angstrom and the box at or above 32 px. 1 probes at the native box."
+        ),
+    )
+    # Candidate grids, config-only (a flag cannot carry a list). Ice thickness
+    # in Angstrom (0 = the box minimum); neighbour spacing as a multiple of the
+    # structure's maximum diameter, every one positive. A particle in a real
+    # stack has neighbours in its ice, so "none" is not a candidate: it was,
+    # until 2026-10-14, and on EMPIAR-11377 it scored within noise of 1.3x
+    # (0.050 against 0.052), so two identical runs chose opposite answers.
+    # The FIRST entry of each list is the fallback: the probe keeps it unless
+    # the best-scoring candidate beats it in 95% of bootstrap replicates
+    # (match.choose_probe). The scores are noisy at the default n_probe: the
+    # same setting, seed and GPU scored 0.083 and 0.097 on two runs, against
+    # differences between candidates of 0.000-0.030, and a plain minimum chose
+    # a different ice thickness on each of three identical runs. Box-depth ice
+    # and one diameter's spacing (the simulator's own default) lead the lists.
+    ice_candidates: list[float] = setting(factory=lambda: [0.0, 400.0, 800.0, 1200.0])
+    crowd_candidates: list[float] = setting(factory=lambda: [1.0, 1.3])
+    # Number of particles to simulate with the matched config after the
+    # report, e.g. for a CryoSPARC mixed classification. 0 skips it.
+    write_stack: int = setting(
+        0,
+        help=(
+            "After the report, simulate this many particles with the "
+            "matched config (e.g. for a mixed 2D classification). 0 skips it."
+        ),
+    )
+
+    # --- Compute ---
+    device: str = setting(
+        "cuda",
+        help=(
+            "Device(s) to use: cpu | cuda | cuda:0 | 0,1. Several devices "
+            "share the probe simulations between them."
+        ),
+    )
+    # Probe simulations run concurrently in this many worker processes,
+    # round-robin over the devices `device` names. 0 is one per device: two
+    # processes sharing one GPU are time-sliced and finish later than the
+    # same two runs back to back (91 s against 62 s for the two-seed
+    # comparison on EMPIAR-11377), so a single device runs everything
+    # in-process, one after another.
+    probe_workers: int = setting(
+        0,
+        help=(
+            "Worker processes that run probe simulations "
+            "concurrently, dealt round-robin over the device(s). 0 is one per device, "
+            "which on a single device runs every simulation in-process, one after "
+            "another; processes sharing one GPU are time-sliced and gain nothing."
+        ),
+    )
+    seed: int | None = seed_setting(
+        "the probe and battery simulations", "Unset uses seed 0."
+    )
+
+    # --- Output & job tracking ---
+    output_dir: str | None = output_dir_setting(
+        "write matched.toml and the report", "match"
+    )
+    project: str | None = project_setting("match")
+    job_id: str | None = job_id_setting()
+
+    # --- Advanced ---
+    pdb_cache_dir: str = setting(
+        factory=default_pdb_cache_dir,
+        help="Where downloaded PDB/mmCIF structures are cached.",
+    )
+    monomer_library_path: str | None = setting(
+        None,
+        help=(
+            "Path to a Monomer Library, so Shtyrov species "
+            "resolve for a hydrogen-free deposition. Unset falls back to $CLIBD_MON."
+        ),
+    )
+    n_frames: int = setting(
+        40,
+        help=(
+            "Frames the simulation splits the dose into. Plain shot noise "
+            "does not depend on it (summing n Poisson(dose/n) is Poisson(dose)), but two "
+            "things do: the coincidence radius, which is derived at the detector's "
+            "hardware frame rate and converted to this count, and the exposure filter, "
+            "which is applied frame by frame and so must have exactly this many frames."
+        ),
+        check="positive",
+    )  # frames the simulation splits the dose into
+
+
+MATCH_HELP: dict[str, str] = help_of(MatchConfig)

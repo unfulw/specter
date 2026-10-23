@@ -1,0 +1,442 @@
+# Regions & protein packing
+
+![A region-gated run: density on the left, ground-truth labels on the right, showing a cytosol species outside every vesicle and a lumen species only inside them.](../../assets/images/cryoet-packing-hero.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+A region-gated run: density on the left, ground-truth labels on the right, showing a cytosol species outside every vesicle and a lumen species only inside them.
+///
+
+Protein fill is the last and densest stage of specimen assembly. It
+answers two questions per species: *where is this allowed to be*, and
+*how many fit*.
+
+The first is topology: classifying the volume into cytosol, lumen and
+shell. The second is Random Sequential Addition (Widom 1966), obstacle-
+and region-aware, colliding each molecule's real rotated footprint against a
+running occupancy grid.
+
+!!! example "In code"
+    This page is the theory behind [Cellular specimens for cryo-ET](../../tutorials/cellular-specimens.md), which shows it step by step with code and figures.
+
+!!! info "Source"
+    `specter.specimen.tomogram._regions`, `specter.specimen.packing`,
+    `specter.specimen`.
+    `docs-figures/cryoet_specimen_packing.py` produces the figures.
+
+## Regions from topology, not geometry
+
+A membrane field's sign only distinguishes lipid-solid from
+not-lipid-solid. It says nothing about which *side* of a closed shell a
+given empty point is on, and that is exactly what a biologist means by
+"in the lumen."
+
+Recovering it needs real topology. You label the shell's complement with
+connected components (full 26-connectivity, so thresholding noise doesn't
+fracture one region into spurious pieces), and call whichever
+component(s) touch the volume's own boundary faces **cytosol**: by
+construction that is the one region reachable from outside. Everything
+else non-shell is enclosed, and therefore **lumen**.
+
+```
+shell   = density > threshold          (bilayer material, and carbon film)
+cytosol = complement component(s) touching a boundary face
+lumen   = everything else
+```
+
+The three masks partition the volume: every voxel belongs to exactly one.
+
+This is deliberately shape-agnostic. It works for a single vesicle,
+several disjoint vesicles from one instance or many, a sheet, or no
+membrane at all, in which case shell and lumen are empty and the whole
+box is cytosol, with no special-casing anywhere. Keying off the membrane
+generator's internal shape state instead would have needed a branch per
+backend, and would not have handled several disjoint compartments emerging
+from one instance.
+
+It also means the **carbon film lands in `shell`** for free. To this
+stage, "shell" means dense material nothing may be packed into, and the
+film qualifies, so the label is correct.
+
+The classification runs **once**, on the composited volume, after the
+generator merges every membrane instance.
+
+## Two priority tiers
+
+Within each region, the packer places species in two passes:
+
+1. **Targets**: `n_copies` on a spec. An exact instance count, placed
+   first into a still-mostly-empty region. This is the annotated ground
+   truth, and it lands in picks by default.
+2. **Filler**: `ratio` on a spec. The packer fills in around the
+   already-placed targets, drawing species in proportion to their ratios,
+   until it reaches the occupancy budget or the packing jams. Filler is
+   also exported to picks by default, into a separate `-filler`-suffixed
+   file when the same species is also a target in that region.
+
+Targets going first is what makes an exact count meaningful. Ask for 25
+ribosomes after filling the box to jamming with filler and you will not
+get 25. Ratios only compare *within* a region: the packer fills two
+locations independently, so a cytosol ratio and a lumen ratio have no
+relationship.
+
+## What the packer collides
+
+Placement is Random Sequential Addition, and the body it collides is the
+molecule's own shape. The packer rasterizes each species into a binary
+footprint, rotates it, and tests it against a running occupancy grid,
+rejecting a placement if any voxel of the rotated molecule meets a voxel
+already taken. The collision body is therefore the molecule, resolved to
+the packing voxel size.
+
+The alternative is to collide one circumscribing sphere per instance, of
+radius `PDB.max_diameter / 2`. That is the right geometry for the two
+things in a tomogram that are spheres or have no footprint yet — gold
+fiducials, and membrane instances placed by bounding radius before the
+generator builds their bilayer — and both are still placed that way. For
+proteins it is a poor fit. Measured over 180 cached species, a molecule's
+6.8 Å envelope fills only ~0.178 of its own bounding sphere, so an
+elongated or concave molecule reserves several times the room it occupies.
+
+Bounding spheres were selectable for proteins too, through a
+`packing_backend` field, until the density they reach turned out not to be
+a specimen. That field is gone: a config still setting it is rejected as an
+unknown field rather than silently ignored.
+
+![Achieved macromolecule volume fraction against requested occupancy_fraction, for bounding-sphere and footprint collision, with the physiological crowding band and CryoTomoSim's own density marked.](../../assets/images/cryoet-packing-backends.png){ width="620" style="display:block;margin:1.2em auto;" }
+///caption
+Achieved macromolecule volume fraction against requested occupancy_fraction, for bounding-sphere and footprint collision, with the physiological crowding band and CryoTomoSim's own density marked.
+///
+
+| | bounding spheres | footprints |
+|---|---|---|
+| Macromolecule volume fraction | 0.031 | **0.197** |
+| As concentration | 41 mg/mL | **266 mg/mL** |
+| Instances placed (5 Å production box) | 8,128 | 19,426 |
+
+The table measures the 121-species CRYOETSIM filler set at 6.8 Å; the
+figure sweeps six species at 5 Å. Absolute values move with the species
+mix and the voxel size, so read the separation between the curves rather
+than either number in isolation. Both are drawn from candidate pools sized
+separately for each geometry: `occupancy_fraction` is a budget in whatever
+is being collided, and a bounding sphere is ~5.6x a molecule's envelope, so
+one setting does not mean the same thing on both. Comparing them at a
+single value would measure pool sizes rather than geometry.
+
+The table converts volume fraction to concentration at a macromolecular
+density of 1.35 g/cm³, so its figures count all macromolecule, not protein
+alone, and compare with totals. Bacterial cytoplasm carries 300–400 mg/mL
+of macromolecule (Zimmerman & Trach 1991, for *E. coli*), of which
+200–320 mg/mL is protein (Elowitz et al. 1999). Cultured mammalian
+cytoplasm is far more dilute: HeLa cytoplasm holds about 76 mg/mL of
+protein (Liu et al. 2022). Footprint collision reaches 266 mg/mL, just
+below the bacterial range. Bounding spheres cannot reach that range at any
+setting, because RSA saturates long before the real volume fraction gets
+there. For reference,
+[CryoTomoSim](https://github.com/carsonpurnell/cryotomosim_CTS)'s
+(Purnell et al. 2023) own output weighs 0.240 by the same measure, and it
+also collides real shapes rather than spheres.
+
+Footprint collision costs little for that density. On the 5 Å production
+configuration the packer places 19,249 filler instances to 37.7% occupancy
+in 6 s, and rendering them takes 7 s, of a 31 s run. The reason it is not
+more is the reject path: at realistic density RSA rejects ~99.8% of
+attempts, and testing a candidate's whole footprint on each rejection would
+be the entire cost. The packer rejects on a sparse sample of footprint
+voxels first, which is exact rather than approximate, since a sampled voxel
+is a footprint voxel and finding it occupied is a genuine clash. Only a
+candidate that survives the sample pays for the full comparison.
+
+### Packing coarser than you render
+
+`packing_voxel_size` runs collision on a coarser grid than the render.
+The collision grid drives the cost of a fine `voxel_size`, not the
+render: at 1 Å over a production field of view the occupancy grid alone
+is 36 GB, and the rotation cache adds 20 GB for a single 243 Å species.
+Left unset, this engages automatically once the grid would exceed roughly
+a billion voxels, so ordinary boxes stay untouched and a fine
+`voxel_size` degrades to coarser collision instead of failing outright.
+
+The packer builds footprints at the render voxel size and max-pools them
+down, rather than rasterizing at the coarse size directly. The
+distinction matters: a mask rasterized coarsely marks only voxels
+containing an atom centre, and at 2 Å the 1.9 Å van der Waals pad rounds
+to no dilation at all, so instances pack about 2 Å closer than heavy-atom
+contact allows. Measured against a native 1 Å pack, pooling to 2 Å
+reaches volume fraction 0.264 versus 0.269 with no overlapping voxels,
+8.8× faster; the same run with coarsely rasterized masks reads a denser
+0.348, but that density comes from under-sized collision geometry, not
+better packing.
+
+The coarse grid tiles the render canvas from its first voxel, so when the
+pooling factor does not divide the canvas, the last packing voxel of an axis
+also covers render voxels past the canvas's far face. On an axis that may
+not be clipped (`clip_axes`), the packer also tests each footprint's extent
+on the render grid and rejects one that would reach past that face, so no
+copy loses density at the edge.
+
+## Sphere packing, for beads and membranes
+
+Gold fiducials and membrane instances have no footprint to collide — a
+bead is a sphere, and a membrane instance is placed before its bilayer
+exists — so both are packed by bounding radius instead. That packer is
+also Random Sequential Addition, fully vectorized across candidates. It
+places spheres **largest-radius-first, in stages**: one stage per unique
+radius, carrying accepted spheres forward. Within a stage, every remaining
+candidate gets one trial position per pass. The packer generates and
+conflict-checks positions simultaneously through a [`vesin`](#references)
+neighbour list,
+and resolves candidates that conflict within the same pass with a one-shot
+"local minimum priority wins" independent-set selection, rather than a
+Python loop over pairs.
+
+That last point buys the speed: resolving many candidates' accept/reject
+decisions per pass, rather than one at a time, runs ~90× faster than a
+naive one-at-a-time RSA loop at a few thousand spheres, while still
+accepting ~99% as many.
+
+![Left, drawn versus accepted instances per species radius. Right, acceptance rate by radius.](../../assets/images/cryoet-packing-staging.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+Left, drawn versus accepted instances per species radius. Right, acceptance rate by radius.
+///
+
+Staging by size matters because a large sphere has more potential conflict
+partners than a small one at any given density. Mixing all sizes into one
+pool starves the large species; going largest-first gives each its crack
+at the box while it is still open. Acceptance still falls with radius, as
+above; that is geometry, not a scheduling failure.
+
+### Where the ceiling is
+
+RSA saturates well below random close packing. For identical spheres in
+three dimensions the saturation density is 0.3841 (Zhang & Torquato 2013;
+0.38278 in Torquato et al. 2006), and `occupancy_fraction` is therefore a
+**budget, not a promise**. Bare spheres show the ceiling in its simplest
+form:
+
+![Achieved bare-sphere occupancy against requested occupancy_fraction, for a monodisperse and a polydisperse pool.](../../assets/images/cryoet-packing-rsa-limit.png){ width="620" style="display:block;margin:1.2em auto;" }
+///caption
+Achieved bare-sphere occupancy against requested occupancy_fraction, for a monodisperse and a polydisperse pool.
+///
+
+Requested and achieved track each other up to ~0.2 and then part company.
+A monodisperse pool levels off near 0.29, below the saturation density for
+three reasons of roughly equal size, measured at the figure's settings
+(a 2000 Å box, \(r = 60\) Å, `gap` = 5 Å):
+
+- **The gap.** Each sphere excludes a radius of \(r + g/2\), with \(g\)
+  the `gap`, so the bare volume plotted is \((60/62.5)^3 = 0.885\) of the
+  excluded volume the packer actually fills. This costs about 0.04.
+- **The walls.** Spheres may not cross the box faces, which depletes a
+  boundary layer. In a box about 16 diameters across this costs about 0.02
+  against the box interior.
+- **The trial budget.** The remaining gap to saturation shrinks only as
+  \(\tau^{-1/3}\) in the number of trials \(\tau\) (Feder's law;
+  Torquato et al. 2006), and the default `max_passes` and `stall_patience`
+  of `pack_hard_spheres_3d` stop long before saturation. Measured in excluded volume
+  over the box interior, the default reaches 0.35; ten times the passes
+  reaches 0.37, and a hundred times the passes with a pool three times as
+  large reaches 0.377.
+
+The polydisperse pool reaches 0.42 at a requested 1.0 and is still
+rising there, because small spheres fit into gaps the large ones leave.
+That value is a measurement at the default trial budget, not a known
+saturation density.
+
+Footprint packing jams too, and polydispersity raises its ceiling the same
+way, measured in macromolecule volume fraction on real molecules:
+
+![Achieved macromolecule volume fraction against requested occupancy_fraction, for a single species and a five-species mix.](../../assets/images/cryoet-packing-shape-jamming.png){ width="600" style="display:block;margin:1.2em auto;" }
+///caption
+Achieved macromolecule volume fraction against requested occupancy_fraction, for a single species and a five-species mix.
+///
+
+A single species saturates near 0.185 and stays there. A five-species mix
+is still climbing at 1.0, into the physiological band, because a footprint
+leaves gaps a bounding sphere never could and smaller species take them.
+Either way the knob is a budget rather than a target. Set it high, let the
+packing jam, and the density is whatever the geometry allows without
+hand-tuning.
+
+If you want more achieved occupancy from a reference table, raise the
+mass floor rather than the budget: tiny species consume placement slots
+RSA jams on while adding almost no volume.
+
+RSA won out over a denser periodic force-biased relaxation backend.
+Relaxation's per-iteration Python-loop cost runs into hours at production
+tomogram scale, and it has no obstacle-avoidance mechanism, so RSA's
+lower ceiling, reached in seconds, is the actual target.
+
+## One field for obstacles and regions
+
+Footprint packing needs no distance field. Membranes, filaments, carbon
+and placed instances are already volumes, so the packer stamps them
+straight into the one boolean grid it collides against. You restrict a
+region by seeding that grid as occupied everywhere outside it:
+
+![Three panels of one z-slice: the region complement alone, then with a membrane and filament stamped in, then with every packed protein added.](../../assets/images/cryoet-packing-occupancy-grid.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+Three panels of one z-slice: the region complement alone, then with a membrane and filament stamped in, then with every packed protein added.
+///
+
+The packer rejects a candidate if its rotated footprint meets any set
+voxel, so obstacle avoidance, region restriction and instance-instance
+collision collapse into one test instead of three mechanisms.
+
+Beads and membrane instances cannot do that, having no footprint to test.
+They use a distance field instead: both "stay out of the membrane" and "stay
+inside the lumen" share the same input, a field giving the physical
+distance to the nearest **forbidden** voxel. It rejects a candidate
+unless the field, sampled at its centre, exceeds `radius + gap`, meaning
+its whole sphere clears the forbidden set. The walls a sphere must stay
+inside are the faces of the render canvas, which on an even axis is centred
+half a voxel off the origin (see
+[Conventions](../conventions.md#canvas-coordinates)).
+
+![The shell distance field, the field from already-placed spheres, and their elementwise minimum, with rejected centres shaded.](../../assets/images/cryoet-packing-exclusion-field.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+The shell distance field, the field from already-placed spheres, and their elementwise minimum, with rejected centres shaded.
+///
+
+If you want both obstacle avoidance and region restriction, you union the
+masks before taking the distance transform, which is the elementwise
+minimum of the two fields (the third panel above). That is how bead
+placement folds in the membrane shell and placed filaments as one field.
+Protein fill does not use this field at all: it collides against the
+boolean occupancy grid described above.
+
+Note the first panel: the valid region includes the vesicle's *interior*.
+The distance field alone cannot tell inside from outside. That is exactly
+what the region masks are for, and why both mechanisms exist.
+
+### Sampling from the region instead of the box
+
+For a small compartment, a second, separate problem shows up. Uniform
+box-wide sampling has to get lucky before rejection filtering can even
+engage. In one confirmed case, packing into a small vesicle lumen whose
+valid centre region was 0.008% of the box volume, the packer placed zero
+of one candidate within the pass budget, from the odds of ever landing a
+hit alone, despite an exactly-computed valid region that did exist.
+
+Passing a `sampling_mask` fixes this by construction: the packer draws
+candidates from a random `True` voxel of the allowed region (plus
+sub-voxel jitter) instead of from the whole box.
+
+The same tightness drives the pass budget. A region covering at least 25%
+of the box behaves like an open box: it saturates fast, so the default
+`stall_patience` of 15 is enough (verified directly: on a 200×600×600 box
+it packed the same pool to within ~3% of `stall_patience=300`'s density in
+roughly half the wall time). Below that threshold, the packer falls back
+to the much larger `region_max_passes` (default 300), since many
+consecutive misses can separate two valid placements.
+
+## Filler reference tables
+
+Two bundled tables save you from hand-listing background species. Both
+stack additively, with each other and with your own `[[filler]]`
+entries.
+
+![Left, PEI2016 species by mass and relative abundance. Right, the mass coverage of both bundled tables.](../../assets/images/cryoet-packing-filler-tables.png){ width="900" style="display:block;margin:1.2em auto;" }
+///caption
+Left, PEI2016 species by mass and relative abundance. Right, the mass coverage of both bundled tables.
+///
+
+- **`PEI2016_CROWDING_TABLE`**: 20 species from Pei et al. (2016),
+  transcribed from that paper's supplementary Table S1, including its
+  relative-abundance column (`occurrence_freq`). The species are drawn at
+  equal ratios by default. `filler_pei2016_abundance_weighting = true`
+  weights each by its `occurrence_freq` instead, normalised to a mean of 1
+  over the selected species, so the table's combined share against other
+  filler is the same in both modes. (The paper lists 21; the PDB obsoleted its
+  2AWB entry in 2014, and the table drops it rather than repointing it,
+  since it would only have duplicated a ribosome-class size range.)
+- **`CRYOETSIM_PARTICLE_TABLE`**: broader and categorised, so you can
+  select e.g. only distractors or only nucleosomes. Transcribed from the
+  CryoETSim dataset's species table (Stojanovska et al. 2025).
+
+Both route through `build_filler_pool_specs`, which filters by mass range,
+category or code and adapts either table to the flat filler spec format.
+
+Treat these as *one reasonable published reference set* for "generic
+crowded cytoplasm," not a claim about any specific specimen. There is no
+universal answer: composition varies by organism and cell state, and most
+of it sits below any real dataset's identification threshold. Swapping in
+your own list breaks nothing downstream.
+
+## Parameters at a glance
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `location` | `cytosol` or `lumen`, per species | `cytosol` |
+| `n_copies` | Exact instance count (target mode) | — |
+| `ratio` | Relative abundance among filler species in the same region | 1.0 |
+| `occupancy_fraction` | Candidate-pool volume budget, per region, in real footprint volume | 0.2 (`1.0` in the shipped TOML) |
+| `packing_voxel_size` | Collide on a coarser grid than the render | auto |
+| `packing_max_retries` | Trial positions per instance | 1500 |
+| `clip_axes` | Per axis (z, y, x): may an instance's body poke past that wall? | all `False` |
+| `region_max_passes` | Placement passes for the gold-bead packer | 300 |
+| `region_density_threshold` | Shell threshold for classification | 5% of peak |
+
+## Limitations
+
+- **Voxel-quantized collision.** Footprints are rasterized on the packing
+  grid, so the packer resolves a molecule only to that voxel size.
+- **No spatial structure within a region.** Placement is uniform
+  throughout a region; there is no clustering, no gradient, no
+  surface affinity. (The single-particle path's
+  `MicrographSpecimenGenerator` does offer an air-water-interface
+  adsorption bias; this generator has no equivalent. Its realism comes
+  from region gating against real membrane geometry instead.)
+- **Coarse-field bleed** (beads and membrane instances). For very large
+  boxes their exclusion field is built on a coarsened grid, and trilinear
+  sampling near a boundary lets a candidate's distance run a couple of Å
+  past the exact value.
+- **Contact, not interpenetration.** Instances may touch but never
+  overlap. Real proteins' surface loops and hydration shells do
+  interdigitate slightly, and CryoTomoSim models that with a softer
+  overlap test (Purnell et al. 2023). Testing found reproducing it needs only ~2% tolerance,
+  but the design rejects that approach: it would make instance labels
+  ambiguous at exactly the contacts a picker is trained on.
+- **Jamming, not equilibrium.** RSA densities are not thermodynamically
+  meaningful; they are the outcome of an irreversible deposition process.
+
+## References
+
+- Pei, L., Xu, M., Frazier, Z., & Alber, F. (2016). Simulating cryo
+  electron tomograms of crowded cell cytoplasm for assessment of automated
+  particle picking. *BMC Bioinformatics*, 17(1), 405.
+  [doi:10.1186/s12859-016-1283-3](https://doi.org/10.1186/s12859-016-1283-3)
+- Elowitz, M. B., Surette, M. G., Wolf, P.-E., Stock, J. B., & Leibler, S.
+  (1999). Protein mobility in the cytoplasm of *Escherichia coli*.
+  *Journal of Bacteriology*, 181(1), 197–203.
+  [doi:10.1128/JB.181.1.197-203.1999](https://doi.org/10.1128/JB.181.1.197-203.1999)
+- Liu, X., Oh, S., & Kirschner, M. W. (2022). The uniformity and stability
+  of cellular mass density in mammalian cell culture. *Frontiers in Cell
+  and Developmental Biology*, 10, 1017499.
+  [doi:10.3389/fcell.2022.1017499](https://doi.org/10.3389/fcell.2022.1017499)
+- Purnell, C., Heebner, J., Swulius, M. T., Hylton, R., Kabonick, S.,
+  Grillo, M., Grigoryev, S., Heberle, F., Waxham, M. N., & Swulius, M. T.
+  (2023). Rapid synthesis of cryo-ET data for training deep learning
+  models. *bioRxiv*.
+  [doi:10.1101/2023.04.28.538636](https://doi.org/10.1101/2023.04.28.538636)
+  ([CTS source](https://github.com/carsonpurnell/cryotomosim_CTS))
+- Stojanovska, F., Sanchez, R. M., Jensen, R. K., Mahamid, J., Kreshuk, A.,
+  & Zaugg, J. B. (2025). CryoSiam: self-supervised representation learning
+  for automated analysis of cryo-electron tomograms. *bioRxiv*.
+  [doi:10.1101/2025.11.11.687379](https://doi.org/10.1101/2025.11.11.687379)
+- Torquato, S., Uche, O. U., & Stillinger, F. H. (2006). Random sequential
+  addition of hard spheres in high Euclidean dimensions. *Physical Review
+  E*, 74(6), 061308.
+  [doi:10.1103/PhysRevE.74.061308](https://doi.org/10.1103/PhysRevE.74.061308)
+- vesin. Compute neighbor lists for atomistic systems (software); the
+  neighbour list behind the vectorized conflict check.
+  [github.com/Luthaf/vesin](https://github.com/Luthaf/vesin)
+- Widom, B. (1966). Random sequential addition of hard spheres to a volume.
+  *The Journal of Chemical Physics*, 44(10), 3888–3894.
+  [doi:10.1063/1.1726548](https://doi.org/10.1063/1.1726548)
+- Zhang, G., & Torquato, S. (2013). Precise algorithm to generate random
+  sequential addition of hard hyperspheres at saturation. *Physical Review
+  E*, 88(5), 053312.
+  [doi:10.1103/PhysRevE.88.053312](https://doi.org/10.1103/PhysRevE.88.053312)
+- Zimmerman, S. B., & Trach, S. O. (1991). Estimation of macromolecule
+  concentrations and excluded volume effects for the cytoplasm of
+  *Escherichia coli*. *Journal of Molecular Biology*, 222(3), 599–620.
+  [doi:10.1016/0022-2836(91)90499-V](https://doi.org/10.1016/0022-2836(91)90499-V)

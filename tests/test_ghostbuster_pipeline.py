@@ -1,7 +1,7 @@
 """
 Tests for the end-to-end pipeline classes in ghostbuster.py: Ghostbuster
-(CryoSPARC .cs/.mrc loading + preprocessing), TomogramGhostbuster (tilt-series
-loading), and compare_runs. None of these had any test coverage prior to this
+(CryoSPARC .cs/.mrc loading + preprocessing) and TomogramGhostbuster
+(tilt-series loading). None of these had any test coverage prior to this
 file — only Reconstructor's forward/loss behaviour was tested.
 
 CryoSPARC .cs loading is exercised via a fake `Dataset.load` (same pattern as
@@ -11,7 +11,6 @@ scattering/CTF math downstream is real.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import mrcfile
@@ -19,50 +18,22 @@ import numpy as np
 import pytest
 import torch
 
+from specter.cpu_threads import limited_cpu_threads
 from specter.ghostbuster import (
     Ghostbuster,
-    Reconstructor,
     TomogramGhostbuster,
     TomogramReconstructor,
-    compare_runs,
 )
 from specter.io import _cryosparc
-
-# ---------------------------------------------------------------------------
-# Fake CryoSPARC dataset (mirrors tests/test_cryosparc.py's _FakeDataset)
-# ---------------------------------------------------------------------------
+from specter.settings import Propagation
+from conftest import fake_cryosparc_dataset
 
 N_PARTICLES = 4
 BOX = 8
 PIXEL_SIZE = 1.5
 
 
-class _FakeDataset(dict):
-    @classmethod
-    def load(cls, csfile_path: str) -> "_FakeDataset":
-        n = N_PARTICLES
-        dtype = np.float32
-        rng = np.random.default_rng(0)
-        return cls(
-            {
-                "alignments3D/shift": rng.normal(size=(n, 2)).astype(dtype),
-                "alignments3D/psize_A": np.full(n, PIXEL_SIZE, dtype=dtype),
-                "ctf/cs_mm": np.full(n, 2.7, dtype=dtype),
-                "ctf/df_angle_rad": rng.normal(size=n).astype(dtype),
-                "ctf/df1_A": (rng.normal(size=n) + 10000).astype(dtype),
-                "ctf/df2_A": (rng.normal(size=n) + 10000).astype(dtype),
-                "ctf/amp_contrast": np.full(n, 0.1, dtype=dtype),
-                "ctf/accel_kv": np.full(n, 300.0, dtype=dtype),
-                "alignments3D/pose": rng.normal(size=(n, 3)).astype(dtype),
-                "alignments3D/split": np.array([0, 1, 0, 1][:n]),
-                "ctf/tilt_A": np.zeros((n, 2), dtype=dtype),
-                "ctf/phase_shift_rad": np.zeros(n, dtype=dtype),
-                "ctf/shift_A": np.zeros((n, 2), dtype=dtype),
-                "ctf/trefoil_A": np.zeros((n, 2), dtype=dtype),
-                "alignments3D/alpha": np.ones(n, dtype=dtype),
-                "ctf/anisomag": np.zeros((n, 4), dtype=dtype),
-            }
-        )
+_FakeDataset = fake_cryosparc_dataset(N_PARTICLES, PIXEL_SIZE)
 
 
 @pytest.fixture(autouse=True)
@@ -94,7 +65,7 @@ def test_ghostbuster_loads_and_preprocesses_images(mrc_file: Path) -> None:
         cs_file="fake.cs",
         mrc_file=str(mrc_file),
         dose_per_angstrom=dose_per_angstrom,
-        scattering_model="projection",
+        propagation=Propagation(scattering_model="projection"),
     )
 
     assert gb._images.shape == (N_PARTICLES, BOX, BOX)
@@ -106,89 +77,188 @@ def test_ghostbuster_loads_and_preprocesses_images(mrc_file: Path) -> None:
         raw = torch.as_tensor(mrc.data.copy())
     dose_per_area = dose_per_angstrom * PIXEL_SIZE**2
     expected = dose_per_area**0.5 * (-raw) + dose_per_area
-    assert torch.allclose(gb._images, expected)
+    # Exact, not approximate: the default must reproduce earlier runs.
+    assert torch.equal(gb._images, expected)
 
 
-@pytest.mark.parametrize(
-    "return_class,expected_label",
-    [("0", "A"), ("1", "B"), ("all", None)],
-)
-def test_ghostbuster_halfset_label_mapping(
-    mrc_file: Path, return_class: str, expected_label: str | None
+def test_ghostbuster_counts_stack_is_used_as_is(mrc_file: Path) -> None:
+    """image_units='counts' skips the sign flip and the dose mapping."""
+    gb = Ghostbuster(
+        cs_file="fake.cs",
+        mrc_file=str(mrc_file),
+        dose_per_angstrom=2.0,
+        image_units="counts",
+        propagation=Propagation(scattering_model="projection"),
+    )
+    with mrcfile.mmap(str(mrc_file)) as mrc:
+        raw = torch.as_tensor(mrc.data.copy())
+    assert torch.equal(gb._images, raw)
+
+
+@pytest.mark.parametrize("halfset", ["all", "A", "B"])
+@pytest.mark.parametrize("dtype", [np.float32, np.float16, np.int16])
+def test_particle_stack_conversion_preserves_rows_and_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, halfset: str, dtype: type
 ) -> None:
-    """return_class maps to halfset_label as documented: '0'->A, '1'->B, 'all'->None."""
+    """Cross the preprocessing block boundary and keep the mmap untouched.
+
+    Float stacks reuse their owned storage; integer stacks retain the original
+    conversion's type and arithmetic. Halfset filtering must still pair every
+    pose with its original image, including the final incomplete block.
+    """
+    n = 131
+    monkeypatch.setattr(_cryosparc, "Dataset", fake_cryosparc_dataset(n, PIXEL_SIZE))
+    rng = np.random.default_rng(42)
+    raw = (rng.normal(size=(n, BOX, BOX)) * 10).astype(dtype)
+    path = tmp_path / "owned_stack.mrcs"
+    with mrcfile.new(path, overwrite=True) as mrc:
+        mrc.set_data(raw)
+    gb = Ghostbuster(
+        cs_file="fake.cs",
+        mrc_file=path,
+        dose_per_angstrom=3.25,
+        halfset=halfset,  # type: ignore[arg-type]
+        propagation=Propagation(scattering_model="projection"),
+    )
+    rows = np.arange(n)
+    if halfset in ("A", "B"):
+        rows = rows[rows % 2 == (0 if halfset == "A" else 1)]
+    counts = 3.25 * PIXEL_SIZE**2
+    expected = counts**0.5 * (-torch.as_tensor(raw[rows])) + counts
+    assert torch.equal(gb._images, expected)
+    # The returned stack remains owned and writable after the mmap closes.
+    gb._images.fill_(123.0)
+    with mrcfile.mmap(path) as mrc:
+        np.testing.assert_array_equal(mrc.data, raw)
+
+
+def test_resident_loader_worker_count_preserves_epoch_order(mrc_file: Path) -> None:
+    """Removing workers must preserve shuffled batches and parent RNG draws."""
+    # A forked worker resets Torch to one thread; inherit that setting to
+    # avoid forking an active CPU pool in this regression test.
+    with limited_cpu_threads(1):
+        orders = []
+        next_draws = []
+        for workers in (2, 0):
+            gb = Ghostbuster(
+                "fake.cs",
+                mrc_file,
+                2.0,
+                num_workers=workers,
+                batchsize=3,
+                propagation=Propagation(scattering_model="projection"),
+            )
+            _, loader = gb._build_reconstructor_and_loader(gb._images, PIXEL_SIZE, 3)
+            torch.manual_seed(77)
+            orders.append([torch.cat([idx for _, idx in loader]) for _ in range(5)])
+            next_draws.append(torch.rand(5))
+        assert all(torch.equal(a, b) for a, b in zip(*orders))
+        assert torch.equal(*next_draws)
+
+
+@pytest.mark.parametrize("alpha,expected", [(None, 0.1), (0.0, 0.0), (0.5, 0.5)])
+def test_ghostbuster_alpha_overrides_cs(
+    mrc_file: Path, alpha: float | None, expected: float
+) -> None:
+    """alpha, when given, replaces the .cs file's amp_contrast (0.1 here) in
+    the forward model; unset, the .cs value is used. 0.0 is a real override,
+    not a falsy "unset"."""
     gb = Ghostbuster(
         cs_file="fake.cs",
         mrc_file=str(mrc_file),
         dose_per_angstrom=2.0,
-        scattering_model="projection",
-        return_class=return_class,
+        alpha=alpha,
+        propagation=Propagation(scattering_model="projection"),
     )
-    assert gb.halfset_label == expected_label
+    assert gb.propagation.alpha == pytest.approx(expected)
 
 
-def test_ghostbuster_test_run_executes(mrc_file: Path) -> None:
-    """test_run() binning + one epoch completes and returns a trained Reconstructor."""
-    gb = Ghostbuster(
-        cs_file="fake.cs",
-        mrc_file=str(mrc_file),
-        dose_per_angstrom=2.0,
-        scattering_model="projection",
-        lr=0.1,
-        batch_size=2,
-    )
-    model = gb.test_run(bin_factor=2)
-    assert isinstance(model, Reconstructor)
-    assert model.V.shape == (BOX // 2, BOX // 2, BOX // 2)
-
-
-def test_ghostbuster_run_executes(mrc_file: Path) -> None:
-    """run() completes one full (unbinned) epoch and updates the volume."""
-    gb = Ghostbuster(
-        cs_file="fake.cs",
-        mrc_file=str(mrc_file),
-        dose_per_angstrom=2.0,
-        scattering_model="projection",
-        lr=0.1,
-        epochs=1,
-        batch_size=2,
-    )
-    model = gb.run()
-    assert isinstance(model, Reconstructor)
-    assert model.V.shape == (BOX, BOX, BOX)
-    assert not torch.equal(model.V.data, torch.zeros(BOX, BOX, BOX))
+def test_ghostbuster_alpha_out_of_range_rejected(mrc_file: Path) -> None:
+    """An alpha outside [0, 1] is refused before anything is loaded."""
+    with pytest.raises(ValueError, match="alpha"):
+        Ghostbuster(
+            cs_file="fake.cs",
+            mrc_file=str(mrc_file),
+            dose_per_angstrom=2.0,
+            alpha=1.5,
+        )
 
 
 # ---------------------------------------------------------------------------
-# compare_runs
+# Ghostbuster: starting volume
 # ---------------------------------------------------------------------------
 
 
-def test_compare_runs_prints_summary_table(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def _volume_file(tmp_path: Path, data: np.ndarray) -> Path:
+    path = tmp_path / "start.mrc"
+    with mrcfile.new(str(path), overwrite=True) as mrc:
+        mrc.set_data(data.astype(np.float32))
+    return path
+
+
+def _starting_volume(mrc_file: Path, **kwargs) -> torch.Tensor:
+    gb = Ghostbuster(
+        cs_file="fake.cs",
+        mrc_file=str(mrc_file),
+        dose_per_angstrom=2.0,
+        propagation=Propagation(scattering_model="projection"),
+        **kwargs,
+    )
+    model, _ = gb._build_reconstructor_and_loader(gb._images, gb._voxel_size, 2)
+    return model.V.detach().float().cpu()
+
+
+def test_reconstruction_starts_from_zeros_by_default(mrc_file: Path) -> None:
+    assert torch.equal(_starting_volume(mrc_file), torch.zeros(BOX, BOX, BOX))
+
+
+def test_init_volume_is_the_starting_volume(mrc_file: Path, tmp_path: Path) -> None:
+    """A map on the images' grid is taken exactly, from a file or a tensor."""
+    data = np.random.default_rng(2).normal(size=(BOX, BOX, BOX))
+    path = _volume_file(tmp_path, data)
+    expected = torch.as_tensor(data, dtype=torch.float32)
+    assert torch.equal(_starting_volume(mrc_file, init_volume=path), expected)
+    assert torch.equal(_starting_volume(mrc_file, init_volume=expected), expected)
+
+
+def test_init_volume_on_a_finer_grid_is_block_averaged(
+    mrc_file: Path, tmp_path: Path
 ) -> None:
-    """compare_runs prints one row per run directory with the requested columns."""
-    for name, params in [
-        ("run1", {"scattering_model": "projection", "lr": 0.1}),
-        ("run2", {"scattering_model": "multislice", "lr": 0.05}),
-    ]:
-        run_dir = tmp_path / name
-        run_dir.mkdir()
-        (run_dir / "params.json").write_text(json.dumps(params))
-
-    compare_runs(base_dir=tmp_path, show_params=["scattering_model", "lr"])
-    out = capsys.readouterr().out
-    assert "run1" in out and "run2" in out
-    assert "projection" in out and "multislice" in out
+    """A 2x box is averaged 2x2x2, which keeps the potential per voxel."""
+    data = np.random.default_rng(3).normal(size=(2 * BOX,) * 3)
+    path = _volume_file(tmp_path, data)
+    expected = (
+        torch.as_tensor(data, dtype=torch.float32)
+        .reshape(BOX, 2, BOX, 2, BOX, 2)
+        .mean(dim=(1, 3, 5))
+    )
+    torch.testing.assert_close(
+        _starting_volume(mrc_file, init_volume=path), expected, rtol=1e-6, atol=1e-6
+    )
 
 
-def test_compare_runs_reports_no_runs_found(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_init_lowpass_keeps_the_mean_and_removes_fine_detail(
+    mrc_file: Path, tmp_path: Path
 ) -> None:
-    """An empty base_dir prints a 'no runs found' message instead of a table."""
-    compare_runs(base_dir=tmp_path)
-    out = capsys.readouterr().out
-    assert "No runs found" in out
+    data = np.random.default_rng(4).normal(size=(BOX, BOX, BOX)) + 3.0
+    path = _volume_file(tmp_path, data)
+    start = _starting_volume(mrc_file, init_volume=path, init_lowpass=4 * PIXEL_SIZE)
+    raw = torch.as_tensor(data, dtype=torch.float32)
+    assert start.mean().item() == pytest.approx(raw.mean().item(), rel=1e-5)
+    k = torch.fft.fftfreq(BOX, d=PIXEL_SIZE)
+    k_mag = torch.sqrt(sum(g**2 for g in torch.meshgrid(k, k, k, indexing="ij")))
+    high = k_mag > 1 / (2.5 * PIXEL_SIZE)
+
+    def power(v: torch.Tensor) -> torch.Tensor:
+        return (torch.fft.fftn(v).abs() ** 2)[high].sum()
+
+    assert power(start) < 0.01 * power(raw)
+
+
+def test_init_volume_box_mismatch_is_refused(mrc_file: Path, tmp_path: Path) -> None:
+    path = _volume_file(tmp_path, np.zeros((BOX + 3,) * 3))
+    with pytest.raises(ValueError, match="integer multiple"):
+        _starting_volume(mrc_file, init_volume=path)
 
 
 # ---------------------------------------------------------------------------
@@ -217,11 +287,12 @@ def test_tomogram_ghostbuster_angles_path(
         voxel_size=2.0,
         voltage=300.0,
         ctf_params=tomo_ctf_params,
+        dose_per_angstrom=1.0,
         angles=[-20.0, 0.0, 20.0],
-        scattering_model="projection",
         lr=0.1,
         epochs=1,
-        batch_size=3,
+        batchsize=3,
+        propagation=Propagation(scattering_model="projection"),
     )
     assert tgb._quaternions.shape == (3, 4)
     model = tgb.run()
@@ -240,12 +311,114 @@ def test_tomogram_ghostbuster_quaternions_path(
         voxel_size=2.0,
         voltage=300.0,
         ctf_params=tomo_ctf_params,
+        dose_per_angstrom=1.0,
         quaternions=quats,
-        scattering_model="projection",
         lr=0.1,
+        propagation=Propagation(scattering_model="projection"),
     )
     model = tgb.test_run(bin_factor=2)
     assert isinstance(model, TomogramReconstructor)
+
+
+def test_tomogram_ghostbuster_maps_a_normalised_series_with_per_tilt_dose(
+    tilt_series: torch.Tensor, tomo_ctf_params: dict[str, torch.Tensor]
+) -> None:
+    """A normalised series is flipped and mapped to counts tilt by tilt."""
+    dose = torch.tensor([1.0, 2.0, 4.0])
+    tgb = TomogramGhostbuster(
+        tilt_series=tilt_series,
+        voxel_size=2.0,
+        voltage=300.0,
+        ctf_params=tomo_ctf_params,
+        dose_per_angstrom=dose,
+        angles=[-20.0, 0.0, 20.0],
+        image_units="normalized",
+        propagation=Propagation(scattering_model="projection"),
+    )
+    n = (dose * 2.0**2).reshape(-1, 1, 1)
+    assert torch.allclose(tgb._images, n**0.5 * (-tilt_series) + n)
+
+
+def test_tomogram_ghostbuster_refuses_to_flip_counts(
+    tilt_series: torch.Tensor, tomo_ctf_params: dict[str, torch.Tensor]
+) -> None:
+    with pytest.raises(ValueError, match="flip_contrast"):
+        TomogramGhostbuster(
+            tilt_series=tilt_series,
+            voxel_size=2.0,
+            voltage=300.0,
+            ctf_params=tomo_ctf_params,
+            dose_per_angstrom=1.0,
+            angles=[-20.0, 0.0, 20.0],
+            flip_contrast=True,
+        )
+
+
+def test_tomogram_test_run_bins_counts_by_sum_and_potential_by_mean(
+    tomo_ctf_params: dict[str, torch.Tensor], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Binning keeps the electrons a region received and the potential's value.
+
+    Counts add across the pooled pixels; a potential in volts is averaged, so
+    the projected potential sum(V * dz) survives the coarser slicing.
+    """
+    counts = torch.full((3, BOX, BOX), 7.0)
+    V_init = torch.full((BOX, BOX, BOX), 0.5)
+    tgb = TomogramGhostbuster(
+        tilt_series=counts,
+        voxel_size=2.0,
+        voltage=300.0,
+        ctf_params=tomo_ctf_params,
+        dose_per_angstrom=1.0,
+        angles=[-20.0, 0.0, 20.0],
+        V_init=V_init,
+        propagation=Propagation(scattering_model="projection"),
+    )
+    binned, _ = tgb._bin_images(2)
+    assert torch.allclose(binned, torch.full((3, BOX // 2, BOX // 2), 28.0))
+    # Skip the fit: what is under test is the volume test_run starts from.
+    monkeypatch.setattr(tgb, "_fit", lambda model, *args, **kwargs: model)
+    model = tgb.test_run(bin_factor=2, device="cpu")
+    assert torch.allclose(model.V, torch.full((BOX // 2,) * 3, 0.5))
+
+
+def test_tomogram_ghostbuster_forwards_reconstructor_settings(
+    tilt_series: torch.Tensor,
+    tomo_ctf_params: dict[str, torch.Tensor],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """checkpoint_chunks, lr_decay and kmask reach the TomogramReconstructor."""
+    kmask = torch.ones(BOX, BOX, BOX)
+    tgb = TomogramGhostbuster(
+        tilt_series=tilt_series,
+        voxel_size=2.0,
+        voltage=300.0,
+        ctf_params=tomo_ctf_params,
+        dose_per_angstrom=1.0,
+        angles=[-20.0, 0.0, 20.0],
+        propagation=Propagation(scattering_model="projection"),
+        checkpoint_chunks=4,
+        lr_decay=0.3,
+        kmask=kmask,
+    )
+    monkeypatch.setattr(tgb, "_fit", lambda model, *args, **kwargs: model)
+    model = tgb.run(device="cpu")
+    assert model.checkpoint_chunks == 4
+    assert model.lr_decay == 0.3
+    assert torch.equal(model.kmask, kmask)
+    # test_run bins the volume, so the full-size mask cannot apply there.
+    assert tgb.test_run(bin_factor=2, device="cpu").kmask is None
+    with pytest.raises(ValueError, match="kmask"):
+        TomogramGhostbuster(
+            tilt_series=tilt_series,
+            voxel_size=2.0,
+            voltage=300.0,
+            ctf_params=tomo_ctf_params,
+            dose_per_angstrom=1.0,
+            angles=[-20.0, 0.0, 20.0],
+            kmask=torch.ones(2, 2, 2),
+        )
 
 
 def test_tomogram_ghostbuster_rejects_both_angles_and_quaternions(
@@ -257,6 +430,7 @@ def test_tomogram_ghostbuster_rejects_both_angles_and_quaternions(
             voxel_size=2.0,
             voltage=300.0,
             ctf_params=tomo_ctf_params,
+            dose_per_angstrom=1.0,
             angles=[0.0, 10.0, 20.0],
             quaternions=torch.zeros(3, 4),
         )
@@ -271,4 +445,190 @@ def test_tomogram_ghostbuster_requires_angles_or_quaternions(
             voxel_size=2.0,
             voltage=300.0,
             ctf_params=tomo_ctf_params,
+            dose_per_angstrom=1.0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Row order is the contract, and blob/idx is what checks it
+# ---------------------------------------------------------------------------
+
+
+def _dataset_with_blobs(
+    blob_idx: list[int], stack_name: str = "particles.mrcs"
+) -> type:
+    """_FakeDataset whose stack sits at ``blob_idx`` rather than in row order."""
+
+    class _WithBlobs(_FakeDataset):  # type: ignore[valid-type, misc]
+        @classmethod
+        def load(cls, csfile_path: str) -> "_WithBlobs":
+            ds = super().load(csfile_path)
+            ds["blob/path"] = np.array([f"J1/restack/{stack_name}"] * N_PARTICLES)
+            ds["blob/idx"] = np.asarray(blob_idx, dtype=np.int64)
+            return ds
+
+    return _WithBlobs
+
+
+def _preprocessed(raw: torch.Tensor) -> torch.Tensor:
+    dose_per_area = 2.0 * PIXEL_SIZE**2
+    return dose_per_area**0.5 * -raw + dose_per_area
+
+
+def test_ghostbuster_refuses_a_stack_the_cs_file_says_is_not_in_row_order(
+    monkeypatch: pytest.MonkeyPatch, mrc_file: Path
+) -> None:
+    """A Restack Particles job writes its stack in the order it reads its
+    inputs, so row i is some other slice. Reading it by row pairs every pose
+    with another particle's image, and says nothing: the images are real
+    particles, the loss falls, the map is mush. blob/idx is what makes that
+    detectable, so it is checked before the stack is trusted."""
+    monkeypatch.setattr(_cryosparc, "Dataset", _dataset_with_blobs([2, 3, 0, 1]))
+
+    with pytest.raises(ValueError, match="not in row order"):
+        Ghostbuster(
+            cs_file="fake.cs",
+            mrc_file=str(mrc_file),
+            dose_per_angstrom=2.0,
+            propagation=Propagation(scattering_model="projection"),
+        )
+
+
+def test_ghostbuster_reads_such_a_stack_in_place_when_asked(
+    monkeypatch: pytest.MonkeyPatch, mrc_file: Path
+) -> None:
+    """address_by_blob_idx points straight at a restack without exporting a
+    row-ordered copy of it first."""
+    rotated = [2, 3, 0, 1]
+    monkeypatch.setattr(_cryosparc, "Dataset", _dataset_with_blobs(rotated))
+
+    gb = Ghostbuster(
+        cs_file="fake.cs",
+        mrc_file=str(mrc_file),
+        dose_per_angstrom=2.0,
+        address_by_blob_idx=True,
+        propagation=Propagation(scattering_model="projection"),
+    )
+
+    with mrcfile.open(str(mrc_file)) as mrc:
+        raw = torch.as_tensor(mrc.data.copy())
+    assert torch.allclose(gb._images, _preprocessed(raw[rotated]))
+
+
+def test_ghostbuster_trusts_row_order_when_there_is_nothing_to_check(
+    monkeypatch: pytest.MonkeyPatch, mrc_file: Path
+) -> None:
+    """A passthrough file separated from its siblings carries no blob columns,
+    which is the ordinary state of a dataset copied off the machine that made
+    it. Row order is still the contract; it just cannot be verified."""
+
+    class _NoBlobs(_FakeDataset):  # type: ignore[valid-type, misc]
+        @classmethod
+        def load(cls, csfile_path: str) -> "_NoBlobs":
+            ds = super().load(csfile_path)
+            for column in ("blob/path", "blob/idx"):
+                ds.pop(column)
+            return ds
+
+    monkeypatch.setattr(_cryosparc, "Dataset", _NoBlobs)
+
+    gb = Ghostbuster(
+        cs_file="fake.cs",
+        mrc_file=str(mrc_file),
+        dose_per_angstrom=2.0,
+        propagation=Propagation(scattering_model="projection"),
+    )
+
+    with mrcfile.open(str(mrc_file)) as mrc:
+        raw = torch.as_tensor(mrc.data.copy())
+    assert torch.allclose(gb._images, _preprocessed(raw))
+
+
+def test_ghostbuster_refuses_particles_spread_over_several_stack_files(
+    monkeypatch: pytest.MonkeyPatch, mrc_file: Path
+) -> None:
+    """Particles drawn from several stacks cannot be in one stack's row order,
+    and one mrc_file cannot address them at blob/idx either."""
+
+    class _TwoStacks(_FakeDataset):  # type: ignore[valid-type, misc]
+        @classmethod
+        def load(cls, csfile_path: str) -> "_TwoStacks":
+            ds = super().load(csfile_path)
+            ds["blob/path"] = np.array(["J1/a.mrc", "J1/a.mrc", "J1/b.mrc", "J1/b.mrc"])
+            ds["blob/idx"] = np.array([0, 1, 0, 1], dtype=np.int64)
+            return ds
+
+    monkeypatch.setattr(_cryosparc, "Dataset", _TwoStacks)
+    common = dict(
+        cs_file="fake.cs",
+        mrc_file=str(mrc_file),
+        dose_per_angstrom=2.0,
+        propagation=Propagation(scattering_model="projection"),
+    )
+
+    with pytest.raises(ValueError, match="not in row order"):
+        Ghostbuster(**common)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="2 stack files"):
+        Ghostbuster(**common, address_by_blob_idx=True)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# blob/sign: a stack stored either way round preprocesses the same
+# ---------------------------------------------------------------------------
+
+
+def _dataset_with_sign(sign: float) -> type:
+    """_FakeDataset recording ``sign`` as every particle's blob/sign."""
+
+    class _WithSign(_FakeDataset):  # type: ignore[valid-type, misc]
+        @classmethod
+        def load(cls, csfile_path: str) -> "_WithSign":
+            ds = super().load(csfile_path)
+            ds["blob/sign"] = np.full(N_PARTICLES, sign, dtype=np.float32)
+            return ds
+
+    return _WithSign
+
+
+def test_a_stack_stored_either_way_round_preprocesses_the_same(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mrc_file: Path
+) -> None:
+    """
+    CryoSPARC's data sign says which way round a stack stores its particles:
+    -1 inverted, as extraction writes them, +1 as recorded. The same images
+    stored either way, each with its sign, must come out as the same counts;
+    an unconditional flip got the +1 stack backwards.
+    """
+    with mrcfile.mmap(str(mrc_file)) as mrc:
+        raw = np.asarray(mrc.data).copy()
+    recorded = tmp_path / "recorded.mrcs"
+    with mrcfile.new(str(recorded), overwrite=True) as mrc:
+        mrc.set_data(-raw)
+
+    def load(sign: float, path: Path) -> torch.Tensor:
+        monkeypatch.setattr(_cryosparc, "Dataset", _dataset_with_sign(sign))
+        return Ghostbuster(
+            cs_file="fake.cs",
+            mrc_file=str(path),
+            dose_per_angstrom=2.0,
+            propagation=Propagation(scattering_model="projection"),
+        )._images
+
+    inverted = load(-1.0, mrc_file)
+    assert torch.equal(inverted, _preprocessed(torch.as_tensor(raw)))
+    assert torch.equal(load(1.0, recorded), inverted)
+
+
+def test_counts_recorded_as_inverted_are_refused(
+    monkeypatch: pytest.MonkeyPatch, mrc_file: Path
+) -> None:
+    """A count has a physical sign; counts stored inverted are mislabelled."""
+    monkeypatch.setattr(_cryosparc, "Dataset", _dataset_with_sign(-1.0))
+    with pytest.raises(ValueError, match="blob/sign"):
+        Ghostbuster(
+            cs_file="fake.cs",
+            mrc_file=str(mrc_file),
+            dose_per_angstrom=2.0,
+            image_units="counts",
+            propagation=Propagation(scattering_model="projection"),
         )

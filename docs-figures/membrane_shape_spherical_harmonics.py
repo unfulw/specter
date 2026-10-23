@@ -24,6 +24,9 @@ docs/concepts/membrane-shape/spherical-harmonics.md).
 
 from __future__ import annotations
 
+import argparse
+import time
+
 import numpy as np
 import torch
 
@@ -40,6 +43,7 @@ from specter.specimen.membrane._field_spherical_harmonics import (
     _angular_grid_resolution,
     _interpolate_angular_grid,
     _real_spherical_harmonic,
+    _real_spherical_harmonics_grid,
     _sample_sh_coefficients,
     _synthesize_angular_grid,
 )
@@ -52,9 +56,9 @@ OUT_DIR = "docs/assets/images"
 # (sh_max_degree=8, sh_amplitude=0.15, sh_spectrum_power=2.0) except for a
 # fixed seed chosen for a visually clear (non-degenerate, non-extreme) shape.
 SHAPE_ZYX = (140, 140, 140)
-SPACING_A = 3.0
+SPACING_ANGSTROM = 3.0
 SH_MAX_DEGREE = 8
-SH_AXES_A = (150.0, 150.0, 150.0)
+SH_AXES_ANGSTROM = (150.0, 150.0, 150.0)
 SH_AMPLITUDE = 0.15
 SH_SPECTRUM_POWER = 2.0
 SEED = 7
@@ -63,20 +67,20 @@ SEED = 7
 def _reference_instance() -> dict:
     """Reproduce generate_membrane_field_spherical_harmonics' own steps,
     returning every intermediate array those docs figures need."""
-    extent_a = (
+    extent_angstrom = (
         torch.tensor([SHAPE_ZYX[2], SHAPE_ZYX[1], SHAPE_ZYX[0]], dtype=torch.float32)
-        * SPACING_A
+        * SPACING_ANGSTROM
     )
-    origin_xyz = -0.5 * extent_a
-    points_xyz = _grid_points_xyz(SHAPE_ZYX, SPACING_A, origin_xyz, device="cpu")
+    origin_xyz = -0.5 * extent_angstrom
+    points_xyz = _grid_points_xyz(SHAPE_ZYX, SPACING_ANGSTROM, origin_xyz, device="cpu")
     query = points_xyz.reshape(-1, 3).numpy()
 
-    axes = np.asarray(SH_AXES_A, dtype=np.float64)
+    axes = np.asarray(SH_AXES_ANGSTROM, dtype=np.float64)
     p_prime = query / axes
     r_prime = np.linalg.norm(p_prime, axis=-1)
     r_safe = np.clip(r_prime, 1e-12, None)
     theta = np.arccos(np.clip(p_prime[:, 2] / r_safe, -1.0, 1.0))
-    phi_ang = np.arctan2(p_prime[:, 1], p_prime[:, 0])
+    phi_rad = np.arctan2(p_prime[:, 1], p_prime[:, 0])
 
     rng = np.random.default_rng(SEED)
     coefficients = _sample_sh_coefficients(SH_MAX_DEGREE, SH_SPECTRUM_POWER, rng)
@@ -85,13 +89,13 @@ def _reference_instance() -> dict:
     coarse_padded = _synthesize_angular_grid(
         coefficients, SH_MAX_DEGREE, n_theta, n_phi
     )
-    perturbation = _interpolate_angular_grid(coarse_padded, theta, phi_ang, "cpu")
+    perturbation = _interpolate_angular_grid(coarse_padded, theta, phi_rad, "cpu")
 
     r_surface = np.clip(1.0 + SH_AMPLITUDE * perturbation, 0.05, None)
     inside = (r_prime < r_surface).reshape(SHAPE_ZYX)
 
-    dist_out = ndimage.distance_transform_edt(~inside, sampling=SPACING_A)
-    dist_in = ndimage.distance_transform_edt(inside, sampling=SPACING_A)
+    dist_out = ndimage.distance_transform_edt(~inside, sampling=SPACING_ANGSTROM)
+    dist_in = ndimage.distance_transform_edt(inside, sampling=SPACING_ANGSTROM)
     phi_field = dist_out - dist_in
 
     return dict(
@@ -105,36 +109,36 @@ def _reference_instance() -> dict:
 
 
 def _phi_field_at_resolution(
-    ref: dict, shape_zyx: tuple[int, int, int], spacing_a: float
+    ref: dict, shape_zyx: tuple[int, int, int], spacing_angstrom: float
 ) -> np.ndarray:
     """Re-run only the grid-resolution-dependent steps (query points, inside
     test, EDT) at a different working-grid resolution, reusing the SAME
     random coefficients and SAME coarse angular grid from `ref` (both are
     grid-resolution-independent) -- so this is still the identical organelle,
     just resolved more finely, for a smoother hero isosurface render."""
-    extent_a = (
+    extent_angstrom = (
         torch.tensor([shape_zyx[2], shape_zyx[1], shape_zyx[0]], dtype=torch.float32)
-        * spacing_a
+        * spacing_angstrom
     )
-    origin_xyz = -0.5 * extent_a
-    points_xyz = _grid_points_xyz(shape_zyx, spacing_a, origin_xyz, device="cpu")
+    origin_xyz = -0.5 * extent_angstrom
+    points_xyz = _grid_points_xyz(shape_zyx, spacing_angstrom, origin_xyz, device="cpu")
     query = points_xyz.reshape(-1, 3).numpy()
 
-    axes = np.asarray(SH_AXES_A, dtype=np.float64)
+    axes = np.asarray(SH_AXES_ANGSTROM, dtype=np.float64)
     p_prime = query / axes
     r_prime = np.linalg.norm(p_prime, axis=-1)
     r_safe = np.clip(r_prime, 1e-12, None)
     theta = np.arccos(np.clip(p_prime[:, 2] / r_safe, -1.0, 1.0))
-    phi_ang = np.arctan2(p_prime[:, 1], p_prime[:, 0])
+    phi_rad = np.arctan2(p_prime[:, 1], p_prime[:, 0])
 
     perturbation = _interpolate_angular_grid(
-        ref["coarse_padded"], theta, phi_ang, "cpu"
+        ref["coarse_padded"], theta, phi_rad, "cpu"
     )
     r_surface = np.clip(1.0 + SH_AMPLITUDE * perturbation, 0.05, None)
     inside = (r_prime < r_surface).reshape(shape_zyx)
 
-    dist_out = ndimage.distance_transform_edt(~inside, sampling=spacing_a)
-    dist_in = ndimage.distance_transform_edt(inside, sampling=spacing_a)
+    dist_out = ndimage.distance_transform_edt(~inside, sampling=spacing_angstrom)
+    dist_in = ndimage.distance_transform_edt(inside, sampling=spacing_angstrom)
     return dist_out - dist_in
 
 
@@ -154,17 +158,17 @@ def figure_hero(ref: dict) -> None:
     (module docstring step 4): EDT distances are exact to the nearest
     boundary VOXEL, not to the continuous analytic surface, so the
     resulting field has genuine voxel-grid-scale ripple -- finer
-    `hero_spacing_a` shrinks it (this resolution + a softened light in
+    `hero_spacing_angstrom` shrinks it (this resolution + a softened light in
     `_render.shade_mesh` were chosen empirically to make it unobtrusive) but
     never removes it outright. Harmless for the field's actual use (the
     bilayer profile only ever samples within a thin band near the zero level
     set), but worth knowing before assuming a rendering bug."""
     hero_shape_zyx = (300, 300, 300)
-    hero_spacing_a = 1.4
-    hero_phi = _phi_field_at_resolution(ref, hero_shape_zyx, hero_spacing_a)
+    hero_spacing_angstrom = 1.4
+    hero_phi = _phi_field_at_resolution(ref, hero_shape_zyx, hero_spacing_angstrom)
     fig = plt.figure(figsize=(5, 5))
     ax = fig.add_subplot(111, projection="3d")
-    isosurface_axes(ax, hero_phi, hero_spacing_a, TEAL)
+    isosurface_axes(ax, hero_phi, hero_spacing_angstrom, TEAL)
     ax.view_init(elev=18, azim=35)
     plt.tight_layout(pad=0)
     path = f"{OUT_DIR}/membrane-sh-hero.png"
@@ -343,7 +347,7 @@ def figure_inside_test(ref: dict) -> None:
     z_mid = SHAPE_ZYX[0] // 2
     sl = ref["inside"][z_mid]
     fig, ax = plt.subplots(figsize=(4.4, 4.4))
-    ax.imshow(sl, cmap="gray", origin="lower")
+    ax.imshow(sl, cmap="gray_r", origin="lower")
     ax.set_title("step 3: is |p'| < R_surface(θ, φ) ?", fontsize=11)
     ax.axis("off")
     plt.tight_layout()
@@ -360,8 +364,8 @@ def figure_sdf_slice(ref: dict) -> None:
     field' concrete for readers who haven't met one before."""
     z_mid = SHAPE_ZYX[0] // 2
     sl = ref["phi_field"][z_mid]
-    extent_a = SHAPE_ZYX[1] * SPACING_A
-    half = extent_a / 2.0
+    extent_angstrom = SHAPE_ZYX[1] * SPACING_ANGSTROM
+    half = extent_angstrom / 2.0
 
     fig, axes = plt.subplots(
         1, 2, figsize=(10.5, 4.4), gridspec_kw={"width_ratios": [1.2, 1]}
@@ -392,13 +396,13 @@ def figure_sdf_slice(ref: dict) -> None:
     fig.colorbar(im, ax=axes[0], shrink=0.8, label=r"$\phi$ (Å)")
     axes[0].axhline(0.0, color="k", linestyle=":", linewidth=1)
 
-    x_a = np.linspace(-half, half, sl.shape[1])
+    x_angstrom = np.linspace(-half, half, sl.shape[1])
     line = sl[row_idx]
-    axes[1].plot(x_a, line, color=TEAL)
+    axes[1].plot(x_angstrom, line, color=TEAL)
     axes[1].axhline(0.0, color="0.5", linewidth=1)
     sign_change = np.where(np.diff(np.sign(line)) != 0)[0]
     for idx in sign_change:
-        axes[1].axvline(x_a[idx], color="k", linestyle=":", linewidth=1)
+        axes[1].axvline(x_angstrom[idx], color="k", linestyle=":", linewidth=1)
     axes[1].set_title(
         r"linescan along y=0 -- $\phi$ crosses zero at the surface", fontsize=10
     )
@@ -426,10 +430,10 @@ def figure_parameter_sweep() -> None:
     fig, axes = plt.subplots(1, len(configs), figsize=(2.2 * len(configs), 2.6))
     for ax, (label, cfg) in zip(axes, configs):
         gen = MembraneGenerator(
-            target_shape_zyx=SHAPE_ZYX,
-            v_size=SPACING_A,
+            target_shape=SHAPE_ZYX,
+            voxel_size=SPACING_ANGSTROM,
             shape_backend="spherical_harmonics",
-            sh_axes_a=SH_AXES_A,
+            sh_axes=SH_AXES_ANGSTROM,
             n_lipids_per_leaflet=1,
             seed=SEED,
             **cfg,
@@ -449,7 +453,7 @@ def figure_parameter_sweep() -> None:
 
 
 def figure_axes_sweep() -> None:
-    """sh_axes_a sweep: isotropic vs. elongated vs. flattened organelles.
+    """sh_axes sweep: isotropic vs. elongated vs. flattened organelles.
 
     Uses a larger working grid than SHAPE_ZYX/SPACING_A: the elongated
     (220, 120, 120) config's long semi-axis, inflated by up to
@@ -458,19 +462,19 @@ def figure_axes_sweep() -> None:
     generate_membrane_field_spherical_harmonics' own boundary check warns
     about)."""
     shape_zyx = (170, 170, 170)
-    spacing_a = 4.0
+    spacing_angstrom = 4.0
     configs = [
         ("isotropic (150,150,150)", (150.0, 150.0, 150.0)),
         ("elongated (220,120,120)", (220.0, 120.0, 120.0)),
         ("flattened (90,150,150)", (90.0, 150.0, 150.0)),
     ]
     fig, axes = plt.subplots(1, len(configs), figsize=(3.2 * len(configs), 3.4))
-    for ax, (label, sh_axes_a) in zip(axes, configs):
+    for ax, (label, sh_axes) in zip(axes, configs):
         gen = MembraneGenerator(
-            target_shape_zyx=shape_zyx,
-            v_size=spacing_a,
+            target_shape=shape_zyx,
+            voxel_size=spacing_angstrom,
             shape_backend="spherical_harmonics",
-            sh_axes_a=sh_axes_a,
+            sh_axes=sh_axes,
             sh_amplitude=SH_AMPLITUDE,
             sh_max_degree=SH_MAX_DEGREE,
             n_lipids_per_leaflet=1,
@@ -490,7 +494,74 @@ def figure_axes_sweep() -> None:
     print(f"saved {path}")
 
 
+def benchmark_synthesis(n_points: int = 10_000_000) -> None:
+    """Time direct per-voxel harmonic evaluation against the angular-grid
+    interpolation the backend actually uses.
+
+    Backs the "~70s at a 10M-voxel grid" and "30-150x reduction in wall time"
+    claims in the "Fast harmonic synthesis" section of the page. Both paths
+    run on the CPU over the same directions, because the direct one is a
+    `scipy.special.sph_harm_y_all` call with no GPU form -- timing the
+    interpolated path on a GPU instead would report the device difference on
+    top of the algorithmic one.
+
+    Directions are drawn uniformly on the sphere rather than read off a
+    working grid: what the direct path costs depends only on how many
+    distinct directions it is handed, and a voxel grid's are distinct.
+    """
+    rng = np.random.default_rng(SEED)
+    theta = np.arccos(rng.uniform(-1.0, 1.0, size=n_points))
+    phi = rng.uniform(0.0, 2.0 * np.pi, size=n_points)
+    coefficients = _sample_sh_coefficients(
+        SH_MAX_DEGREE, SH_SPECTRUM_POWER, np.random.default_rng(SEED)
+    )
+
+    start = time.perf_counter()
+    real_sh = _real_spherical_harmonics_grid(SH_MAX_DEGREE, theta, phi)
+    direct = np.zeros(n_points, dtype=np.float64)
+    for degree, order, coeff in coefficients:
+        direct += coeff * real_sh[(degree, order)]
+    direct_s = time.perf_counter() - start
+    del real_sh
+
+    n_theta, n_phi = _angular_grid_resolution(SH_MAX_DEGREE)
+    start = time.perf_counter()
+    coarse = _synthesize_angular_grid(coefficients, SH_MAX_DEGREE, n_theta, n_phi)
+    interpolated = _interpolate_angular_grid(coarse, theta, phi, device="cpu")
+    interp_s = time.perf_counter() - start
+
+    # Two error metrics, not one. The documented ~0.17% is the peak-relative
+    # max (max|residual| / max|perturbation|); the RMS-relative figure is
+    # roughly a third of it. Quoting either number against the other's
+    # definition misstates the accuracy by ~3x, so both are printed with
+    # their denominators named.
+    residual = np.asarray(interpolated) - direct
+    max_rel = float(np.abs(residual).max()) / float(np.abs(direct).max())
+    rms_rel = float(np.sqrt(np.mean(residual**2))) / float(np.sqrt(np.mean(direct**2)))
+    print(f"{n_points:,} directions, sh_max_degree={SH_MAX_DEGREE}")
+    print(f"  direct per-point evaluation   {direct_s:8.2f} s")
+    print(
+        f"  angular grid + interpolation  {interp_s:8.2f} s  ({n_theta}x{n_phi} grid)"
+    )
+    print(f"  speedup                       {direct_s / interp_s:8.1f}x")
+    print(f"  error, max / perturbation max {max_rel:8.4%}")
+    print(f"  error, rms / perturbation rms {rms_rel:8.4%}")
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help="Measure harmonic synthesis cost instead of drawing the figures.",
+    )
+    parser.add_argument("--n_points", type=int, default=10_000_000)
+    args = parser.parse_args()
+
+    if args.timing:
+        benchmark_synthesis(args.n_points)
+        raise SystemExit(0)
+
     ref = _reference_instance()
     figure_hero(ref)
     figure_basis_gallery()

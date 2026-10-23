@@ -1,17 +1,59 @@
 <p align="center">
-  <img src="images/SPECTER_Logo_White.png" alt="SPECTER logo" width="300">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/logo-light.png">
+    <img src="docs/assets/logo-light.png" alt="SPECTER logo" width="220">
+  </picture>
 </p>
 
-# SPECTER
-### Scattering & Propagation of Electrons in Cryo-EM: Twin Emulator & Reconstruction
+<h1 align="center">SPECTER</h1>
+<p align="center"><strong>S</strong>cattering &amp; <strong>P</strong>ropagation of <strong>E</strong>lectrons in Cryo-EM: <strong>T</strong>win <strong>E</strong>mulator &amp; <strong>R</strong>econstruction</p>
 
-[![Docs](https://github.com/joelyeois/specter/actions/workflows/docs.yml/badge.svg)](https://joelyeois.github.io/specter/)
+<p align="center">
+  <a href="https://joelyeois.github.io/specter/"><img src="https://github.com/joelyeois/specter/actions/workflows/docs.yml/badge.svg" alt="Docs"></a>
+  <img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/license-All%20Rights%20Reserved-lightgrey.svg" alt="License">
+</p>
 
-**SPECTER** is a Python package for simulating cryo-electron microscopy (cryo-EM) images with physics-based models.  
-It supports aberrations, scattering, detector effects, and integrates with PyTorch for GPU acceleration.
+<p align="center">
+A physics-based simulator for cryo-EM and cryo-ET, built to produce images
+that match experimental data as closely as possible — and, through
+Ghostbuster, the same forward model run in reverse to reconstruct a 3D map
+from images.
+</p>
+
+<p align="center">
+  <img src="docs/assets/images/cryoet-tomogram-hero.png" alt="A simulated cryo-ET specimen" width="560">
+</p>
 
 > **Early development notice**  
 > SPECTER is under active development. APIs and behaviour may change without notice between releases — including breaking changes. It is not yet recommended for production workflows. Feedback and bug reports are welcome via [GitHub Issues](https://github.com/joelyeois/specter/issues).
+
+---
+
+## Table of contents
+
+- [Why SPECTER?](#why-specter)
+- [Installation](#installation)
+- [Usage](#usage)
+- [CLI at a glance](#cli-at-a-glance)
+- [Documentation](#documentation)
+- [Repository layout](#repository-layout)
+- [Tests](#tests)
+- [FAQ](#faq)
+- [License](#license)
+- [Getting help](#getting-help)
+
+---
+
+## Why SPECTER?
+
+- **Structured ice.** Ice comes from configurations optimised against a measured structure factor and a coarse-grained water potential, not from water molecules placed at random to the right bulk density.
+- **Per-electron detector.** Individual electrons are placed and merged when they land too close together, reproducing the low-frequency suppression that real counting detectors show.
+- **Validated against experiment.** Simulated particles pooled with real EMPIAR-11377 particles and run through a single CryoSPARC 2D classification job sort into the same classes, in roughly the same proportion, across nearly all 50 classes — see the [particle-stack guide](https://joelyeois.github.io/specter/user-guide/particle-stack/#example-matching-empiar-11377).
+- **One model, both directions.** The forward model that generates images (`specter.imaging`'s `Specimen`, `Sample` and `TiltSeries`) is the same model that drives reconstruction (`Ghostbuster`/`TomogramGhostbuster`), so a change to the physics applies in both directions rather than to a simulator alone.
+- **GPU-accelerated.** Volume rotation, potential calculation, and wave propagation all run on PyTorch, with multi-GPU support for particle stacks, ice cache generation, and the two gold-standard reconstruction halves.
+- **Tracked runs.** Every reconstruction, and any simulation run with `--project` or `--job_id`, is recorded as a numbered job (`specter jobs list/show/diff`), so parameters and provenance are kept between experiments.
 
 ---
 
@@ -20,26 +62,229 @@ It supports aberrations, scattering, detector effects, and integrates with PyTor
 ```bash
 git clone https://github.com/joelyeois/specter.git
 cd specter
-uv sync
+uv sync                      # installs SPECTER itself, plus its dependencies
 source .venv/bin/activate
-uv pip install -e .          # the package itself, not just its dependencies
 uv run --with jupyter jupyter lab
 ```
 
-See the [installation guide](https://joelyeois.github.io/specter/installation.html)
-for the conda/pip alternative, GPU notes, and troubleshooting an install
-outside a git checkout.
+The default `shtyrov` scattering-factor parameterization types atoms by their
+bonded neighbours, so it needs hydrogens that deposited structures do not
+carry. Install the
+[Monomer Library](https://github.com/MonomerLibrary/monomers) and point
+`$CLIBD_MON` at it to supply them — without it roughly 44% of a protein's
+atoms fall back to per-element factors:
+
+```bash
+git clone https://github.com/MonomerLibrary/monomers.git
+export CLIBD_MON=/path/to/monomers
+```
+
+See the [installation guide](https://joelyeois.github.io/specter/installation/)
+for the conda/pip alternative, choosing a CUDA version, and the Monomer
+Library in full.
 
 ---
 
 ## Usage
 
-Full usage documentation — every demo script's CLI reference, the TOML
+The `specter simulate particles` CLI is the quickest way to produce a
+simulated cryo-EM particle stack. Every setting carries a built-in default,
+so the only thing you must supply is the structure to simulate:
+
+```bash
+specter simulate particles --pdb_source 6bdf
+```
+
+This downloads the structure, builds the scattering potential, applies CTF
+and detector effects, and writes a `.mrcs` / `.star` file pair. A TOML
+config carries the settings once there are more of them than fit on a line,
+and any field in it can still be overridden on the command line:
+
+```bash
+specter simulate particles \
+    --config particle.toml \
+    --pdb_source 6bdf \
+    --n_particles 200 \
+    --device cuda:0 \
+    --output_dir particles
+```
+
+**The example configs are not installed with the package.** They live in this
+repository, one per subcommand, under
+[`configs/`](https://github.com/joelyeois/specter/tree/main/configs). Clone
+the repository, or download the one you want:
+
+```bash
+curl -O https://raw.githubusercontent.com/joelyeois/specter/main/configs/particle.toml
+```
+
+Keep the config and the installed version in step: field names change between
+releases, and a config naming a field that no longer exists is rejected by
+name rather than ignored.
+
+<details>
+<summary>What <code>configs/particle.toml</code> looks like</summary>
+
+```toml
+# Canonical default config for `specter simulate particles`.
+# Any field can be overridden on the command line, e.g.:
+#   specter simulate particles --config configs/particle.toml --n_particles 3000
+
+# Where the particles come from. Left unset, the run synthesizes them and
+# everything below applies as written; given a file, the poses and
+# per-particle CTF come from it instead.
+[data]
+# cs_path = "path/to/particles.cs"      # a CryoSPARC .cs file
+# star_path = "path/to/particles.star"  # ... or a RELION .star file (mutually exclusive)
+
+[specimen]
+pdb_source = "6bdf"
+assembly = true
+n_pixels = 256
+pixel_size = 1.0              # Å
+ice_thickness = 0.0           # Å, 0 = minimum (particle box size)
+
+[microscope]
+voltage = 300.0                # kV
+dose = 20.0                    # e⁻/Å²; single value, or [low, high] to sample per particle
+cs = 2.0                       # mm
+alpha = 0.1                    # unitless, amplitude contrast ratio
+
+# ... see the full file: configs/particle.toml
+```
+
+</details>
+
+Full usage documentation — the `specter` CLI reference, the TOML
 config system, the physics pipeline, ice generation, Ghostbuster
 reconstruction, and job management — lives in the docs:
 
 **[joelyeois.github.io/specter](https://joelyeois.github.io/specter/)**
 
-Ready-to-run CLI scripts are in `demo-scripts/`; interactive notebooks are
-in `demo-notebooks/`.
+Simulation is driven by the `specter` command (`specter simulate particles`,
+`micrograph`, `tiltseries`, `specter build tomogram`, `specter build ice`),
+and reconstruction by `specter reconstruct particle`, also spelled
+`specter ghostbuster particle`. `specter match particles` derives a
+simulation config from a real particle set, and `specter convert cs2star`
+converts CryoSPARC particle metadata to RELION. Interactive notebooks are in
+`demo-notebooks/`.
 
+---
+
+## CLI at a glance
+
+| Command | What it does |
+|---|---|
+| `specter simulate particles` | Single-particle image stack from a PDB code, or a "twin" of a real CryoSPARC/RELION dataset via `--cs_path`/`--star_path`. |
+| `specter simulate micrograph` | A full field of view: many particles, crowding, and ice. |
+| `specter build tomogram` | Composite a specimen volume from membranes, filaments, microtubules, beads, and packed protein species. |
+| `specter simulate tiltseries` | A cryo-ET tilt series through a tomogram specimen volume, with dose accumulation across tilts. |
+| `specter build ice` | A replacement `IceBank` library at a pixel size the bundled cache doesn't cover. |
+| `specter reconstruct particle` (alias: `specter ghostbuster particle`) | Reconstruct a 3D map from a particle stack. Pose, translation, and defocus refinement are off by default and not yet validated. |
+| `specter match particles` | Derive a `matched.toml` for `specter simulate particles` from a real particle set, with a report of how close the match is. |
+| `specter convert cs2star` | Convert a CryoSPARC particle `.cs` file to a RELION `.star` file, pointing at the same image stacks. |
+| `specter jobs list/show/diff` | Inspect and compare parameters and provenance across past runs. |
+| `specter cache dir/info/clean` | Locate, inspect, or clear the cache of downloaded PDB/mmCIF structures. |
+
+Every subcommand takes an optional `--config path/to.toml`; any field in that
+TOML can also be set directly on the command line, and any field left unset
+takes its built-in default. See
+[Configure a run](https://joelyeois.github.io/specter/user-guide/configuration/).
+
+---
+
+## Documentation
+
+| | |
+|---|---|
+| [Installation](https://joelyeois.github.io/specter/installation/) | Set up SPECTER with `uv` and confirm the `specter` command is available. |
+| [Basic examples](https://joelyeois.github.io/specter/basic-examples/) | Complete templates for a particle stack, a micrograph, a tilt series and a reconstruction. |
+| [Walkthrough](https://joelyeois.github.io/specter/walkthrough/) | The forward model one stage per page, with code and figures, from an atomic model to a reconstructed map. |
+| [Tutorials](https://joelyeois.github.io/specter/user-guide/particle-stack/) | Command-line workflows: particle stacks, micrographs, tilt series, tomogram specimens, ice caches, configuration and job management. |
+| [Theory](https://joelyeois.github.io/specter/concepts/) | The derivations, conventions and validation behind each physical model. |
+| [Python API](https://joelyeois.github.io/specter/api/) | Generated from docstrings, one page per subpackage. |
+
+---
+
+## Repository layout
+
+```
+src/specter/        # main package: physics simulator + Ghostbuster reconstruction
+  imaging/           # Specimen, Field/Sample, TiltSeries, ExitWave, Image
+  ghostbuster/       # Reconstructor, Ghostbuster, tomogram reconstruction
+  specimen/          # membranes, filaments, microtubules, tomogram specimen assembly
+  ice/               # amorphous ice generation and the IceBank library
+  cli/               # the `specter` command
+  pipelines/         # end-to-end functions behind each CLI subcommand
+demo-notebooks/      # interactive, always-working usage examples
+configs/             # worked example TOML configs (not shipped in the wheel)
+docs/                # Concepts, user guide, and API reference (published to GitHub Pages)
+tests/               # pytest suite
+```
+
+---
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+The default runs the non-network suite in `tests/` with 32 workers and work
+stealing, using four CPU threads per worker. It measured 2m 10s on a 128-core
+host; runtime varies with hardware and load. Use `-n 4` on smaller machines,
+or `-n 0` for a single module:
+
+```bash
+uv run pytest -n 0 tests/test_cryosparc.py
+uv run pytest -m ""  # include tests that fetch structures from the internet
+```
+
+---
+
+## FAQ
+
+**Do I need a GPU?**
+No. Every simulator and Ghostbuster component runs on CPU as well as GPU
+via PyTorch/Lightning; a CPU-only install path is documented in the
+[installation guide](https://joelyeois.github.io/specter/installation/).
+A GPU accelerates volume rotation, potential calculation, and wave
+propagation, and multiple GPUs can be used at once for particle stacks,
+ice cache generation, and gold-standard reconstruction.
+
+**Does this replace RELION or CryoSPARC?**
+No. SPECTER can read a real CryoSPARC `.cs` or RELION `.star` file and use
+its pixel size, poses, and CTF to simulate a physically matched "twin" of
+that dataset (`--cs_path`/`--star_path`), rather than sample those
+parameters synthetically. Ghostbuster, its reconstruction side, is a
+research-stage forward-model-based reconstructor, not a production
+alternative to those packages — see [Why SPECTER?](#why-specter) above.
+
+**How do I know the simulated images are realistic?**
+Simulated particles pooled with real EMPIAR-11377 particles and passed
+through one CryoSPARC 2D classification job sort into the same classes, in
+roughly the same proportion, across nearly all 50 classes; see the
+[worked example](https://joelyeois.github.io/specter/user-guide/particle-stack/#example-matching-empiar-11377).
+
+**Which structures can I simulate?**
+Any PDB/mmCIF structure. `--pdb_source` takes either a 4-character PDB
+accession code, which SPECTER fetches and caches automatically, or the path
+to a local `.pdb`/`.cif` file, which is read where it lies and never copied
+into the cache. Scattering-factor typing is most accurate on structures with
+resolvable hydrogens; see the [Monomer Library note](#installation) above.
+
+---
+
+## License
+
+This source is made publicly viewable for reference purposes only; see
+[`LICENSE`](LICENSE) for the exact terms. It is expected to move to an
+open-source license (anticipated: BSD-3-Clause) once the associated paper
+is published.
+
+---
+
+## Getting help
+
+Questions, bug reports, and feature requests are welcome on
+[GitHub Issues](https://github.com/joelyeois/specter/issues).

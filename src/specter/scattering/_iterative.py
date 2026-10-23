@@ -1,0 +1,1202 @@
+"""
+`IterativeScattering`: exit waves from a volume sampled slice by slice under
+a pose, without ever rotating the whole volume.
+"""
+
+from __future__ import annotations
+
+import functools
+
+from collections.abc import Callable, Iterator
+
+import lightning as L
+import torch
+from torch.utils.checkpoint import checkpoint as _gradient_checkpoint
+
+from ..arrays import center_crop
+from ..constants import energy_to_wavelength, interaction_parameter
+from ..fft import fft2, ifft2
+from ..potential import apply_amplitude_contrast
+from ..progress import track
+from ..rotations import VolumeRotator, build_affine_matrix
+from ._kernels import (
+    bandlimit_mask,
+    fourier_crop_xy,
+    fourier_upsample_xy,
+    oversampled_exp,
+    frequency_grid,
+    fresnel_propagator,
+    phase_scale,
+)
+from specter.options import EwaldSphereSign, GridSamplePadding, ScatteringModel
+
+
+class IterativeScattering(L.LightningModule):
+    """
+    Scattering module that computes the 2D exitwave from a 3D scattering
+    potential using on-the-fly slice sampling. This is highly memory efficient
+    as it avoids rotating the entire 3D volume.
+
+    The models and their formulas are those of
+    :class:`~specter.scattering.Scattering`: the multislice method of Cowley &
+    Moodie [1]_ in the FFT form of Ishizuka & Uyeda [2]_, as presented by
+    Kirkland [3]_.
+
+    References
+    ----------
+    .. [1] Cowley, J. M., & Moodie, A. F. (1957). The scattering of electrons by
+       atoms and crystals. I. A new theoretical approach. *Acta
+       Crystallographica*, 10(10), 609–619.
+       https://doi.org/10.1107/S0365110X57002194
+    .. [2] Ishizuka, K., & Uyeda, N. (1977). A new theoretical and practical
+       approach to the multislice method. *Acta Crystallographica Section A*,
+       33(5), 740–749. https://doi.org/10.1107/S0567739477001879
+    .. [3] Kirkland, E. J. (2010). *Advanced computing in electron microscopy*
+       (2nd ed.). Springer. https://doi.org/10.1007/978-1-4419-6533-2
+    """
+
+    def __init__(
+        self,
+        nxy: int,
+        pixel_size: float,
+        voltage: float,
+        scattering_model: ScatteringModel = "multislice",
+        klim: float | None = None,
+        ews_curvature_sign: EwaldSphereSign = "negative",
+        alpha: float = 0.0,
+        progressbars: bool = True,
+        roi_padding_mode: GridSamplePadding = "zeros",
+        pad_fft: bool = False,
+        fft_pad_margin: int = 32,
+        oversample: int = 1,
+        crop: bool = True,
+        keep_pad: bool = False,
+    ):
+        """
+        Parameters
+        ----------
+        nxy : int
+            Number of pixels in x and y dimensions.
+        pixel_size : float
+            Pixel size in Å.
+        voltage : float
+            Electron beam accelerating voltage in kV.
+        scattering_model : str
+            Scattering model to use ('multislice', 'firstborn', 'rytov', 'projection', 'ctf').
+        klim : float, optional
+            Bandlimit parameter.
+        ews_curvature_sign : str
+            Ewald sphere curvature sign matching CryoSPARC's convention.
+            ``'negative'`` (default) or ``'positive'``. Affects multislice,
+            Rytov, and first Born models.
+        alpha : float
+            Amplitude contrast ratio.
+        progressbars : bool
+            Whether to show progress bars.
+        roi_padding_mode : str, optional
+            ``padding_mode`` passed to ``grid_sample`` (via
+            ``VolumeRotator.sample_rotated_slices``) in ``_fetch_volume_slices``, for
+            ROI queries (under rotation) that fall outside the input volume's extent.
+            ``'zeros'`` (default) treats out-of-bounds queries as vacuum, which is the
+            physically correct assumption for a discrete object surrounded by empty
+            space, but wrong for a continuous medium like a vitreous-ice lamella (which
+            has no vacuum -- real content everywhere) sampled with an ROI larger than
+            the requested volume's own padding: it introduces a real, measurable
+            density cliff exactly at the volume boundary (a discontinuity with slowly
+            decaying, ~1/k, Fourier content, spread broadly rather than confined to a
+            single spatial frequency). ``'reflection'`` or ``'border'`` avoid the value
+            discontinuity (at the cost of a gradient kink, ~1/k^2, a much gentler
+            artifact) by mirroring or clamping the real content instead. See
+            ``imaging.TiltSeries``' ``fft_pad_margin`` for where this matters in
+            practice.
+        pad_fft : bool, optional
+            For ``scattering_model="multislice"`` only: give the per-slice FFT-based
+            Fresnel propagation extra canvas headroom for the whole ``nz_new``-step
+            recursion, rather than propagating at exactly ``nxy`` with zero headroom.
+            Zero headroom lets each step's circular convolution wrap slightly at the
+            same fixed frame boundary every step; under tilt (hundreds to 1000+ steps),
+            that small per-step wraparound compounds coherently into a real, visible
+            artifact along all four frame edges (confirmed via direct comparison against
+            ``scattering_model="projection"``, which cannot exhibit this artifact by
+            construction, at both toy and production scale).
+            The fix is to pad once, run the *entire* recursion at the padded size, and
+            crop back to ``nxy`` only once at the end -- padding and cropping every
+            individual step was also tested and made things worse, since it discards
+            genuinely-propagating field content on every iteration instead of only
+            preventing wraparound. Default False.
+        fft_pad_margin : int, optional
+            Padding added on each side of the propagation canvas when ``pad_fft=True``,
+            i.e. the recursion runs at ``nxy + 2 * fft_pad_margin``. Always filled with
+            zeros (not reflection): the region a tilted slice's flanks sample is real
+            vacuum, not continuing material, so reflecting would fabricate density that
+            isn't there. With ``oversample`` above 1 the slice interpolation is periodic
+            too, and a tilted slice, which holds specimen at one frame edge and not the
+            other, rings from that join in proportion to one over the margin: a uniform
+            slab at 60 degrees images 1.0% off flat at the edge with 16 px, 0.3% with
+            32 px. Default 32.
+        oversample : int, optional
+            Run the multislice recursion on an xy grid this many times finer
+            than the sampled slices, interpolating each slice onto it, and
+            Fourier-crop the exit wave back. See
+            :class:`~specter.scattering.Scattering` for the measurement
+            behind it. Applies to multislice, and to Rytov's and projection's
+            final exponential. Default 1.
+        crop : bool, optional
+            Crop the oversampled exit wave back to the slice grid (default),
+            or return it on the propagation grid for the image to be formed
+            there; see :class:`Scattering`. Default True.
+        keep_pad : bool, optional
+            Under ``pad_fft``, return the multislice wave on the whole padded
+            canvas, :attr:`output_nxy` pixels across, rather than cropped to
+            ``nxy``. The margin samples the volume beyond the field, so the
+            transfer function, a circular convolution as well, then sees what
+            surrounds the field instead of wrapping its opposite edges into
+            each other; the image is cropped to the field at the detector.
+            Default False.
+        """
+        super().__init__()
+        if not isinstance(oversample, int) or oversample < 1:
+            raise ValueError(f"oversample={oversample!r} must be an integer >= 1")
+        self.oversample = oversample
+        self.crop = crop
+        self.nxy = nxy
+        self.pixel_size = pixel_size
+        self.voltage = voltage
+        self.wavelength = energy_to_wavelength(voltage)
+        self.sigma = interaction_parameter(voltage)
+        self.scattering_model = scattering_model
+        self.ews_curvature_sign = ews_curvature_sign
+        self.alpha = alpha
+        self.progressbars = progressbars
+        self.roi_padding_mode = roi_padding_mode
+        self.pad_fft = pad_fft
+        self.fft_pad_margin = fft_pad_margin
+        self.keep_pad = keep_pad
+
+        k = frequency_grid(nxy, pixel_size)
+        self.register_buffer("k2", k**2, persistent=False)
+
+        self.klim = klim
+        # The multislice propagator and bandlimit live on the propagation
+        # grid, `oversample` times finer than the slices; `k2` stays on the
+        # slice grid for the single-scatter models. The bandlimit's cutoff is
+        # a fraction of the SLICE grid's Nyquist on either (bandlimit_mask
+        # reads the Nyquist off the coarse pixel size it is given).
+        k_ms = frequency_grid(nxy * oversample, pixel_size / oversample)
+        self._register_bandlimit("kmask", k_ms)
+
+        # Single-step Fresnel propagator, for multislice.
+        F_step = fresnel_propagator(k_ms**2, self.wavelength, pixel_size)
+        self.register_buffer("F_step_real", F_step.real, persistent=False)
+        self.register_buffer("F_step_imag", F_step.imag, persistent=False)
+
+        # Second propagator/bandlimit at the padded canvas size, used only when
+        # pad_fft=True (see multislice()).
+        self.padded_nxy = nxy + 2 * fft_pad_margin if pad_fft else nxy
+        if pad_fft:
+            k_p = frequency_grid(self.padded_nxy * oversample, pixel_size / oversample)
+            F_step_p = fresnel_propagator(k_p**2, self.wavelength, pixel_size)
+            self.register_buffer("F_step_padded_real", F_step_p.real, persistent=False)
+            self.register_buffer("F_step_padded_imag", F_step_p.imag, persistent=False)
+            self._register_bandlimit("kmask_padded", k_p)
+
+    def _register_bandlimit(self, name: str, k: torch.Tensor) -> None:
+        """Attach the Kirkland bandlimit for ``k`` as a buffer, or the int 1."""
+        kmask = bandlimit_mask(k, self.pixel_size, self.klim)
+        if isinstance(kmask, torch.Tensor):
+            self.register_buffer(name, kmask, persistent=False)
+        else:
+            setattr(self, name, kmask)
+
+    def _is_identity(self, theta_matrix: torch.Tensor) -> bool:
+        """Check if the affine matrix is identity (no rotation or translation)."""
+        B = theta_matrix.shape[0]
+        identity = (
+            torch.eye(3, 4, device=theta_matrix.device, dtype=theta_matrix.dtype)
+            .unsqueeze(0)
+            .expand(B, -1, -1)
+        )
+        return torch.allclose(theta_matrix, identity, atol=1e-6)
+
+    def _setup_tilt(
+        self, V: torch.Tensor, theta_matrix: torch.Tensor
+    ) -> tuple[int, VolumeRotator]:
+        """Helper to calculate rotation parameters and setup VolumeRotator."""
+        B, Z, Y, X = V.shape
+
+        # Determine nz_new for arbitrary rotation
+        # R is the rotation matrix (B, 3, 3) from output to input coordinates.
+        R = theta_matrix[:, :3, :3]
+
+        # Corners of the volume in pixel units relative to center.
+        # VolumeRotator expects (z, y, x) or (x, y, z)?
+        # Grid sample uses (x, y, z).
+        corners = torch.tensor(
+            [
+                [-X / 2, -Y / 2, -Z / 2],
+                [X / 2, -Y / 2, -Z / 2],
+                [-X / 2, Y / 2, -Z / 2],
+                [X / 2, Y / 2, -Z / 2],
+                [-X / 2, -Y / 2, Z / 2],
+                [X / 2, -Y / 2, Z / 2],
+                [-X / 2, Y / 2, Z / 2],
+                [X / 2, Y / 2, Z / 2],
+            ],
+            device=V.device,
+            dtype=V.dtype,
+        ).t()  # (3, 8)
+
+        # Output Z-axis in input frame is R[:, 2].
+        # P_out = R.T @ (P_in - T)
+        # z_out = R.T[2, :] @ (P_in - T)
+        # We ignore T for nz_new as it just shifts the center of sampling.
+        rotated_corners = torch.bmm(
+            R.transpose(1, 2), corners.unsqueeze(0).expand(B, -1, -1)
+        )
+        z_min = rotated_corners[:, 2, :].min(dim=1).values
+        z_max = rotated_corners[:, 2, :].max(dim=1).values
+
+        # Max extent across the batch
+        nz_new = int(torch.ceil((z_max - z_min).max()).item())
+        nz_new = max(1, nz_new)
+
+        rotator = VolumeRotator(
+            nz=Z,
+            ny=Y,
+            nx=X,
+            origin="relion",
+            padding_mode="reflection",
+        ).to(V.device)
+
+        return nz_new, rotator
+
+    def _get_propagator(self, distance_slices: float) -> torch.Tensor:
+        """The Fresnel propagator for a distance given in slices."""
+        return fresnel_propagator(
+            self.k2, self.wavelength, self.pixel_size * distance_slices
+        )
+
+    def _phase_scale(self, V: torch.Tensor) -> complex:
+        """See :func:`phase_scale`."""
+        return phase_scale(V, self.sigma, self.pixel_size, self.alpha)
+
+    # ------------------------------------------------------------------
+    # Shared slice-fetching machinery
+    #
+    # Every iterative scattering model (multislice, rytov, firstborn,
+    # kinematic, projection, parallel_rytov) needs to: resolve how many
+    # Z-slices to traverse for the given rotation, decide the traversal
+    # order (Ewald sphere curvature sign), and fetch each slice either
+    # directly from V (identity transform) or by resampling the rotated
+    # volume. These helpers factor that out so each model method only
+    # has to express its own per-slice physics.
+    # ------------------------------------------------------------------
+
+    def _resolve_tilt_setup(
+        self, V: torch.Tensor, theta_matrix: torch.Tensor
+    ) -> tuple[int, VolumeRotator | None, bool]:
+        """
+        Resolve the number of Z-slices to traverse and the rotator needed
+        to sample them, short-circuiting rotated-volume setup entirely for
+        the identity transform.
+
+        Returns
+        -------
+        nz_new : int
+            Number of Z-slices to traverse (equals V's Z-extent for identity).
+        rotator : VolumeRotator or None
+            None for the identity transform (slices are read directly from V).
+        is_identity : bool
+        """
+        is_identity = self._is_identity(theta_matrix)
+        if is_identity:
+            return V.shape[1], None, is_identity
+        nz_new, rotator = self._setup_tilt(V, theta_matrix)
+        return nz_new, rotator, is_identity
+
+    def _roi_start(
+        self, V: torch.Tensor, roi_size: int | None = None
+    ) -> tuple[int, int]:
+        """Top-left pixel of the centered (roi_size, roi_size) ROI within V's (Y, X) extent."""
+        size = self.nxy if roi_size is None else roi_size
+        y_start = (V.shape[-2] - size) // 2
+        x_start = (V.shape[-1] - size) // 2
+        return y_start, x_start
+
+    def _slice_processing_order(
+        self, nz_new: int, device: str | torch.device
+    ) -> torch.Tensor:
+        """Z-slice traversal order; positive EWS curvature reverses it."""
+        indices = torch.arange(nz_new, device=device)
+        if self.ews_curvature_sign == "positive":
+            indices = torch.flip(indices, dims=(0,))
+        return indices
+
+    def _fetch_volume_slices(
+        self,
+        V: torch.Tensor,
+        slice_positions: torch.Tensor | slice,
+        is_identity: bool,
+        rotator: VolumeRotator | None,
+        theta_matrix: torch.Tensor,
+        nz_new: int,
+        y_start: int,
+        x_start: int,
+        device: str | torch.device,
+        roi_size: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Fetch Z-slices of `V` at the given processing-order positions.
+
+        For the identity transform, slices are read directly out of `V`
+        (no resampling needed). Otherwise they are resampled from the
+        rotated volume via `rotator.sample_rotated_slices`.
+
+        Parameters
+        ----------
+        slice_positions : torch.Tensor or slice
+            Slice indices in processing order. A Python slice avoids an
+            advanced-indexing copy for consecutive, unrotated planes.
+        roi_size : int, optional
+            Size of the square ROI to fetch. Defaults to ``self.nxy``; callers
+            that need a larger canvas (e.g. ``multislice`` with ``pad_fft=True``)
+            pass it explicitly.
+
+        Returns
+        -------
+        torch.Tensor
+            Real-valued slices, shape (B, K, roi_size, roi_size).
+        """
+        size = self.nxy if roi_size is None else roi_size
+        if is_identity:
+            B = V.shape[0]
+            K = (
+                len(range(*slice_positions.indices(V.shape[1])))
+                if isinstance(slice_positions, slice)
+                else slice_positions.shape[0]
+            )
+            Y, X = V.shape[-2], V.shape[-1]
+            y_end, x_end = y_start + size, x_start + size
+            # Requested window may exceed V's actual extent (e.g. a padded canvas
+            # requested from a volume only sized for the unpadded ROI). Anything
+            # outside V is genuine vacuum -- zero-fill it instead of silently
+            # truncating (which produces a shape mismatch downstream).
+            y0, y1 = max(y_start, 0), min(y_end, Y)
+            x0, x1 = max(x_start, 0), min(x_end, X)
+            if y0 == y_start and y1 == y_end and x0 == x_start and x1 == x_end:
+                return V[:, slice_positions, y_start:y_end, x_start:x_end].to(device)
+            out = torch.zeros(B, K, size, size, device=device, dtype=V.dtype)
+            if y1 > y0 and x1 > x0:
+                out[:, :, y0 - y_start : y1 - y_start, x0 - x_start : x1 - x_start] = V[
+                    :, slice_positions, y0:y1, x0:x1
+                ].to(device)
+            return out
+        assert rotator is not None
+        assert isinstance(slice_positions, torch.Tensor)
+        slice_indices = slice_positions.float() - (nz_new - 1) / 2
+        # device= lets sample_rotated_slices interpolate directly on `device`
+        # via a small windowed transfer when V lives elsewhere -- e.g. when
+        # a TiltSeries' volume didn't fit on the compute device and stayed on
+        # CPU (see `TiltSeries.place`).
+        # When V and device already match, this is exactly the original
+        # direct grid_sample, unchanged.
+        return rotator.sample_rotated_slices(
+            V,
+            theta_matrix,
+            slice_indices=slice_indices,
+            roi_size=(size, size),
+            padding_mode=self.roi_padding_mode,
+            device=device,
+        )
+
+    def _iter_slices(
+        self,
+        V: torch.Tensor,
+        theta_matrix: torch.Tensor,
+        slice_batchsize: int,
+        description: str,
+        roi_size: int | None = None,
+    ) -> Iterator[tuple[int, int, torch.Tensor]]:
+        """
+        Yield ``(i, nz_new, slice_sample)`` for each Z-slice of a (possibly
+        rotated) volume, in EWS processing order.
+
+        For the identity transform, each slice is fetched as a view, with
+        a device transfer only when needed. Otherwise slices are fetched in
+        ``slice_batchsize``-sized batches via `_fetch_volume_slices` and
+        cached, trading memory for fewer `sample_rotated_slices` calls.
+
+        Parameters
+        ----------
+        roi_size : int, optional
+            Size of the square ROI to fetch per slice. Defaults to ``self.nxy``;
+            ``multislice`` passes ``self.padded_nxy`` when ``pad_fft=True``.
+
+        Yields
+        ------
+        i : int
+            Loop index (0-indexed position in processing order).
+        nz_new : int
+            Total number of slices being traversed.
+        slice_sample : torch.Tensor
+            Real-valued slice, shape (B, roi_size, roi_size).
+        """
+        nz_new, rotator, is_identity = self._resolve_tilt_setup(V, theta_matrix)
+        device = self.device
+        y_start, x_start = self._roi_start(V, roi_size=roi_size)
+        indices = self._slice_processing_order(nz_new, device=V.device)
+
+        pbar = track(
+            range(nz_new),
+            description=description,
+            transient=True,
+            disable=not (self.progressbars),
+        )
+
+        slices_block: torch.Tensor | None = None
+        for i in pbar:
+            if is_identity:
+                z = nz_new - 1 - i if self.ews_curvature_sign == "positive" else i
+                slice_sample = self._fetch_volume_slices(
+                    V,
+                    slice(z, z + 1),
+                    is_identity,
+                    rotator,
+                    theta_matrix,
+                    nz_new,
+                    y_start,
+                    x_start,
+                    device,
+                    roi_size=roi_size,
+                )[:, 0]
+            else:
+                if i % slice_batchsize == 0:
+                    batch_end = min(i + slice_batchsize, nz_new)
+                    slices_block = self._fetch_volume_slices(
+                        V,
+                        indices[i:batch_end],
+                        is_identity,
+                        rotator,
+                        theta_matrix,
+                        nz_new,
+                        y_start,
+                        x_start,
+                        device,
+                        roi_size=roi_size,
+                    )
+                assert slices_block is not None
+                slice_sample = slices_block[:, i % slice_batchsize]
+
+            yield i, nz_new, slice_sample
+
+    def multislice(
+        self,
+        V: torch.Tensor,
+        theta_matrix: torch.Tensor,
+        slice_batchsize: int = 1,
+        checkpoint_chunks: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute exit wave using iterative multislice on a transformed volume.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            Input 3D potential volume, shape ``(B, Z, Y, X)``.
+        theta_matrix : torch.Tensor
+            Affine rotation matrices, shape ``(B, 3, 4)``.
+        slice_batchsize : int
+            Number of slices to sample from V in one ``sample_rotated_slices``
+            call. Larger values trade memory for fewer kernel launches.
+        checkpoint_chunks : int or None
+            If set, the slice loop is split into chunks of this size and each
+            chunk is run under ``torch.utils.checkpoint`` (gradient
+            checkpointing). Only the exitwave at chunk boundaries is retained
+            for backprop; intermediate wave states are recomputed during the
+            backward pass. This reduces activation memory from
+            ``O(nz_new)`` to ``O(checkpoint_chunks)`` at the cost of one
+            extra forward pass per chunk during backward.
+            ``None`` disables checkpointing (original behaviour).
+        """
+        B = V.shape[0]
+        device = self.device
+
+        if self.pad_fft:
+            F = self.F_step_padded_real + 1j * self.F_step_padded_imag
+            kmask = self.kmask_padded
+            canvas = self.padded_nxy
+            roi_size: int | None = canvas
+        else:
+            F = self.F_step_real + 1j * self.F_step_imag
+            kmask = self.kmask
+            canvas = self.nxy
+            roi_size = None
+
+        # Fold the bandlimit into the propagator once, rather than once per
+        # slice -- the same reassociation `Scattering.multislice` already makes,
+        # and exact for the same reason: kmask is binary (0.0/1.0), or the
+        # Python int 1 when klim is None, in which case `psi_k * F * kmask` was
+        # spending a whole extra full-size complex kernel multiplying by one.
+        # Measured bitwise-identical, and 1.08-1.18x on the slice step at
+        # tilt-series (1200^2), micrograph (4096^2) and particle-stack shapes.
+        Fk = F * kmask
+
+        fine = canvas * self.oversample
+        exitwave = torch.ones(B, fine, fine, device=device, dtype=torch.complex64)
+
+        if checkpoint_chunks is None:
+            for i, _, slice_sample in self._iter_slices(
+                V,
+                theta_matrix,
+                slice_batchsize,
+                "Multislice (Iterative)",
+                roi_size=roi_size,
+            ):
+                slice_complex = apply_amplitude_contrast(slice_sample, alpha=self.alpha)
+                slice_complex = fourier_upsample_xy(slice_complex, self.oversample)
+                t = torch.exp(1j * self.sigma * self.pixel_size * slice_complex)
+                exitwave = ifft2(fft2(t * exitwave) * Fk)
+        else:
+            nz_new, rotator, is_identity = self._resolve_tilt_setup(V, theta_matrix)
+            y_start, x_start = self._roi_start(V, roi_size=roi_size)
+            indices = self._slice_processing_order(nz_new, device=V.device)
+
+            # Gradient-checkpointed loop: each chunk's slices are re-fetched
+            # and re-transmitted in the backward pass, so only the exit wave
+            # at chunk boundaries is kept. The constants ride along as bound
+            # keyword arguments; (exitwave, V) are the differentiable inputs.
+            pbar = track(
+                range(0, nz_new, checkpoint_chunks),
+                description="Multislice (Checkpointed)",
+                transient=True,
+                disable=not (self.progressbars),
+            )
+            for chunk_start in pbar:
+                chunk_end = min(chunk_start + checkpoint_chunks, nz_new)
+                chunk_fn = functools.partial(
+                    self._multislice_chunk,
+                    indices=indices[chunk_start:chunk_end],
+                    nz_new=nz_new,
+                    is_identity=is_identity,
+                    rotator=rotator,
+                    theta_matrix=theta_matrix,
+                    y_start=y_start,
+                    x_start=x_start,
+                    roi_size=roi_size,
+                    Fk=Fk,
+                )
+                exitwave = self._checkpointed(chunk_fn, exitwave, V, checkpoint=True)
+
+        return self._output(exitwave, canvas)
+
+    def multislice_absorptive(
+        self,
+        V: torch.Tensor,
+        source: torch.Tensor,
+        theta_matrix: torch.Tensor,
+        absorption_filter: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        slice_batchsize: int = 1,
+        checkpoint_chunks: int | None = None,
+    ) -> torch.Tensor:
+        """Propagate paired real fields, filtering absorption in the beam frame.
+
+        ``source`` has the same shape and geometry as ``V`` and is in volts.
+        With no filter it is the imaginary potential itself. A filter maps
+        each sampled transverse source slice to an imaginary potential.
+        Geometry stays real; only the transmission slice becomes complex.
+        Both input fields retain gradients. Checkpointing recomputes chunks of
+        transmission/FFT steps; sampling is streamed in bounded slice batches.
+        """
+        if self.scattering_model != "multislice" or self.alpha != 0:
+            raise ValueError("Explicit absorption requires multislice and alpha=0")
+        if V.is_complex() or source.is_complex() or V.shape != source.shape:
+            raise ValueError(
+                "elastic and absorption fields must be real and same-shaped"
+            )
+        if V.device != source.device or V.dtype != source.dtype:
+            raise ValueError("paired fields must share device and dtype")
+        # Match forward(): geometry follows host-resident fields when slices
+        # are streamed to a different compute device.
+        theta_matrix = theta_matrix.to(V.device)
+        if slice_batchsize < 1 or (
+            checkpoint_chunks is not None and checkpoint_chunks < 1
+        ):
+            raise ValueError("slice and checkpoint batch sizes must be positive")
+        canvas = self.padded_nxy if self.pad_fft else self.nxy
+        roi_size = canvas if self.pad_fft else None
+        Fk = (
+            (self.F_step_padded_real + 1j * self.F_step_padded_imag) * self.kmask_padded
+            if self.pad_fft
+            else (self.F_step_real + 1j * self.F_step_imag) * self.kmask
+        )
+        fine = canvas * self.oversample
+        wave = torch.ones(
+            V.shape[0], fine, fine, device=self.device, dtype=torch.complex64
+        )
+        elastic_slices = self._iter_slices(
+            V, theta_matrix, slice_batchsize, "Elastic slices", roi_size
+        )
+        halo = getattr(absorption_filter, "halo", 0)
+        source_roi = canvas + 2 * halo
+        source_slices = self._iter_slices(
+            source, theta_matrix, slice_batchsize, "Absorption slices", source_roi
+        )
+
+        def step(
+            psi: torch.Tensor, elastic: torch.Tensor, raw: torch.Tensor
+        ) -> torch.Tensor:
+            if absorption_filter is None:
+                imaginary = raw
+            else:
+                apply_filter = getattr(
+                    absorption_filter, "filter_sampled", absorption_filter
+                )
+                imaginary = apply_filter(raw)
+            if imaginary.shape != elastic.shape:
+                raise ValueError("filtered absorption must match the propagation slice")
+            transmission = torch.exp(
+                self.sigma
+                * self.pixel_size
+                * fourier_upsample_xy(1j * elastic - imaginary, self.oversample)
+            )
+            return ifft2(fft2(transmission * psi) * Fk)
+
+        def advance_chunk(psi, elastic_block, source_block):
+            for elastic, raw in zip(
+                elastic_block.unbind(), source_block.unbind(), strict=True
+            ):
+                psi = step(psi, elastic, raw)
+            return psi
+
+        elastic_block, source_block = [], []
+        for (i, nz, elastic), (_, _, raw) in zip(
+            elastic_slices, source_slices, strict=True
+        ):
+            if checkpoint_chunks is None:
+                wave = step(wave, elastic, raw)
+            else:
+                elastic_block.append(elastic)
+                source_block.append(raw)
+                if len(elastic_block) == checkpoint_chunks or i + 1 == nz:
+                    wave = _gradient_checkpoint(
+                        advance_chunk,
+                        wave,
+                        torch.stack(elastic_block),
+                        torch.stack(source_block),
+                        use_reentrant=False,
+                    )
+                    elastic_block, source_block = [], []
+        return self._output(wave, canvas)
+
+    @property
+    def output_nxy(self) -> int:
+        """
+        Pixels across the wave :meth:`forward` returns: the padded canvas for
+        a multislice wave under ``keep_pad``, else ``nxy``.
+        """
+        padded = self.pad_fft and self.keep_pad
+        return (
+            self.padded_nxy
+            if padded and self.scattering_model == "multislice"
+            else self.nxy
+        )
+
+    def _output(self, wave: torch.Tensor, canvas: int) -> torch.Tensor:
+        """
+        The multislice exit wave as the caller asked for it: cropped to the
+        slice grid, or left on the propagation grid; with the ``pad_fft``
+        canvas margin removed unless ``keep_pad``.
+        """
+        if self.crop:
+            wave = fourier_crop_xy(wave, canvas)
+        if self.pad_fft and not self.keep_pad:
+            out = self.nxy if self.crop else self.nxy * self.oversample
+            wave = center_crop(wave, out, dim=(-2, -1))
+        return wave
+
+    @staticmethod
+    def _checkpointed(
+        fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        state: torch.Tensor,
+        V: torch.Tensor,
+        checkpoint: bool,
+    ) -> torch.Tensor:
+        """
+        Advance ``state`` through one chunk, ``fn(state, V)``, optionally
+        under non-reentrant gradient checkpointing so the chunk's
+        intermediates are recomputed in the backward pass rather than kept.
+        """
+        if checkpoint:
+            return _gradient_checkpoint(fn, state, V, use_reentrant=False)
+        return fn(state, V)
+
+    def _multislice_chunk(
+        self,
+        exitwave: torch.Tensor,
+        V: torch.Tensor,
+        *,
+        indices: torch.Tensor,
+        nz_new: int,
+        is_identity: bool,
+        rotator: VolumeRotator | None,
+        theta_matrix: torch.Tensor,
+        y_start: int,
+        x_start: int,
+        roi_size: int | None,
+        Fk: torch.Tensor,
+    ) -> torch.Tensor:
+        """Transmit and propagate ``exitwave`` through the slices ``indices``."""
+        dev = exitwave.device
+        for j in range(len(indices)):
+            s = self._fetch_volume_slices(
+                V,
+                indices[j : j + 1],
+                is_identity,
+                rotator,
+                theta_matrix,
+                nz_new,
+                y_start,
+                x_start,
+                dev,
+                roi_size=roi_size,
+            )[:, 0]
+            sc = apply_amplitude_contrast(s, alpha=self.alpha)
+            sc = fourier_upsample_xy(sc, self.oversample)
+            t = torch.exp(1j * self.sigma * self.pixel_size * sc)
+            exitwave = ifft2(fft2(t * exitwave) * Fk)
+        return exitwave
+
+    def _rytov_chunk(
+        self,
+        phase_sum: torch.Tensor,
+        V: torch.Tensor,
+        *,
+        indices: torch.Tensor,
+        distances: torch.Tensor,
+        nz_new: int,
+        is_identity: bool,
+        rotator: VolumeRotator | None,
+        theta_matrix: torch.Tensor,
+        y_start: int,
+        x_start: int,
+    ) -> torch.Tensor:
+        """
+        Add the slices ``indices``' single-scatter phase, each propagated
+        by its own Fresnel distance, to the running ``phase_sum``.
+
+        The sum over slices is taken in Fourier space, where the inverse
+        FFT is linear and commutes with it, and inverted once. Summing
+        before the IFFT is mathematically identical to summing after it,
+        but avoids ever backpropagating a broadcast-expanded gradient (from
+        the slice-dim sum) through an FFT: MKL's FFT backward raises
+        "Inconsistent configuration parameters" on such inputs.
+        """
+        dev = phase_sum.device
+        slices = self._fetch_volume_slices(
+            V,
+            indices,
+            is_identity,
+            rotator,
+            theta_matrix,
+            nz_new,
+            y_start,
+            x_start,
+            dev,
+        )
+        slices_c = apply_amplitude_contrast(slices, alpha=self.alpha)
+        # (K, nxy, nxy) Fresnel kernels for this chunk, cheap to rebuild.
+        d = distances.to(dev)
+        F_chunk = fresnel_propagator(
+            self.k2[None, ...], self.wavelength, self.pixel_size * d[:, None, None]
+        )
+        scattered = fft2(1j * self.sigma * self.pixel_size * slices_c) * F_chunk[None]
+        return phase_sum + ifft2(scattered.sum(dim=1))
+
+    def projection(
+        self, V: torch.Tensor, theta_matrix: torch.Tensor, slice_batchsize: int = 1
+    ) -> torch.Tensor:
+        """
+        Compute exit wave using iterative projection approximation on a transformed volume.
+        """
+        nz_new, rotator, is_identity = self._resolve_tilt_setup(V, theta_matrix)
+        B = V.shape[0]
+        device = self.device
+
+        total_potential = torch.zeros((B, self.nxy, self.nxy), device=device)
+        # Note: unlike the other iterative models, projection sums slices in
+        # a commutative accumulation, so it does not apply the EWS curvature
+        # traversal order.
+        indices = torch.arange(nz_new, device=V.device)
+        y_start, x_start = self._roi_start(V)
+
+        pbar = track(
+            range(nz_new),
+            description="Projection (Iterative)",
+            transient=True,
+            disable=not (self.progressbars),
+        )
+
+        slices_block: torch.Tensor | None = None
+        for i in pbar:
+            if is_identity:
+                total_potential += self._fetch_volume_slices(
+                    V,
+                    indices[i : i + 1],
+                    is_identity,
+                    rotator,
+                    theta_matrix,
+                    nz_new,
+                    y_start,
+                    x_start,
+                    device,
+                )[:, 0]
+            else:
+                if i % slice_batchsize == 0:
+                    batch_end = min(i + slice_batchsize, nz_new)
+                    slices_block = self._fetch_volume_slices(
+                        V,
+                        indices[i:batch_end],
+                        is_identity,
+                        rotator,
+                        theta_matrix,
+                        nz_new,
+                        y_start,
+                        x_start,
+                        device,
+                    )
+                assert slices_block is not None
+                total_potential += slices_block[:, i % slice_batchsize]
+
+        total_complex = apply_amplitude_contrast(total_potential, alpha=self.alpha)
+        exitwave = oversampled_exp(
+            1j * self.sigma * self.pixel_size * total_complex,
+            self.oversample,
+            self.crop,
+        )
+        return exitwave
+
+    def rytov(
+        self, V: torch.Tensor, theta_matrix: torch.Tensor, slice_batchsize: int = 1
+    ) -> torch.Tensor:
+        """
+        Compute exit wave using iterative Rytov approximation on a transformed volume.
+        """
+        B = V.shape[0]
+        device = self.device
+
+        phase_sum = torch.zeros(
+            (B, self.nxy, self.nxy), device=device, dtype=torch.complex64
+        )
+
+        # The exit wave is the exponential of a sum over slices (see
+        # `parallel_rytov`), so the product of per-slice exponentials is
+        # one exponential of the summed exponent, and that sum is linear:
+        # it is accumulated in Fourier space and inverted once. The
+        # absorption factor and i*sigma*dz are one complex scalar, which
+        # depends only on whether V is complex.
+        c = self._phase_scale(V)
+        for i, nz_new, slice_sample in self._iter_slices(
+            V, theta_matrix, slice_batchsize, "Rytov (Iterative)"
+        ):
+            # Propagate slice i to the exit plane; the distance is nz_new - i.
+            F_i = self._get_propagator(float(nz_new - i))
+            phase_sum += fft2(slice_sample) * F_i
+
+        return oversampled_exp(c * ifft2(phase_sum), self.oversample, self.crop)
+
+    def parallel_rytov(
+        self,
+        V: torch.Tensor,
+        theta_matrix: torch.Tensor,
+        checkpoint_chunks: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute exit wave using a fully-parallel Rytov approximation.
+
+        Mathematically identical to ``rytov``, but restructured for
+        throughput and bounded memory -- see "When to use this over
+        ``rytov``" below.
+
+        The exit wave is:
+
+        .. math::
+            \\psi = \\exp\\!\\left(
+                \\sum_{z} \\mathcal{F}^{-1}\\!\\left[
+                    \\mathcal{F}[i\\sigma\\,\\Delta z\\,V_z] \\cdot F_z
+                \\right]
+            \\right)
+
+        Because the exponent is a *sum* over independent slices -- unlike
+        multislice's ``psi_i = t_i * psi_{i-1}``, no slice's contribution
+        depends on any other slice's result -- the computation
+        parallelises trivially across the Z dimension.
+
+        When to use this over ``rytov``
+        --------------------------------
+        ``rytov`` computes the exact same sum, but as a Python loop over
+        slices, one small FFT pair per slice, with no way to bound
+        backward's memory: every slice's activations are retained for
+        gradients regardless of how many slices there are. That's fine
+        for a handful of slices (e.g. an untilted or mildly tilted single
+        particle). It stops being fine for a tilted cryo-ET volume, where
+        ``nz_new`` can reach the hundreds to low thousands: this method
+        batches those slices into a handful of large, vectorized FFT
+        calls instead of many small sequential ones (faster forward
+        pass, independent of gradients), and ``checkpoint_chunks`` lets
+        backward's memory scale with chunk size instead of ``nz_new``.
+        Both benefits come from the same independence-across-slices
+        property that makes multislice's true recursion unable to use
+        this approach at all -- multislice's ``checkpoint_chunks``
+        exists for the memory side of this same problem, but has no
+        batching counterpart to reach for, since its slices are not
+        independent.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            Input 3D potential volume, shape ``(B, Z, Y, X)``.
+        theta_matrix : torch.Tensor
+            Affine rotation matrices, shape ``(B, 3, 4)``.
+        checkpoint_chunks : int or None
+            Chunk size along Z for gradient checkpointing.  Each chunk
+            processes ``checkpoint_chunks`` slices with a single batched
+            FFT pair and accumulates into a running phase sum.  Only the
+            phase sum at chunk boundaries (12 MB) and the chunk's slice
+            inputs are retained; intermediate FFT activations are
+            recomputed during backward.  Suggested value: ``50``.
+            ``None`` processes all slices in one pass (fast but high
+            memory).
+
+        Notes
+        -----
+        Accuracy: Rytov ≈ multislice when σ·Δz·V ≪ 1 per slice (valid
+        for 300 keV electrons through typical cryo-ET ice thicknesses at
+        5 Å/px).
+        """
+        nz_new, rotator, is_identity = self._resolve_tilt_setup(V, theta_matrix)
+        device = self.device
+        y_start, x_start = self._roi_start(V)
+
+        # Processing order: negative EWS sign flips the slice traversal
+        indices = self._slice_processing_order(nz_new, device=V.device)
+
+        # Each slice j (processing order) propagates distance (nz_new - j)
+        # to the exit plane.
+        distances = torch.arange(nz_new, 0, -1, dtype=torch.float32, device=device)
+
+        # Running phase accumulator — shape (B, nxy, nxy) complex64
+        B = V.shape[0]
+        phase_sum = torch.zeros(
+            B, self.nxy, self.nxy, device=device, dtype=torch.complex64
+        )
+
+        chunk_size = checkpoint_chunks if checkpoint_chunks is not None else nz_new
+
+        pbar = track(
+            range(0, nz_new, chunk_size),
+            description="Rytov (Parallel)",
+            transient=True,
+            disable=not (self.progressbars),
+        )
+        for chunk_start in pbar:
+            chunk_end = min(chunk_start + chunk_size, nz_new)
+            chunk_fn = functools.partial(
+                self._rytov_chunk,
+                indices=indices[chunk_start:chunk_end],
+                distances=distances[chunk_start:chunk_end],
+                nz_new=nz_new,
+                is_identity=is_identity,
+                rotator=rotator,
+                theta_matrix=theta_matrix,
+                y_start=y_start,
+                x_start=x_start,
+            )
+            phase_sum = self._checkpointed(
+                chunk_fn, phase_sum, V, checkpoint=checkpoint_chunks is not None
+            )
+
+        return oversampled_exp(phase_sum, self.oversample, self.crop)
+
+    def firstborn(
+        self, V: torch.Tensor, theta_matrix: torch.Tensor, slice_batchsize: int = 1
+    ) -> torch.Tensor:
+        """
+        Compute exit wave using iterative first Born approximation on a transformed volume.
+        """
+        B = V.shape[0]
+        device = self.device
+
+        total_scattered = torch.zeros(
+            (B, self.nxy, self.nxy), device=device, dtype=torch.complex64
+        )
+
+        # The scalar depends only on whether V is complex, so it is one
+        # value for every slice. The sum is linear, so it is accumulated in
+        # Fourier space and inverted once rather than once per slice.
+        c = self._phase_scale(V)
+        for i, nz_new, slice_sample in self._iter_slices(
+            V, theta_matrix, slice_batchsize, "First Born (Iterative)"
+        ):
+            F_i = self._get_propagator(float(nz_new - i))
+            total_scattered += fft2(slice_sample) * F_i
+
+        exitwave = 1 + c * ifft2(total_scattered)
+        return exitwave
+
+    def kinematic(
+        self, V: torch.Tensor, theta_matrix: torch.Tensor, slice_batchsize: int = 1
+    ) -> torch.Tensor:
+        """
+        Compute exit wave using iterative kinematic scattering approximation.
+
+        Like ``firstborn`` but uses the full per-slice transmission function
+        ``exp(iσΔz V) − 1`` instead of the weak-phase linearisation ``iσΔz V``.
+        """
+        B = V.shape[0]
+        device = self.device
+
+        total_scattered = torch.zeros(
+            (B, self.nxy, self.nxy), device=device, dtype=torch.complex64
+        )
+
+        for i, nz_new, slice_sample in self._iter_slices(
+            V, theta_matrix, slice_batchsize, "Kinematic (Iterative)"
+        ):
+            c = self._phase_scale(slice_sample)
+            t = torch.exp(c * slice_sample) - 1
+            F_i = self._get_propagator(float(nz_new - i))
+            total_scattered += ifft2(fft2(t) * F_i)
+
+        exitwave = 1 + total_scattered
+        return exitwave
+
+    def ctf(
+        self, V: torch.Tensor, theta_matrix: torch.Tensor, slice_batchsize: int = 1
+    ) -> torch.Tensor:
+        """
+        Compute iterative projected potential (for CTF) with transformed sampling.
+        """
+        nz_new, rotator, is_identity = self._resolve_tilt_setup(V, theta_matrix)
+        B = V.shape[0]
+        device = self.device
+
+        total_potential = torch.zeros((B, self.nxy, self.nxy), device=device)
+        # Note: like projection, this is a commutative sum, so it does not
+        # apply the EWS curvature traversal order.
+        indices = torch.arange(nz_new, device=V.device)
+        y_start, x_start = self._roi_start(V)
+
+        pbar = track(
+            range(nz_new),
+            description="CTF Projection (Iterative)",
+            transient=True,
+            disable=not (self.progressbars),
+        )
+
+        slices_block: torch.Tensor | None = None
+        for i in pbar:
+            if is_identity:
+                total_potential += self._fetch_volume_slices(
+                    V,
+                    indices[i : i + 1],
+                    is_identity,
+                    rotator,
+                    theta_matrix,
+                    nz_new,
+                    y_start,
+                    x_start,
+                    device,
+                )[:, 0]
+            else:
+                if i % slice_batchsize == 0:
+                    batch_end = min(i + slice_batchsize, nz_new)
+                    slices_block = self._fetch_volume_slices(
+                        V,
+                        indices[i:batch_end],
+                        is_identity,
+                        rotator,
+                        theta_matrix,
+                        nz_new,
+                        y_start,
+                        x_start,
+                        device,
+                    )
+                assert slices_block is not None
+                total_potential += slices_block[:, i % slice_batchsize]
+
+        return 2 * self.sigma * self.pixel_size * total_potential
+
+    def forward(
+        self,
+        V: torch.Tensor,
+        pose: float | torch.Tensor,
+        slice_batchsize: int = 1,
+        checkpoint_chunks: int | None = None,
+        *,
+        absorption_source: torch.Tensor | None = None,
+        absorption_filter: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass for iterative scattering.
+
+        Parameters
+        ----------
+        V : torch.Tensor
+            Input 3D potential volume.
+        pose : float or torch.Tensor
+            If float, interpreted as tilt angle in degrees around X.
+            If torch.Tensor, interpreted as affine matrix (B, 3, 4).
+        slice_batchsize : int
+            Number of slices to batch for sampling.
+        """
+        if isinstance(pose, (int, float)) or (
+            isinstance(pose, torch.Tensor) and pose.ndim == 0
+        ):
+            # Backward compatibility for tilt angle
+            angle_deg = pose
+            B = V.shape[0]
+            device = V.device
+            theta_rad = torch.deg2rad(torch.as_tensor(angle_deg, device=device))
+            c, s = torch.cos(theta_rad), torch.sin(theta_rad)
+            R = (
+                torch.tensor(
+                    [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]],
+                    device=device,
+                    dtype=V.dtype,
+                )
+                .unsqueeze(0)
+                .expand(B, -1, -1)
+            )
+            theta_matrix = build_affine_matrix(R)
+        else:
+            theta_matrix = pose.to(V.device)
+
+        if absorption_source is not None:
+            return self.multislice_absorptive(
+                V,
+                absorption_source,
+                theta_matrix,
+                absorption_filter,
+                slice_batchsize,
+                checkpoint_chunks,
+            )
+        if absorption_filter is not None:
+            raise ValueError("absorption_filter requires absorption_source")
+
+        if self.scattering_model == "ctf":
+            return self.ctf(V, theta_matrix, slice_batchsize)
+
+        if self.scattering_model == "multislice":
+            return self.multislice(V, theta_matrix, slice_batchsize, checkpoint_chunks)
+        elif self.scattering_model == "rytov_parallel":
+            return self.parallel_rytov(V, theta_matrix, checkpoint_chunks)
+        elif self.scattering_model == "rytov":
+            return self.rytov(V, theta_matrix, slice_batchsize)
+        elif self.scattering_model == "projection":
+            return self.projection(V, theta_matrix, slice_batchsize)
+        elif self.scattering_model == "firstborn":
+            return self.firstborn(V, theta_matrix, slice_batchsize)
+        elif self.scattering_model == "kinematic":
+            return self.kinematic(V, theta_matrix, slice_batchsize)
+        else:
+            raise ValueError(f"Unknown scattering model: {self.scattering_model}")
