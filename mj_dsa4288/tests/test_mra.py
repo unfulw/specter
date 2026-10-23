@@ -40,8 +40,8 @@ def test_snr_conventions() -> None:
 
 
 def test_specter_projection_template_smoke() -> None:
-    """Physics-free single-view projection through SPECTER's ImageGenerator."""
-    pytest.importorskip("specter.imagegenerator", reason="SPECTER venv not synced")
+    """Physics-free single-view projection through SPECTER's projection model."""
+    pytest.importorskip("specter.imaging", reason="SPECTER venv not synced")
     n = 16
     z, yy, xx = torch.meshgrid(*[torch.arange(n) - n / 2] * 3, indexing="ij")
     blob = torch.exp(-((z + 2) ** 2 + yy**2 + (xx - 3) ** 2) / 6.0)

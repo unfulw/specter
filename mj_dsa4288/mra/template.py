@@ -7,7 +7,7 @@ Two sources:
   support (a *generic* signal in the paper's sense), no SPECTER needed.
 * :func:`template_from_volume` / :func:`template_from_pdb` -- a single-view,
   physics-free projection of a real macromolecule computed with SPECTER's
-  ``ImageGenerator`` in ``projection`` mode. This is Phase A of the plan: the
+  ``projection`` scattering model. This is Phase A of the plan: the
   simulator only provides a realistic ``theta``; shifting and noising happen in
   :mod:`mj_dsa4288.mra.model`.
 """
@@ -78,10 +78,11 @@ def template_from_volume(
     """
     Physics-free single-view projection of a scattering potential via SPECTER.
 
-    Runs ``ImageGenerator`` with ``scattering_model="projection"`` and no ice,
-    noise, detector or envelopes, and returns the projected phase
+    Scatters the volume with ``scattering_model="projection"`` and no ice,
+    oversampling or amplitude contrast, and returns the projected phase
     ``2 sigma_e dx sum_z V`` (the exit-wave phase in the weak-phase limit),
-    i.e. the linear projection image the MRA model needs.
+    i.e. the linear projection image the MRA model needs. No lens, noise or
+    detector is applied.
 
     Parameters
     ----------
@@ -101,29 +102,26 @@ def template_from_volume(
     torch.Tensor
         Real projection image ``[Y, X]`` on CPU, normalised to unit 2-norm.
     """
-    from specter.imagegenerator import ImageGenerator
+    from specter.imaging import Poses, Specimen
 
     if quaternion is None:
         quaternion = torch.tensor([1.0, 0.0, 0.0, 0.0])
-    model = ImageGenerator(
-        volume,
-        pixel_size,
-        quaternions=quaternion[None].float(),
-        translations=torch.zeros(1, 2),
-        ctf_params={"dfu": torch.zeros(1), "cs": torch.zeros(1)},
-        voltage=voltage,
-        dose_per_angstrom=1.0,
-        ice_model=None,
-        scattering_model="projection",
-        aberration_model="holography",
-        noise_model=None,
-        detector_model=None,
-        alpha=0.0,
-        verbose=False,
-    ).to(device)
+    poses = Poses(
+        quaternions=quaternion[None].float().to(device),
+        shifts=torch.zeros(1, 2, device=device),
+        ids=torch.zeros(1, dtype=torch.long),
+    )
+    specimen = Specimen(volume.float(), pixel_size).to(device)
     with torch.no_grad():
-        model(torch.tensor([0], device=device))
-    phi = model.exitwaves[0].detach().cpu()
+        wave = specimen.scatter(
+            poses,
+            voltage=voltage,
+            scattering_model="projection",
+            alpha=0.0,
+            oversample=1,
+            pad_fft=False,
+        )
+    phi = wave.array[0].detach().cpu()
     if torch.is_complex(phi):
         phi = torch.angle(phi)
     return normalise_template(phi.float())

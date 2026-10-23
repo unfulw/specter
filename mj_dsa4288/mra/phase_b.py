@@ -18,7 +18,7 @@ from Phase A:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -39,12 +39,18 @@ class PhysicsConfig:
         Half-width of a per-particle uniform defocus perturbation (Phase B.2).
     scattering_model : str
         ``"projection"`` (linear) or ``"multislice"`` (full).
+    aberration_model : str
+        Kept for old configs; must be ``"holography"`` (the full, non-linear
+        transfer function, which SPECTER applies to every wave model).
     noise_model : str or None
         ``None`` (clean) or ``"poisson"`` (dose-limited counting noise).
     detector_model : str or None
         ``None``, ``"perfect"``, ``"k3_300kv"`` ...
     coincidence_radius : float
         Detector coincidence-loss radius in pixels (needs ``noise_model``).
+    num_frames : int or None
+        Movie frames the dose is fractionated into; coincidence loss is
+        applied per frame. None uses SPECTER's default.
     ice_model : str or None
         ``None``, ``"random"`` or ``"gd"``.
     ice_thickness : float
@@ -65,11 +71,48 @@ class PhysicsConfig:
     noise_model: str | None = None
     detector_model: str | None = None
     coincidence_radius: float = 0.0
+    num_frames: int | None = None
     ice_model: str | None = None
     ice_thickness: float = 0.0
     max_shift_angstrom: float = 10.0
     bfactor: float | None = None
     device: str = "cpu"
+
+
+@dataclass
+class ParticleStack:
+    """
+    Everything SPECTER needs to image one stack; run it with :func:`generate_stack`.
+
+    Attributes
+    ----------
+    specimen : specter.imaging.Specimen
+        The volume, solvated when ice is on.
+    poses : specter.imaging.Poses
+        Fixed view and the sampled in-plane shift of every particle.
+    ctf : specter.imaging.CTF
+        Per-particle defocus and Cs.
+    exposure : specter.imaging.Exposure
+        Dose per particle.
+    voltage : float
+        kV.
+    device : str
+        Torch device.
+    scatter, optics, coherence, camera : dict
+        Keywords for the scattering, transfer-function, coherence and detector
+        stages.
+    """
+
+    specimen: Any
+    poses: Any
+    ctf: Any
+    exposure: Any
+    voltage: float
+    device: str
+    scatter: dict[str, Any] = field(default_factory=dict)
+    optics: dict[str, Any] = field(default_factory=dict)
+    coherence: dict[str, Any] = field(default_factory=dict)
+    camera: dict[str, Any] = field(default_factory=dict)
 
 
 def build_generator(
@@ -80,9 +123,9 @@ def build_generator(
     cfg: PhysicsConfig,
     quaternion: torch.Tensor | None = None,
     seed: int = 0,
-) -> Any:
+) -> ParticleStack:
     """
-    Construct a SPECTER ``ImageGenerator`` for a fixed view with in-plane shifts.
+    Set up a SPECTER particle stack for a fixed view with in-plane shifts.
 
     Parameters
     ----------
@@ -103,11 +146,16 @@ def build_generator(
 
     Returns
     -------
-    ImageGenerator
-        Call ``model(idx)`` with an index tensor to obtain images ``[B, Y, X]``.
+    ParticleStack
+        Pass to :func:`generate_stack` to obtain images ``[n, Y, X]``.
     """
-    from specter.imagegenerator import ImageGenerator
+    from specter.imaging import CTF, Exposure, Poses, Specimen
 
+    if cfg.aberration_model != "holography":
+        raise ValueError(
+            f"aberration_model={cfg.aberration_model!r} is no longer supported; "
+            "use 'holography'"
+        )
     gen = torch.Generator().manual_seed(seed)
     if quaternion is None:
         quaternion = torch.tensor([1.0, 0.0, 0.0, 0.0])
@@ -119,38 +167,51 @@ def build_generator(
             defocus
             + (2 * torch.rand(n, generator=gen) - 1) * cfg.defocus_jitter_angstrom
         )
-    ctf_params = {
-        "dfu": defocus,
-        "dfv": defocus.clone(),
-        "dfang": torch.zeros(n),
-        "cs": torch.full((n,), cfg.cs * 1e7),  # mm -> Angstrom
-    }
-    return ImageGenerator(
-        volume,
-        pixel_size,
-        quaternions=quats,
-        translations=shifts,
-        ctf_params=ctf_params,
+    specimen = Specimen(volume.float(), pixel_size).to(cfg.device)
+    if cfg.ice_model:
+        specimen = specimen.solvate(model=cfg.ice_model, thickness=cfg.ice_thickness)
+    return ParticleStack(
+        specimen=specimen,
+        poses=Poses(quats, shifts, torch.arange(n)),
+        ctf=CTF.from_values(defocus, cs=cfg.cs),
+        exposure=Exposure(dose=dose, n_frames=cfg.num_frames),
         voltage=cfg.voltage,
-        dose_per_angstrom=dose,
-        ice_model=cfg.ice_model,
-        ice_thickness=cfg.ice_thickness if cfg.ice_model else None,
-        scattering_model=cfg.scattering_model,
-        aberration_model=cfg.aberration_model,
-        noise_model=cfg.noise_model,
-        detector_model=cfg.detector_model,
-        coincidence_radius=cfg.coincidence_radius,
-        alpha=cfg.alpha,
-        bfactor=cfg.bfactor,
-        verbose=False,
-    ).to(cfg.device)
+        device=cfg.device,
+        # SPECTER now oversamples the image grid and applies a chromatic
+        # envelope by default; both are switched off to keep the physics above.
+        scatter={
+            "scattering_model": cfg.scattering_model,
+            "alpha": cfg.alpha,
+            "oversample": 1,
+            "pad_fft": False,
+        },
+        optics={"bfactor": cfg.bfactor},
+        coherence={"cc": None},
+        camera={
+            "detector": cfg.detector_model,
+            "noise": cfg.noise_model,
+            "coincidence_radius": cfg.coincidence_radius,
+        },
+    )
 
 
-def generate_stack(model: Any, n: int, batch_size: int = 64) -> torch.Tensor:
-    """Run ``model`` over ``range(n)`` in batches and return images ``[n, Y, X]`` on CPU."""
-    out = []
+def generate_stack(
+    model: ParticleStack, n: int, batch_size: int = 64
+) -> torch.Tensor:
+    """Image the first ``n`` particles of ``model`` in batches; returns ``[n, Y, X]`` on CPU."""
+    from specter.imaging import simulate_particles
+
     with torch.no_grad():
-        for start in range(0, n, batch_size):
-            idx = torch.arange(start, min(start + batch_size, n), device=model.device)
-            out.append(model(idx).detach().cpu().float())
-    return torch.cat(out, 0)
+        images = simulate_particles(
+            model.specimen,
+            model.poses[:n],
+            model.ctf[:n],
+            model.exposure,
+            voltage=model.voltage,
+            batch_size=batch_size,
+            scatter=model.scatter,
+            optics=model.optics,
+            coherence=model.coherence,
+            camera=model.camera,
+        )
+    return images.array.detach().cpu().float()
